@@ -5,8 +5,14 @@
 #![allow(clippy::all)]
 #![allow(improper_ctypes)]
 
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/bindings.rs"));
+#[allow(clippy::all)]
 
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/generated/bindings.rs"
+));
+
+// premium-discount: 기능 `runtime-load` 일 때 `OrtGetApiBase` 는 바인딩의 링크 기호 대신 실행할 때 불러온 라이브러리에서 옵니다.
 /// ONNX Runtime loaded at run time instead of linked (Raon Zena change to the vendored crate).
 ///
 /// Only `OrtGetApiBase` is a real C symbol; everything else goes through the API table it returns, so loading that
@@ -17,6 +23,7 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/generated/bindings.rs"));
 /// `target/<profile>/deps`), `%LOCALAPPDATA%\RaonZena\models\onnxruntime`, then the library the build script
 /// prepared (development builds). The library is always opened by full path, never by bare name, so an unrelated
 /// `onnxruntime.dll` elsewhere on the system (Windows ships an old one) is never picked up.
+#[cfg(feature = "runtime-load")]
 pub mod dynload {
     use super::OrtApiBase;
     use std::path::PathBuf;
@@ -150,6 +157,7 @@ pub mod dynload {
 }
 
 /// `OrtGetApiBase` of the run-time loaded library (null when it is unavailable — check [`dynload::api_available`]).
+#[cfg(feature = "runtime-load")]
 pub unsafe fn OrtGetApiBase() -> *const OrtApiBase {
     dynload::api_base()
 }

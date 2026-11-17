@@ -1,5 +1,4 @@
-// Vendored from Qntology/logis-center (onnxruntime-rs 0.0.14 fork); lints of the original code are not ours to fix.
-#![allow(missing_docs, dead_code, mismatched_lifetime_syntaxes)]
+#![warn(missing_docs)]
 
 //! ONNX Runtime
 //!
@@ -172,7 +171,9 @@ lazy_static! {
 }
 
 fn g_ort() -> sys::OrtApi {
-    let mut api_ref = G_ORT_API.lock().expect("Failed to acquire lock: another thread panicked?");
+    let mut api_ref = G_ORT_API
+        .lock()
+        .expect("Failed to acquire lock: another thread panicked?");
     let api_ref_mut: &mut *mut sys::OrtApi = api_ref.get_mut();
     let api_ptr_mut: *mut sys::OrtApi = *api_ref_mut;
 
@@ -214,8 +215,12 @@ mod onnxruntime {
             let file_and_line_number = splitter.next().unwrap_or("<unknown file:line>");
             let function = splitter.next().unwrap_or("<unknown module>");
             let mut file_and_line_number_splitter = file_and_line_number.split(':');
-            let file = file_and_line_number_splitter.next().unwrap_or("<unknown file>");
-            let line_number = file_and_line_number_splitter.next().unwrap_or("<unknown line number>");
+            let file = file_and_line_number_splitter
+                .next()
+                .unwrap_or("<unknown file>");
+            let line_number = file_and_line_number_splitter
+                .next()
+                .unwrap_or("<unknown line number>");
 
             CodeLocation {
                 file,
@@ -547,9 +552,9 @@ mod test {
 
 pub mod mixed {
     use super::*;
-    use crate::memory::MemoryInfo;
-    use crate::tensor::ort_owned_tensor::{OrtOwnedTensor, OrtOwnedTensorExtractor};
     use crate::tensor::ort_tensor::OrtTensor;
+    use crate::tensor::ort_owned_tensor::{OrtOwnedTensor, OrtOwnedTensorExtractor};
+    use crate::memory::MemoryInfo;
     use ndarray::ArrayD;
     use std::ffi::CString;
     use std::ptr;
@@ -576,18 +581,20 @@ pub mod mixed {
             // 🌟 1. E0515 에러 해결: MemoryInfo를 정적(static)으로 생성하여 반환 수명 불일치 원천 차단
             static mut GLOBAL_MEMORY_INFO: *mut MemoryInfo = ptr::null_mut();
             static GLOBAL_MEMORY_INFO_INIT: std::sync::Once = std::sync::Once::new();
-
+            
             let memory_info: &'static MemoryInfo = unsafe {
                 GLOBAL_MEMORY_INFO_INIT.call_once(|| {
-                    let info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).expect("Failed to create MemoryInfo");
+                    let info = MemoryInfo::new(AllocatorType::Arena, MemType::Default)
+                        .expect("Failed to create MemoryInfo");
                     GLOBAL_MEMORY_INFO = Box::into_raw(Box::new(info));
                 });
                 &*GLOBAL_MEMORY_INFO
             };
-
+            
             let mut allocator_ptr: *mut onnxruntime_sys::OrtAllocator = ptr::null_mut();
-            unsafe { crate::error::call_ort(|ort| ort.GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr)) }
-                .map_err(|e| format!("GetAllocator Error: {:?}", e))?;
+            unsafe {
+                crate::error::call_ort(|ort| ort.GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr))
+            }.map_err(|e| format!("GetAllocator Error: {:?}", e))?;
 
             let mut ort_tensors_i64 = Vec::new();
             let mut ort_tensors_f32 = Vec::new();
@@ -602,14 +609,14 @@ pub mod mixed {
 
                 match dyn_input {
                     DynInput::I64(arr) => {
-                        let tensor =
-                            OrtTensor::from_array(memory_info, allocator_ptr, arr).map_err(|e| format!("OrtTensor i64 Error: {:?}", e))?;
+                        let tensor = OrtTensor::from_array(memory_info, allocator_ptr, arr)
+                            .map_err(|e| format!("OrtTensor i64 Error: {:?}", e))?;
                         input_values_ptr.push(tensor.c_ptr);
                         ort_tensors_i64.push(tensor);
-                    }
+                    },
                     DynInput::F32(arr) => {
-                        let tensor =
-                            OrtTensor::from_array(memory_info, allocator_ptr, arr).map_err(|e| format!("OrtTensor f32 Error: {:?}", e))?;
+                        let tensor = OrtTensor::from_array(memory_info, allocator_ptr, arr)
+                            .map_err(|e| format!("OrtTensor f32 Error: {:?}", e))?;
                         input_values_ptr.push(tensor.c_ptr);
                         ort_tensors_f32.push(tensor);
                     }
@@ -650,15 +657,15 @@ pub mod mixed {
                 let mut tensor_info_ptr: *mut onnxruntime_sys::OrtTensorTypeAndShapeInfo = ptr::null_mut();
                 let status = unsafe { crate::g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr) };
                 crate::error::status_to_result(status).map_err(|e| format!("GetTensorTypeAndShape Error: {:?}", e))?;
-
+                
                 let mut num_dims = 0;
                 let status = unsafe { crate::g_ort().GetDimensionsCount.unwrap()(tensor_info_ptr, &mut num_dims) };
                 crate::error::status_to_result(status).map_err(|e| format!("GetDimensionsCount Error: {:?}", e))?;
-
+                
                 let mut node_dims: Vec<i64> = vec![0; num_dims as usize];
                 let status = unsafe { crate::g_ort().GetDimensions.unwrap()(tensor_info_ptr, node_dims.as_mut_ptr(), num_dims) };
                 crate::error::status_to_result(status).map_err(|e| format!("GetDimensions Error: {:?}", e))?;
-
+                
                 unsafe { crate::g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
 
                 let shape: Vec<usize> = node_dims.iter().map(|&d| d as usize).collect();
@@ -666,7 +673,7 @@ pub mod mixed {
 
                 let mut extractor = OrtOwnedTensorExtractor::new(memory_info, dyn_shape);
                 extractor.tensor_ptr = ptr;
-
+                
                 let owned_tensor = extractor.extract::<f32>().map_err(|e| format!("Extract Error: {:?}", e))?;
                 owned_tensors.push(owned_tensor);
             }

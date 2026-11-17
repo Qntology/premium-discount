@@ -19,10 +19,11 @@ use crate::{
 };
 
 lazy_static! {
-    static ref G_ENV: Arc<Mutex<EnvironmentSingleton>> = Arc::new(Mutex::new(EnvironmentSingleton {
-        name: String::from("uninitialized"),
-        env_ptr: AtomicPtr::new(std::ptr::null_mut()),
-    }));
+    static ref G_ENV: Arc<Mutex<EnvironmentSingleton>> =
+        Arc::new(Mutex::new(EnvironmentSingleton {
+            name: String::from("uninitialized"),
+            env_ptr: AtomicPtr::new(std::ptr::null_mut()),
+        }));
 }
 
 #[derive(Debug)]
@@ -86,7 +87,9 @@ impl Environment {
         //      a new Arc<Mutex<EnvironmentSingleton>> with a strong count of 1.
         //      Cloning it to embed it inside the 'Environment' to return
         //      will thus increase the strong count to 2.
-        let mut environment_guard = G_ENV.lock().expect("Failed to acquire lock: another thread panicked?");
+        let mut environment_guard = G_ENV
+            .lock()
+            .expect("Failed to acquire lock: another thread panicked?");
         let g_env_ptr = environment_guard.env_ptr.get_mut();
         if g_env_ptr.is_null() {
             debug!("Environment not yet initialized, creating a new one.");
@@ -101,12 +104,23 @@ impl Environment {
 
             let create_env_with_custom_logger = g_ort().CreateEnvWithCustomLogger.unwrap();
             let status = {
-                unsafe { create_env_with_custom_logger(logging_function, logger_param, log_level.into(), cname.as_ptr(), &mut env_ptr) }
+                unsafe {
+                    create_env_with_custom_logger(
+                        logging_function,
+                        logger_param,
+                        log_level.into(),
+                        cname.as_ptr(),
+                        &mut env_ptr,
+                    )
+                }
             };
 
             status_to_result(status).map_err(OrtError::Environment)?;
 
-            debug!(env_ptr = format!("{:?}", env_ptr).as_str(), "Environment created.");
+            debug!(
+                env_ptr = format!("{:?}", env_ptr).as_str(),
+                "Environment created."
+            );
 
             *g_env_ptr = env_ptr;
             environment_guard.name = name;
@@ -143,9 +157,15 @@ impl Environment {
 impl Drop for Environment {
     #[tracing::instrument]
     fn drop(&mut self) {
-        debug!(global_arc_count = Arc::strong_count(&G_ENV), "Dropping the Environment.",);
+        debug!(
+            global_arc_count = Arc::strong_count(&G_ENV),
+            "Dropping the Environment.",
+        );
 
-        let mut environment_guard = self.env.lock().expect("Failed to acquire lock: another thread panicked?");
+        let mut environment_guard = self
+            .env
+            .lock()
+            .expect("Failed to acquire lock: another thread panicked?");
 
         // NOTE: If we drop an 'Environment' we (obviously) have _at least_
         //       one 'G_ENV' strong count (the one in the 'env' member).
@@ -156,7 +176,10 @@ impl Drop for Environment {
             let release_env = g_ort().ReleaseEnv.unwrap();
             let env_ptr: *mut sys::OrtEnv = *environment_guard.env_ptr.get_mut();
 
-            debug!(global_arc_count = Arc::strong_count(&G_ENV), "Releasing the Environment.",);
+            debug!(
+                global_arc_count = Arc::strong_count(&G_ENV),
+                "Releasing the Environment.",
+            );
 
             assert_ne!(env_ptr, std::ptr::null_mut());
             if env_ptr.is_null() {
@@ -220,6 +243,7 @@ impl EnvBuilder {
 mod tests {
     use super::*;
     use std::sync::{RwLock, RwLockWriteGuard};
+    use test_env_log::test;
 
     impl G_ENV {
         fn is_initialized(&self) -> bool {
@@ -324,7 +348,8 @@ mod tests {
         assert_eq!(main_env.name(), initial_name);
         assert_eq!(main_env.env_ptr() as usize, main_env_ptr);
 
-        let res: Vec<std::thread::Result<_>> = children.into_iter().map(|child| child.join()).collect();
+        let res: Vec<std::thread::Result<_>> =
+            children.into_iter().map(|child| child.join()).collect();
         assert!(res.into_iter().all(|r| std::result::Result::is_ok(&r)));
     }
 }

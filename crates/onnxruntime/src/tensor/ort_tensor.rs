@@ -68,7 +68,8 @@ where
             | TensorElementDataType::Bool => {
                 // primitive data is already suitably laid out in memory; provide it to
                 // onnxruntime as is
-                let tensor_values_ptr: *mut std::ffi::c_void = array.as_mut_ptr() as *mut std::ffi::c_void;
+                let tensor_values_ptr: *mut std::ffi::c_void =
+                    array.as_mut_ptr() as *mut std::ffi::c_void;
                 assert_not_null_pointer(tensor_values_ptr, "TensorValues")?;
 
                 unsafe {
@@ -110,16 +111,29 @@ where
                 let null_terminated_copies: Vec<ffi::CString> = array
                     .iter()
                     .map(|elt| {
-                        let slice = elt.try_utf8_bytes().expect("String data type must provide utf8 bytes");
+                        let slice = elt
+                            .try_utf8_bytes()
+                            .expect("String data type must provide utf8 bytes");
                         ffi::CString::new(slice)
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(OrtError::CStringNulError)?;
 
-                let string_pointers = null_terminated_copies.iter().map(|cstring| cstring.as_ptr()).collect::<Vec<_>>();
+                let string_pointers = null_terminated_copies
+                    .iter()
+                    .map(|cstring| cstring.as_ptr())
+                    .collect::<Vec<_>>();
 
-                unsafe { call_ort(|ort| ort.FillStringTensor.unwrap()(tensor_ptr, string_pointers.as_ptr(), string_pointers.len())) }
-                    .map_err(OrtError::FillStringTensor)?;
+                unsafe {
+                    call_ort(|ort| {
+                        ort.FillStringTensor.unwrap()(
+                            tensor_ptr,
+                            string_pointers.as_ptr(),
+                            string_pointers.len(),
+                        )
+                    })
+                }
+                .map_err(OrtError::FillStringTensor)?;
             }
         }
 
@@ -185,6 +199,7 @@ mod tests {
     use crate::{AllocatorType, MemType};
     use ndarray::{arr0, arr1, arr2, arr3};
     use std::ptr;
+    use test_env_log::test;
 
     #[test]
     fn orttensor_from_array_0d_i32() {
@@ -227,7 +242,11 @@ mod tests {
     #[test]
     fn orttensor_from_array_1d_string() {
         let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).unwrap();
-        let array = arr1(&[String::from("foo"), String::from("bar"), String::from("baz")]);
+        let array = arr1(&[
+            String::from("foo"),
+            String::from("bar"),
+            String::from("baz"),
+        ]);
         let tensor = OrtTensor::from_array(&memory_info, ort_default_allocator(), array).unwrap();
         assert_eq!(tensor.shape(), &[3]);
     }
@@ -235,7 +254,10 @@ mod tests {
     #[test]
     fn orttensor_from_array_3d_str() {
         let memory_info = MemoryInfo::new(AllocatorType::Arena, MemType::Default).unwrap();
-        let array = arr3(&[[["1", "2", "3"], ["4", "5", "6"]], [["7", "8", "9"], ["10", "11", "12"]]]);
+        let array = arr3(&[
+            [["1", "2", "3"], ["4", "5", "6"]],
+            [["7", "8", "9"], ["10", "11", "12"]],
+        ]);
         let tensor = OrtTensor::from_array(&memory_info, ort_default_allocator(), array).unwrap();
         assert_eq!(tensor.shape(), &[2, 2, 3]);
     }

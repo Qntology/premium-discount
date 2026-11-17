@@ -212,7 +212,9 @@ impl From<OrtStatusWrapper> for std::result::Result<(), OrtApiError> {
             match char_p_to_string(raw) {
                 Ok(msg) => Err(OrtApiError::Msg(msg)),
                 Err(err) => match err {
-                    OrtError::StringConversion(OrtApiError::IntoStringError(e)) => Err(OrtApiError::IntoStringError(e)),
+                    OrtError::StringConversion(OrtApiError::IntoStringError(e)) => {
+                        Err(OrtApiError::IntoStringError(e))
+                    }
                     _ => unreachable!(),
                 },
             }
@@ -220,7 +222,9 @@ impl From<OrtStatusWrapper> for std::result::Result<(), OrtApiError> {
     }
 }
 
-pub(crate) fn status_to_result(status: *const sys::OrtStatus) -> std::result::Result<(), OrtApiError> {
+pub(crate) fn status_to_result(
+    status: *const sys::OrtStatus,
+) -> std::result::Result<(), OrtApiError> {
     let status_wrapper: OrtStatusWrapper = status.into();
     status_wrapper.into()
 }

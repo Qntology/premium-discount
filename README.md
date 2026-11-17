@@ -1326,7 +1326,7 @@ raon-zena 의 범용 엔진을 `crates/` 로 옮기고, Relay · 창 계산 crat
 
 | crate | 출처 | 한 일 |
 | --- | --- | --- |
-| `onnxruntime-sys` · `onnxruntime` | raon-zena (onnxruntime-rs 0.0.14 벤더 판) | 실행 시 라이브러리 찾는 곳에 `%LOCALAPPDATA%\premium.discount\models\onnxruntime` 을 더함. 오래된 시험 대상 오류 두 가지(`test_env_log` 가져오기, bindgen 배치 시험 261개의 null 역참조)와 libc 기호 경고 25개(`memcpy` 등 다시 선언)를 없앰 |
+| `onnxruntime-sys` · `onnxruntime` | logis-center `commerce/crates/onnxruntime(-sys)` (onnxruntime-rs 0.0.14 벤더 판, ORT 1.28.0). 2026-11-18 에 logis-center 판을 기준으로 다시 맞춤 (앞서는 raon-zena 판) | logis-center 판 그대로에, 기본 꺼진 기능 `runtime-load` 만 더함: ONNX Runtime 을 링크하지 않고 실행할 때 불러오고(`dynload`, 찾는 곳 `ORT_DYLIB_PATH` · 실행 파일 옆 · `%LOCALAPPDATA%\{premium.discount,RaonZena,logis-center}\models\onnxruntime` · 빌드가 준비한 라이브러리), 빌드는 라이브러리 준비에 실패해도(`ORT_STRATEGY=skip`, 내려받기 404) 계속함. nlp 의 `stanza` 기능이 켬. 자체 시험은 돌리지 않음(`[lib] test = false`: bindgen 배치 시험이 Rust 1.99 에서 null 역참조 오류) |
 | `premium-discount-nlp` | raon-zena `zena-nlp` | 기능 `granite`(candle) · `stanza`(ONNX). 모델은 `PD_*` → `RAON_*` → `premium.discount` · `RaonZena` · `logis-center` 의 `models` 순서로 찾음 |
 | `premium-discount-nms` | raon-zena `nlp-nms-router` 의 중립 부분 | `DomainBank<M, E>`(항목 내용 `M` 은 부르는 쪽 타입, `DomainSpec` 으로 만듦), 호출어는 `set_wake_words` 로 정함(기본 없음) |
 | `premium-discount-sds` | raon-zena `zena-sds` 전체 | `Moments` 와 합침. 장부 recipe 그대로 |

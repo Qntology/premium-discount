@@ -8,8 +8,8 @@ use tracing::debug;
 use onnxruntime_sys as sys;
 
 use crate::{
-    error::status_to_result, g_ort, memory::MemoryInfo, tensor::ndarray_tensor::NdArrayTensor, OrtError, Result,
-    TypeToTensorElementDataType,
+    error::status_to_result, g_ort, memory::MemoryInfo, tensor::ndarray_tensor::NdArrayTensor,
+    OrtError, Result, TypeToTensorElementDataType,
 };
 
 /// Tensor containing data owned by the ONNX Runtime C library, used to return values from inference.
@@ -95,13 +95,18 @@ where
         let mut is_tensor = 0;
         let status = unsafe { g_ort().IsTensor.unwrap()(self.tensor_ptr, &mut is_tensor) };
         status_to_result(status).map_err(OrtError::IsTensor)?;
-        (is_tensor == 1).then(|| ()).ok_or(OrtError::IsTensorCheck)?;
+        (is_tensor == 1)
+            .then(|| ())
+            .ok_or(OrtError::IsTensorCheck)?;
 
         // Get pointer to output tensor float values
         let mut output_array_ptr: *mut T = std::ptr::null_mut();
         let output_array_ptr_ptr: *mut *mut T = &mut output_array_ptr;
-        let output_array_ptr_ptr_void: *mut *mut std::ffi::c_void = output_array_ptr_ptr as *mut *mut std::ffi::c_void;
-        let status = unsafe { g_ort().GetTensorMutableData.unwrap()(self.tensor_ptr, output_array_ptr_ptr_void) };
+        let output_array_ptr_ptr_void: *mut *mut std::ffi::c_void =
+            output_array_ptr_ptr as *mut *mut std::ffi::c_void;
+        let status = unsafe {
+            g_ort().GetTensorMutableData.unwrap()(self.tensor_ptr, output_array_ptr_ptr_void)
+        };
         status_to_result(status).map_err(OrtError::IsTensor)?;
         assert_ne!(output_array_ptr, std::ptr::null_mut());
 

@@ -24,7 +24,7 @@
 | `premium-discount-sds` | SDS 통계: `Moments` · `Welford`(최근 값 고리) · 스코프 백오프 `Ledger` · 혼동 장부 · 이중 센터링 · 적응 배타 배정 (raon-zena `zena-sds` 를 합침) | nav, nms, relay, raon-zena |
 | `premium-discount-manifest` | 고정 파일 내려받기 검증(`.part` · SHA-256 · 이름 바꾸기 · 안전한 경로) | app, raon-zena 아바타 카탈로그 |
 | `premium-discount-sensor` | 가상 이벤트 카메라(WGSL · CPU), ROI 추적, 화면 극좌표, NaFlex 패치, 화면 종류 `VisionKind` | nms, vision, raon-zena |
-| `onnxruntime-sys` · `onnxruntime` | ONNX Runtime 을 실행할 때 불러오는 바인딩(onnxruntime-rs 0.0.14 벤더 판) | nlp |
+| `onnxruntime-sys` · `onnxruntime` | ONNX Runtime 바인딩(logis-center 판 onnxruntime-rs 0.0.14 벤더 사본, ORT 1.28.0). 기능 `runtime-load` 는 링크 대신 실행할 때 불러옴 | nlp |
 | `premium-discount-nlp` | Stanza(ONNX, 12개 언어) · granite-embedding-97m-multilingual-r2(384차원), 모델 폴더 찾기 | nms, relay |
 | `premium-discount-nms` | 도메인 중립 NLP-NMS: 조사 떼기 · 역할 · 부정 분석 · 해시 / granite 임베더 · 제네릭 도메인 은행 · 구간 / 시간 의미 / 공간-글 NMS | relay, raon-zena 라우터 |
 | `premium-discount-quant` | safetensors · GGUF v3 · imatrix · K-quant 인코더 · 융합 커널 · 어휘 잘라 내기(Raon 고정 규칙, 언어 규칙 `trim`, ColdGuard) | vision, raon-zena `raon-quant` · `raon-infer` |

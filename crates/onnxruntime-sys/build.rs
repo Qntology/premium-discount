@@ -1,4 +1,4 @@
-#![allow(dead_code, mismatched_lifetime_syntaxes)]
+#![allow(dead_code)]
 
 use std::{
     borrow::Cow,
@@ -39,22 +39,20 @@ fn main() {
     println!("Build script disabled!");
 }
 
-#[cfg(not(feature = "disable-sys-build-script"))]
+#[cfg(all(not(feature = "disable-sys-build-script"), feature = "runtime-load"))]
 fn main() {
+    // premium-discount `runtime-load`: ONNX Runtime 은 실행할 때 불러오고(lib.rs 의 dynload) 링크하지 않습니다. 빌드는 개발 빌드 · 시험이
+    // 찾을 라이브러리만 준비합니다(공식 배포판 내려받기, 또는 ORT_STRATEGY=system + ORT_LIB_LOCATION). ORT_STRATEGY=skip 이거나
+    // 준비에 실패하면(내려받기 404 등) 라이브러리 없이 빌드하고, 실행할 때 ORT_DYLIB_PATH 등으로 찾습니다.
     println!("cargo:rerun-if-env-changed={}", ORT_ENV_STRATEGY);
     println!("cargo:rerun-if-env-changed={}", ORT_ENV_GPU);
     println!("cargo:rerun-if-env-changed={}", ORT_ENV_SYSTEM_LIB_LOCATION);
-
-    // Raon Zena: ONNX Runtime is loaded at run time (`dynload` in lib.rs), never linked, so a binary starts and
-    // falls back without it. The build only fetches the official prebuilt (or reads ORT_LIB_LOCATION) to give
-    // development builds and tests a library to find; `ORT_STRATEGY=skip`, or a failed download, builds without one.
     if env::var(ORT_ENV_STRATEGY).as_deref() == Ok("skip") {
         println!("cargo:rustc-env=ORT_BUILD_LIB_DIR=");
         generate_bindings(Path::new(""));
         return;
     }
-    let prepared = std::panic::catch_unwind(prepare_libort_dir);
-    match prepared {
+    match std::panic::catch_unwind(prepare_libort_dir) {
         Ok(libort_install_dir) => {
             let include_dir = libort_install_dir.join("include");
             let lib_dir = libort_install_dir.join("lib");
@@ -73,6 +71,27 @@ fn main() {
             generate_bindings(Path::new(""));
         }
     }
+}
+
+#[cfg(all(not(feature = "disable-sys-build-script"), not(feature = "runtime-load")))]
+fn main() {
+    let libort_install_dir = prepare_libort_dir();
+
+    let include_dir = libort_install_dir.join("include");
+    let lib_dir = libort_install_dir.join("lib");
+
+    println!("Include directory: {:?}", include_dir);
+    println!("Lib directory: {:?}", lib_dir);
+
+    // Tell cargo to tell rustc to link onnxruntime shared library.
+    println!("cargo:rustc-link-lib=onnxruntime");
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+    println!("cargo:rerun-if-env-changed={}", ORT_ENV_STRATEGY);
+    println!("cargo:rerun-if-env-changed={}", ORT_ENV_GPU);
+    println!("cargo:rerun-if-env-changed={}", ORT_ENV_SYSTEM_LIB_LOCATION);
+
+    generate_bindings(&include_dir);
 }
 
 #[cfg(not(feature = "generate-bindings"))]
@@ -95,7 +114,14 @@ fn generate_bindings(_include_dir: &Path) {
 fn generate_bindings(include_dir: &Path) {
     let clang_args = &[
         format!("-I{}", include_dir.display()),
-        format!("-I{}", include_dir.join("onnxruntime").join("core").join("session").display()),
+        format!(
+            "-I{}",
+            include_dir
+                .join("onnxruntime")
+                .join("core")
+                .join("session")
+                .display()
+        ),
     ];
 
     // Tell cargo to invalidate the built crate whenever the wrapper changes
@@ -132,7 +158,9 @@ fn generate_bindings(include_dir: &Path) {
         .join(env::var("CARGO_CFG_TARGET_ARCH").unwrap())
         .join("bindings.rs");
     println!("cargo:rerun-if-changed={:?}", generated_file);
-    bindings.write_to_file(&generated_file).expect("Couldn't write bindings!");
+    bindings
+        .write_to_file(&generated_file)
+        .expect("Couldn't write bindings!");
 }
 
 fn download<P>(source_url: &str, target_file: P)
@@ -144,7 +172,10 @@ where
         .call()
         .unwrap_or_else(|err| panic!("ERROR: Failed to download {}: {:?}", source_url, err));
 
-    let len = resp.header("Content-Length").and_then(|s| s.parse::<usize>().ok()).unwrap();
+    let len = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap();
     let mut reader = resp.into_reader();
     // FIXME: Save directly to the file
     let mut buffer = vec![];
@@ -326,9 +357,11 @@ impl OnnxPrebuiltArchive for Triplet {
             | (Os::Windows, Architecture::Arm64, Accelerator::None)
             | (Os::Linux, Architecture::X86_64, Accelerator::None)
             | (Os::MacOs, Architecture::X86_64, Accelerator::None)
-            | (Os::MacOs, Architecture::Arm64, Accelerator::None) => {
-                Cow::from(format!("{}-{}", self.os.as_onnx_str(), self.arch.as_onnx_str()))
-            }
+            | (Os::MacOs, Architecture::Arm64, Accelerator::None) => Cow::from(format!(
+                "{}-{}",
+                self.os.as_onnx_str(),
+                self.arch.as_onnx_str()
+            )),
             // onnxruntime-win-gpu-x64-1.28.0.zip
             // Note how this one is inverted from the linux one next
             (Os::Windows, Architecture::X86_64, Accelerator::Gpu) => Cow::from(format!(
@@ -357,7 +390,10 @@ impl OnnxPrebuiltArchive for Triplet {
 
 fn prebuilt_archive_url() -> (PathBuf, String) {
     let triplet = Triplet {
-        os: env::var("CARGO_CFG_TARGET_OS").expect("Unable to get TARGET_OS").parse().unwrap(),
+        os: env::var("CARGO_CFG_TARGET_OS")
+            .expect("Unable to get TARGET_OS")
+            .parse()
+            .unwrap(),
         arch: env::var("CARGO_CFG_TARGET_ARCH")
             .expect("Unable to get TARGET_ARCH")
             .parse()
@@ -371,7 +407,10 @@ fn prebuilt_archive_url() -> (PathBuf, String) {
         ORT_VERSION,
         triplet.os.archive_extension()
     );
-    let prebuilt_url = format!("{}/v{}/{}", ORT_RELEASE_BASE_URL, ORT_VERSION, prebuilt_archive);
+    let prebuilt_url = format!(
+        "{}/v{}/{}",
+        ORT_RELEASE_BASE_URL, ORT_VERSION, prebuilt_archive
+    );
 
     (PathBuf::from(prebuilt_archive), prebuilt_url)
 }
@@ -389,7 +428,11 @@ fn prepare_libort_dir_prebuilt() -> PathBuf {
         println!("Creating directory {:?}", out_dir);
         fs::create_dir_all(&out_dir).unwrap();
 
-        println!("Downloading {} into {}", prebuilt_url, downloaded_file.display());
+        println!(
+            "Downloading {} into {}",
+            prebuilt_url,
+            downloaded_file.display()
+        );
         download(&prebuilt_url, &downloaded_file);
     }
 
@@ -405,7 +448,10 @@ fn prepare_libort_dir() -> PathBuf {
     let strategy = env::var(ORT_ENV_STRATEGY);
     println!(
         "strategy: {:?}",
-        strategy.as_ref().map(String::as_str).unwrap_or_else(|_| "unknown")
+        strategy
+            .as_ref()
+            .map(String::as_str)
+            .unwrap_or_else(|_| "unknown")
     );
     match strategy.as_ref().map(String::as_str) {
         Ok("download") | Err(_) => prepare_libort_dir_prebuilt(),
