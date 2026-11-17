@@ -13,12 +13,17 @@
       {
         "label": "main",
         "title": "premium.discount",
-        "width": 1100,
-        "height": 800,
-        "minWidth": 380,
-        "minHeight": 520
+        "width": 360,
+        "height": 56,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": false
       }
     ],
+    "macOSPrivateApi": true,
     "security": {
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
     }

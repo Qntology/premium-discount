@@ -1,5 +1,6 @@
 //! premium.discount 데스크톱 앱: Tauri 창 하나가 화면(../ui/dist)을 보여 주고, 화면의 명령(`cmd_*`)을 앱 코어(상위 크레이트)에 연결한다.
 //! 명령 계층(AppCore)은 프레임워크와 무관하므로 여기서는 감싸기만 한다. 설정은 settings.rs.
+//! 데스크톱 창은 테두리 없는 투명 오버레이(tauri.conf.json)이고, 단계마다 크기 · 위치는 화면(ui/stage.ts)이 바꾼다.
 //!
 //! 코어(모델 로드 약 2초)는 첫 명령이 올 때 만든다. 창은 바로 뜨고, 만들지 못하면(모델 폴더 없음 등)
 //! 모델 명령(`cmd_model_*`) 말고는 not_ready 오류를 돌려주며, 화면이 원인과 "모델 내려받기"를 보여 준다.
@@ -14,6 +15,7 @@ use premium_discount_app::{
     FilterSetting, LoadOptions, LocalMatchDto, LoginStartResult, LoginStatus, MergedSearch, ModelFetcher, ModelStatus, Outbox, SearchArgs, SwitchFilter, Variant,
     SearchLocalArgs, SearchResponse, SessionArgs, SessionInfo, SessionStore, SubmitArgs, SubmitResult, SyncArgs,
 };
+use premium_discount_app::commands::{VerdictsArgs, VerdictsResult, VoteArgs, VoteResult};
 use serde_json::Value;
 use settings::Settings;
 use tauri::{Manager, State};
@@ -238,6 +240,18 @@ async fn cmd_flush_outbox(shell: State<'_, Shell>) -> Result<FlushSummary, Comma
     shell.core().await?.cmd_flush_outbox().await
 }
 
+// 추천 / 비추천과 전역 판정. 코어(app/src/commands.rs)와 화면(ui/commands.ts)에는 있었지만 여기에 등록되지 않아
+// Tauri 창에서는 투표가 unknown command 로 실패했다. 인자 형식은 상위 크레이트의 VoteArgs · VerdictsArgs 그대로다.
+#[tauri::command]
+async fn cmd_vote(shell: State<'_, Shell>, args: VoteArgs) -> Result<VoteResult, CommandError> {
+    shell.core().await?.cmd_vote(args).await
+}
+
+#[tauri::command]
+async fn cmd_verdicts(shell: State<'_, Shell>, args: VerdictsArgs) -> Result<VerdictsResult, CommandError> {
+    shell.core().await?.cmd_verdicts(args).await
+}
+
 #[tauri::command]
 async fn cmd_session(shell: State<'_, Shell>, args: Option<SessionArgs>) -> Result<SessionInfo, CommandError> {
     shell.core().await?.cmd_session(args.unwrap_or_default()).await
@@ -307,6 +321,8 @@ pub fn run() {
             cmd_search_remote,
             cmd_search_merged,
             cmd_flush_outbox,
+            cmd_vote,
+            cmd_verdicts,
             cmd_session,
             cmd_login_start,
             cmd_login_status,
