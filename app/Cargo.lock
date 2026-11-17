@@ -4961,6 +4961,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "premium-discount-analytic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "flate2",
+ "premium-discount-nav",
+ "premium-discount-nms",
+ "premium-discount-sds",
+ "premium-discount-verdict",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "premium-discount-app"
 version = "0.1.0"
 dependencies = [
@@ -4972,8 +4988,10 @@ dependencies = [
  "getrandom 0.3.4",
  "half",
  "lancedb",
+ "premium-discount-analytic",
  "premium-discount-filter",
  "premium-discount-manifest",
+ "premium-discount-nav",
  "premium-discount-schema",
  "reqwest",
  "safetensors 0.8.0",
@@ -5010,6 +5028,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "premium-discount-nav"
+version = "0.1.0"
+dependencies = [
+ "premium-discount-identity",
+ "premium-discount-sds",
+ "premium-discount-verdict",
+ "serde",
+]
+
+[[package]]
+name = "premium-discount-nms"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "premium-discount-sds",
+ "premium-discount-sensor",
+ "serde",
+]
+
+[[package]]
 name = "premium-discount-schema"
 version = "0.1.0"
 dependencies = [
@@ -5018,6 +5056,29 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "unicode-normalization",
+]
+
+[[package]]
+name = "premium-discount-sds"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "premium-discount-sensor"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "premium-discount-verdict"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

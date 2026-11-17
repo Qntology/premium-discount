@@ -1,0 +1,18 @@
+[package]
+name = "premium-discount-analytic"
+description = "웹 행동 분석 코어: 수집 사건 → 웹 체크포인트 · 선택 대조(고른 요소 vs 지나친 형제) · 마찰 에피소드, 속성 없는 PUG, 결정론적 시간 해석, 분석 질의 사전, 사건 BLOB 코덱 (logis-center analytic · tracker-logis-center 이식)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+premium-discount-nav.workspace = true
+premium-discount-nms.workspace = true
+premium-discount-sds.workspace = true
+premium-discount-verdict.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+flate2 = "1"
+base64 = "0.22"

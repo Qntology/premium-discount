@@ -39,6 +39,10 @@ test('명령 이름과 인자 모양이 Rust와 맺은 계약(command_contract.j
 	await c.modelDownload(sample('cmd_model_download').variant)
 	await c.modelDownloadCancel()
 	await c.itemDraft(sample('cmd_item_draft'))
+	await c.analyticSite(sample('cmd_analytic_site'))
+	await c.analyticSync(sample('cmd_analytic_sync'))
+	await c.analyticReport(sample('cmd_analytic_report'))
+	await c.analyticForget(sample('cmd_analytic_forget'))
 
 	const names = Object.keys(contract).filter((k) => !k.startsWith('_'))
 	assert.deepEqual(calls.map((x) => x.cmd), names)

@@ -21,6 +21,9 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 premium-discount-schema = { path = "../crates/premium-discount-schema" }
 premium-discount-filter = { path = "../crates/premium-discount-filter" }
 premium-discount-manifest = { path = "../crates/premium-discount-manifest" }
+# 웹 행동 분석 코어 (수집 사건 · PUG · 질의 · 시간 · 퍼널)와 웹 체크포인트 해시
+premium-discount-analytic = { path = "../crates/premium-discount-analytic" }
+premium-discount-nav = { path = "../crates/premium-discount-nav" }
 anyhow = "1"
 async-trait = "0.1"
 candle-core = "0.11.0"

@@ -6,6 +6,7 @@ import { renderHtml } from './renderHtml'
 import { handleEvaluations, type EvalEnv } from './evaluations'
 import { handleGraph } from './graph'
 import { handleNavTrials } from './navtrials'
+import { handleAnalytic, type AnalyticEnv } from './analytic'
 import { handleSession } from './session'
 
 /*
@@ -387,6 +388,12 @@ export default {
 		var navResponse = await handleNavTrials(request, env as unknown as EvalEnv)
 		if(navResponse){
 			return navResponse
+		}
+
+		// 웹 행동 분석 수집 (/analytic/events: 수집 스크립트, /analytic/sites: 사이트 주인의 지갑 서명)
+		var analyticResponse = await handleAnalytic(request, env as unknown as AnalyticEnv)
+		if(analyticResponse){
+			return analyticResponse
 		}
 
 		// 그래프 API (/graph*, 공개)

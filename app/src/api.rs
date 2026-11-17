@@ -4,6 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::AppError;
 
@@ -222,6 +223,17 @@ pub trait EvalBackend: Send + Sync {
     fn session(&self) -> Session {
         Session::anonymous()
     }
+
+    // ---- 웹 행동 분석 (사이트 주인, 로그인 세션) ----
+
+    /// 사이트 확인 (POST /analytic/sites): 서버가 사이트 첫 화면의 `<meta name="premium-discount-site">` 를 본다
+    async fn analytic_site(&self, _host: &str) -> Result<Value, AppError> {
+        Err(AppError::Rejected("web analytics is not supported by this backend".into()))
+    }
+    /// 원시 사건 한 쪽 (GET /analytic/events, (시각, id) 커서)
+    async fn analytic_events(&self, _host: &str, _cursor: &crate::analytic::Cursor, _limit: u32) -> Result<crate::analytic::EventsPage, AppError> {
+        Err(AppError::Rejected("web analytics is not supported by this backend".into()))
+    }
 }
 
 #[async_trait]
@@ -252,6 +264,12 @@ impl<T: EvalBackend + ?Sized> EvalBackend for Arc<T> {
     }
     fn session(&self) -> Session {
         (**self).session()
+    }
+    async fn analytic_site(&self, host: &str) -> Result<Value, AppError> {
+        (**self).analytic_site(host).await
+    }
+    async fn analytic_events(&self, host: &str, cursor: &crate::analytic::Cursor, limit: u32) -> Result<crate::analytic::EventsPage, AppError> {
+        (**self).analytic_events(host, cursor, limit).await
     }
 }
 
@@ -466,6 +484,15 @@ impl EvalBackend for HttpBackend {
 
     fn session(&self) -> Session {
         HttpBackend::session(self)
+    }
+
+    async fn analytic_site(&self, host: &str) -> Result<Value, AppError> {
+        self.post("/analytic/sites", &serde_json::json!({ "host": host })).await
+    }
+
+    async fn analytic_events(&self, host: &str, cursor: &crate::analytic::Cursor, limit: u32) -> Result<crate::analytic::EventsPage, AppError> {
+        let (since, limit) = (cursor.since.to_string(), limit.to_string());
+        self.get("/analytic/events", &[("host", host), ("since", &since), ("after_id", &cursor.after_id), ("limit", &limit)]).await
     }
 }
 

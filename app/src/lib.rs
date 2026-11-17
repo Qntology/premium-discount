@@ -3,6 +3,7 @@
 //! - 질문 임베딩 -> 서버 벡터 검색 (search)
 //! 임베딩은 google/embeddinggemma-2 모듈(embeddinggemma.rs)을 쓰고, 욕설 필터는 trait으로 분리해 두었다.
 
+pub mod analytic;
 pub mod api;
 pub mod commands;
 pub mod embedding;

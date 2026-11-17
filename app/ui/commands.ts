@@ -331,6 +331,14 @@ export interface Commands {
 	modelDownloadCancel(): Promise<FetchProgress>
 	/** 쇼핑 페이지 글 → items 초안 (이 기기의 Qwen3.5-0.8B. 모델이 없으면 not_ready) */
 	itemDraft(args: { text: string; link?: string }): Promise<ItemDraft>
+	/** 웹 행동 분석: 사이트 확인 (사이트 첫 화면의 <meta name="premium-discount-site" content="<로그인 주소>">) */
+	analyticSite(args: { host: string }): Promise<unknown>
+	/** 웹 행동 분석: 원시 사건 받기 + 기기 구조화 (DELTA · TOMBSTONE GUARD) */
+	analyticSync(args: { host: string; max_pages?: number }): Promise<unknown>
+	/** 웹 행동 분석: 자연어 질의 리포트 (기간은 앱이 다시 계산, 퍼널 · 병목 · 선택 대조) */
+	analyticReport(args: { host: string; query: string; lang?: string; top_k?: number }): Promise<unknown>
+	/** 웹 행동 분석: 사건 지우기 (다시 받지 않는다) */
+	analyticForget(args: { ids: string[] }): Promise<unknown>
 }
 
 export function makeCommands(invoke: Invoke): Commands {
@@ -359,6 +367,10 @@ export function makeCommands(invoke: Invoke): Commands {
 		modelDownload: (variant) => call('cmd_model_download', { variant }),
 		modelDownloadCancel: () => call('cmd_model_download_cancel'),
 		itemDraft: (args) => call('cmd_item_draft', args),
+		analyticSite: (args) => call('cmd_analytic_site', args),
+		analyticSync: (args) => call('cmd_analytic_sync', args),
+		analyticReport: (args) => call('cmd_analytic_report', args),
+		analyticForget: (args) => call('cmd_analytic_forget', args),
 	}
 }
 

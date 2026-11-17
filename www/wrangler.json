@@ -46,6 +46,14 @@
 				"limit": 60,
 				"period": 60
 			}
+		},
+		{
+			"name": "ANALYTIC_WRITE_LIMITER",
+			"namespace_id": "1003",
+			"simple": {
+				"limit": 120,
+				"period": 60
+			}
 		}
 	],
 	"assets": {

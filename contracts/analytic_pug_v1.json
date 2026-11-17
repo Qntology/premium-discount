@@ -1,0 +1,71 @@
+{
+ "schema": "analytic-pug/1",
+ "note": "요소(outerHTML) → 속성 없는 PUG. 수집 스크립트(www/public/static/js/tracker.js 의 toPug, 브라우저 DOM)와 crates/premium-discount-analytic 의 html_to_pug(예전 HTML 사건)가 같은 결과를 내야 한다. 규칙은 logis-center 의 ListMode + strip_pug_attributes 이고, 입력 칸 · 글 상자의 값은 내지 않는다. 들여쓰기는 단계마다 공백 4칸.",
+ "cases": [
+  {
+   "name": "button with build classes",
+   "html": "<button class=\"btn css-1x2y3z\" id=\"pay\">간편결제</button>",
+   "pug": "button | 간편결제\n"
+  },
+  {
+   "name": "wrappers fold, thousands separators go",
+   "html": "<div class=\"w\"><span>합계 <b>12,345</b>원</span></div>",
+   "pug": "span | 합계 12345 원\n"
+  },
+  {
+   "name": "form: selected option only, no input value, hidden layer and script dropped",
+   "html": "<div><select name=\"ship\"><option value=\"1\">일반</option><option value=\"2\" selected>빠른배송</option></select><input type=\"text\" value=\"홍길동\"><div style=\"position:absolute\">팝업</div><script>x()</script></div>",
+   "pug": "div\n    select\n        option | 빠른배송\n    input\n"
+  },
+  {
+   "name": "nothing to read",
+   "html": "<div><span> </span></div>",
+   "pug": ""
+  },
+  {
+   "name": "a lone paragraph is a wrapper",
+   "html": "<p>A &amp; B&nbsp;&#39;C&#x27;</p>",
+   "pug": "| A & B 'C'\n"
+  },
+  {
+   "name": "product card: link and image keep the structure",
+   "html": "<li class=\"card\"><a href=\"/p/1\"><img src=\"a.png\"><span>상품 1</span></a><span>무료배송</span></li>",
+   "pug": "li\n    a\n        img\n        | 상품 1\n    | 무료배송\n"
+  },
+  {
+   "name": "hidden list item text is not folded in",
+   "html": "<ul><li>A</li><li style=\"position: fixed; top: 0\">광고</li><li>B</li></ul>",
+   "pug": "ul | A B\n"
+  },
+  {
+   "name": "textarea content is not sent",
+   "html": "<label>메모 <textarea>문 앞에 두세요</textarea></label>",
+   "pug": "label\n    | 메모\n    textarea\n"
+  },
+  {
+   "name": "select without a chosen option",
+   "html": "<select><option>A</option><option>B</option></select>",
+   "pug": "select\n"
+  },
+  {
+   "name": "nested wrappers",
+   "html": "<div><div><div><button>담기</button></div></div></div>",
+   "pug": "button | 담기\n"
+  },
+  {
+   "name": "long text stays on its own line",
+   "html": "<td>이 상품은 주문 제작 상품이라 결제 후 취소와 교환이 어렵습니다. 배송까지 영업일 기준 칠 일에서 십 일이 걸리며 지역에 따라 더 걸릴 수 있습니다.</td>",
+   "pug": "td\n    | 이 상품은 주문 제작 상품이라 결제 후 취소와 교환이 어렵습니다. 배송까지 영업일 기준 칠 일에서 십 일이 걸리며 지역에 따라 더 걸릴 수 있습니다.\n"
+  },
+  {
+   "name": "an area the site excluded (data-pd-ignore) is left out of its parent",
+   "html": "<div><button>담기</button><div data-pd-ignore><button>관리자 메뉴</button></div></div>",
+   "pug": "div\n    button | 담기\n"
+  },
+  {
+   "name": "base64 image and svg icon are dropped",
+   "html": "<a href=\"/cart\"><img src=\"data:image/png;base64,AAAA\"><svg><path d=\"M0\"/></svg>장바구니</a>",
+   "pug": "a | 장바구니\n"
+  }
+ ]
+}

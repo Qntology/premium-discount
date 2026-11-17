@@ -96,5 +96,31 @@
       "text": "겨울 패딩 최대 70% 할인",
       "link": "https://shop.example/padding"
     }
+  },
+  "cmd_analytic_site": {
+    "args": {
+      "host": "shop.example.com"
+    }
+  },
+  "cmd_analytic_sync": {
+    "args": {
+      "host": "shop.example.com",
+      "max_pages": 5
+    }
+  },
+  "cmd_analytic_report": {
+    "args": {
+      "host": "shop.example.com",
+      "query": "이번 달 결제 이탈 원인이 뭐야?",
+      "lang": "ko",
+      "top_k": 5
+    }
+  },
+  "cmd_analytic_forget": {
+    "args": {
+      "ids": [
+        "0190f0a0-0000-7000-8000-0000000000bb"
+      ]
+    }
   }
 }

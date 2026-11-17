@@ -10,11 +10,15 @@
 | `verdict_v2.json` | v2 매개변수와 사례 25개(v1 사례 19개 + 접근성 내비게이션 사례 6개) |
 | `gen_wallet_v1.mjs` | 인증의 지갑 갈래(사용자가 시드 구문을 보관하는 익명 계정) 참조 구현. ethers 로 `wallet_v1.json` 을 다시 씁니다 |
 | `wallet_v1.json` | 시드 구문 → 주소 · 개인 키 2건, EIP-191 서명 3건, 요청 서명 2건, 거절할 시드 구문 3건. 서버(`www/src/auth.ts`)와 `crates/premium-discount-identity` 가 같은 값을 냅니다 |
+| `gen_analytic_blob_v1.mjs` | 웹 분석 사건 BLOB 코덱의 사례를 pako 로 만듭니다(`analytic_blob_v1.json` 을 다시 씀) |
+| `analytic_blob_v1.json` | D1 `data` 칸의 여러 모양(바이트 배열 · Buffer · `{"0":…}` · base64 · JSON · 원시값) 19 사례. 서버 `www/src/blob.ts` 와 `crates/premium-discount-analytic` 의 `blob` 이 같은 객체를 냅니다(logis-center BUG-RT-2/3/4 사례 포함) |
+| `analytic_pug_v1.json` | 요소 → 속성 없는 PUG 13 사례. 수집 스크립트(`www/public/static/js/tracker.js` 의 `toPug`, 브라우저 DOM)와 `premium-discount-analytic` 의 `html_to_pug` 가 같은 결과를 냅니다 |
 
 ```bash
 python contracts/gen_verdict_v1.py   # premium-discount 폴더에서
 python contracts/gen_verdict_v2.py
 node contracts/gen_wallet_v1.mjs     # www/node_modules 의 ethers 를 씁니다
+node contracts/gen_analytic_blob_v1.mjs   # www/node_modules 의 pako 를 씁니다
 ```
 
 ## 지갑 갈래: 요청 서명 (`pd-wallet/1`)

@@ -24,6 +24,7 @@ members = [
     "premium-discount-quant",
     "premium-discount-vision",
     "premium-discount-relay",
+    "premium-discount-analytic",
     "onnxruntime-sys",
     "onnxruntime",
 ]
@@ -64,6 +65,7 @@ premium-discount-nms = { path = "premium-discount-nms" }
 premium-discount-quant = { path = "premium-discount-quant" }
 premium-discount-vision = { path = "premium-discount-vision" }
 premium-discount-relay = { path = "premium-discount-relay" }
+premium-discount-analytic = { path = "premium-discount-analytic" }
 
 # candle → Qntology/candle-rocm-vulkan 포크 (CUDA · ROCm-HIP · Vulkan · Metal). raon-zena · app/ 과 같은 커밋.
 # [patch] 는 빌드하는 쪽 루트의 것만 적용되므로, 이 crate 들을 링크하는 작업 공간도 같은 줄을 둔다.
@@ -76,4 +78,13 @@ opt-level = 3
 [profile.dev.package.candle-nn]
 opt-level = 3
 [profile.dev.package.gemm]
+opt-level = 3
+# hashId(secp256k1 공개 키 주소)를 시험에서 수천 번 부른다(웹 분석의 페이지 · 요소 해시). 디버그 빌드에서도 빠르게
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.tiny-keccak]
 opt-level = 3

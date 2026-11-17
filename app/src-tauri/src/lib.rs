@@ -140,7 +140,36 @@ async fn build_core(settings: &Settings, filter: Arc<SwitchFilter>) -> Result<Co
     let outbox = Outbox::open(&settings.data_dir).await?;
     let store = SessionStore::new(settings.data_dir.join("session.json"));
     let info = AppInfo { model_dir: settings.model_dir.display().to_string(), data_dir: settings.data_dir.display().to_string(), server_url: settings.server_url.clone() };
-    Ok(AppCore::new(Evaluator::new(backend, embedder, filter), outbox).with_session_store(store).with_info(info))
+    // 웹 행동 분석 저장소 (사이트 주인이 받아 온 사건). 헤드리스 코어(app/src/main.rs)와 같은 자리
+    let analytic = premium_discount_app::analytic::AnalyticStore::open(settings.data_dir.join("analytic")).await?;
+    Ok(AppCore::new(Evaluator::new(backend, embedder, filter), outbox)
+        .with_session_store(store)
+        .with_info(info)
+        .with_analytic(analytic))
+}
+
+// 웹 행동 분석 (사이트 주인): 사이트 확인 · 받기 + 구조화 · 리포트 · 지우기. 인자는 상위 크레이트(premium-discount-schema)의 형식 그대로다
+#[tauri::command]
+async fn cmd_analytic_site(shell: State<'_, Shell>, args: premium_discount_app::commands::AnalyticSiteArgs) -> Result<serde_json::Value, CommandError> {
+    shell.core().await?.cmd_analytic_site(args).await
+}
+
+#[tauri::command]
+async fn cmd_analytic_sync(shell: State<'_, Shell>, args: premium_discount_app::commands::AnalyticSyncArgs) -> Result<serde_json::Value, CommandError> {
+    shell.core().await?.cmd_analytic_sync(args).await
+}
+
+#[tauri::command]
+async fn cmd_analytic_report(
+    shell: State<'_, Shell>,
+    args: premium_discount_app::commands::AnalyticReportArgs,
+) -> Result<premium_discount_app::analytic::AnalyticReport, CommandError> {
+    shell.core().await?.cmd_analytic_report(args).await
+}
+
+#[tauri::command]
+async fn cmd_analytic_forget(shell: State<'_, Shell>, args: premium_discount_app::commands::AnalyticForgetArgs) -> Result<serde_json::Value, CommandError> {
+    shell.core().await?.cmd_analytic_forget(args).await
 }
 
 // ---- 명령: AppCore를 한 줄씩 감싼다. 이름과 인자(`args` 하나)는 화면의 ui/commands.ts와 같다 ----
@@ -327,6 +356,10 @@ pub fn run() {
             cmd_login_start,
             cmd_login_status,
             cmd_logout,
+            cmd_analytic_site,
+            cmd_analytic_sync,
+            cmd_analytic_report,
+            cmd_analytic_forget,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 앱을 실행하지 못했습니다");

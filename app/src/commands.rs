@@ -40,6 +40,7 @@ use crate::session::{SavedSession, SessionStore};
 // 와 raon-zena 가 같은 정의를 쓴다. 앱 안의 타입에 기대는 결과(`VerdictsResult`, `AppStatus`)만 여기에 남는다.
 use premium_discount_schema::contract::blank_to_none;
 pub use premium_discount_schema::contract::{
+    AnalyticForgetArgs, AnalyticReportArgs, AnalyticSiteArgs, AnalyticSyncArgs,
     AppInfo, CommandError, FlushSummary, LocalMatchDto, LoginStartResult, LoginStatus, RejectedDto, SearchArgs, SearchLocalArgs,
     SessionArgs, SessionInfo, SubmitArgs, SubmitResult, SyncArgs, VerdictsArgs, VoteArgs, VoteRejectedDto, VoteResult, COMMANDS,
     DEFAULT_TOP_K, ERROR_KINDS,
@@ -311,6 +312,8 @@ pub struct AppCore<B, E, F> {
     pending: Mutex<Option<PendingLogin>>,
     account: RwLock<Account>,
     info: AppInfo,
+    /// 웹 행동 분석 저장소 (사이트 주인 쪽). 없으면 분석 명령은 not_ready
+    analytic: Option<crate::analytic::AnalyticStore>,
 }
 
 impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
@@ -323,7 +326,79 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
             pending: Mutex::new(None),
             account: RwLock::new(Account::default()),
             info: AppInfo::default(),
+            analytic: None,
         }
+    }
+
+    /// 웹 행동 분석 저장소를 붙인다 (`<data_dir>/analytic`)
+    pub fn with_analytic(mut self, store: crate::analytic::AnalyticStore) -> Self {
+        self.analytic = Some(store);
+        self
+    }
+
+    fn analytic_store(&self) -> Result<&crate::analytic::AnalyticStore, CommandError> {
+        self.analytic.as_ref().ok_or_else(|| CommandError::new("not_ready", "web analytics store is not open"))
+    }
+
+    fn analytic_host(raw: &str) -> Result<String, CommandError> {
+        let raw = raw.trim();
+        let host = premium_discount_analytic::event::host_of(raw)
+            .or_else(|| premium_discount_analytic::event::host_of(&format!("https://{raw}")))
+            .filter(|h| h.contains('.') && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'));
+        host.ok_or_else(|| CommandError::new("invalid_input", "host must be a domain name (shop.example.com)"))
+    }
+
+    /// 웹 행동 분석: 사이트 확인. 서버가 사이트 첫 화면의 `<meta name="premium-discount-site" content="<로그인 주소>">` 를 본다
+    pub async fn cmd_analytic_site(&self, args: AnalyticSiteArgs) -> Result<Value, CommandError> {
+        let host = Self::analytic_host(&args.host)?;
+        Ok(self.evaluator.backend().analytic_site(&host).await?)
+    }
+
+    /// 웹 행동 분석: 서버에서 원시 사건을 받아 넣고(DELTA · TOMBSTONE GUARD), 기기에서 구조화한다
+    pub async fn cmd_analytic_sync(&self, args: AnalyticSyncArgs) -> Result<Value, CommandError> {
+        let store = self.analytic_store()?;
+        let host = Self::analytic_host(&args.host)?;
+        let max_pages = args.max_pages.map(|p| p.clamp(1, crate::analytic::MAX_PAGES as u32) as usize).unwrap_or(crate::analytic::MAX_PAGES);
+        let mut total = crate::analytic::IngestReport::default();
+        let mut pages = 0;
+        let mut cursor = store.cursor(&host).await?;
+        loop {
+            let page = self.evaluator.backend().analytic_events(&host, &cursor, 500).await?;
+            pages += 1;
+            let r = store.ingest(&host, &page.rows).await?;
+            total.received += r.received;
+            total.inserted += r.inserted;
+            total.kept_structured += r.kept_structured;
+            total.blocked_tombstoned += r.blocked_tombstoned;
+            total.broken += r.broken;
+            match page.next {
+                Some(next) if page.more && pages < max_pages => cursor = next,
+                _ => break,
+            }
+        }
+        let structured = store.structure(self.evaluator.embedder(), Some(&host), 2_000, crate::analytic::now_ms()).await?;
+        Ok(serde_json::json!({ "host": host, "pages": pages, "ingest": total, "structured": structured }))
+    }
+
+    /// 웹 행동 분석: 자연어 질의 리포트 (기간 재계산 · 퍼널 · 병목 · 선택 대조 · 요약글 검색)
+    pub async fn cmd_analytic_report(&self, args: AnalyticReportArgs) -> Result<crate::analytic::AnalyticReport, CommandError> {
+        let store = self.analytic_store()?;
+        let host = Self::analytic_host(&args.host)?;
+        let query = crate::analytic::parse_query(&args.query, args.lang.as_deref().unwrap_or("ko"), crate::analytic::now_ms());
+        let range = query.range.as_ref().map(|r| (r.start_ms, r.end_ms));
+        let events = store.events(&host, range).await?;
+        let top_k = args.top_k.unwrap_or(5).min(50) as usize;
+        let prompted = crate::embeddinggemma::with_prompt(crate::embeddinggemma::Role::Query, &args.query);
+        let vector = crate::embedding::l2_normalize(self.evaluator.embedder().embed(&prompted)?)?;
+        let matches = store.search(&vector, top_k, &host, range).await?;
+        Ok(crate::analytic::build_report(&host, query, &events, matches))
+    }
+
+    /// 웹 행동 분석: 사건 지우기. 묘비를 남겨 다시 받지 않는다
+    pub async fn cmd_analytic_forget(&self, args: AnalyticForgetArgs) -> Result<Value, CommandError> {
+        let store = self.analytic_store()?;
+        let deleted = store.forget(&args.ids, crate::analytic::now_ms()).await?;
+        Ok(serde_json::json!({ "deleted": deleted }))
     }
 
     /// 화면에 보여 줄 경로와 서버 주소
@@ -601,6 +676,10 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
             "cmd_login_start" => out(self.cmd_login_start().await?),
             "cmd_login_status" => out(self.cmd_login_status().await?),
             "cmd_logout" => out(self.cmd_logout().await?),
+            "cmd_analytic_site" => out(self.cmd_analytic_site(parse(args)?).await?),
+            "cmd_analytic_sync" => out(self.cmd_analytic_sync(parse(args)?).await?),
+            "cmd_analytic_report" => out(self.cmd_analytic_report(parse(args)?).await?),
+            "cmd_analytic_forget" => out(self.cmd_analytic_forget(parse(args)?).await?),
             other => Err(CommandError::new("unknown_command", format!("unknown command: {other}"))),
         }
     }
@@ -669,6 +748,8 @@ mod tests {
         votes: Mutex<Vec<crate::api::VoteRequest>>,
         verdicts: Mutex<std::collections::HashMap<String, crate::api::VerdictDto>>,
         verdict_calls: std::sync::atomic::AtomicUsize,
+        /// 웹 분석: 서버에 쌓인 원시 사건 (커서대로 돌려준다)
+        analytic_rows: Mutex<Vec<crate::analytic::RawEventRow>>,
     }
     impl FakeServer {
         fn new() -> Self {
@@ -684,6 +765,7 @@ mod tests {
                 login_state: Mutex::new("pending"),
                 login_error: AtomicBool::new(false),
                 starts: std::sync::atomic::AtomicUsize::new(0),
+                analytic_rows: Mutex::new(Vec::new()),
             }
         }
     }
@@ -767,6 +849,23 @@ mod tests {
         fn session(&self) -> Session {
             self.session.lock().unwrap().clone()
         }
+        async fn analytic_site(&self, host: &str) -> Result<Value, AppError> {
+            Ok(json!({"host": host, "verified_at": 1}))
+        }
+        async fn analytic_events(&self, _host: &str, cursor: &crate::analytic::Cursor, limit: u32) -> Result<crate::analytic::EventsPage, AppError> {
+            let mut rows: Vec<crate::analytic::RawEventRow> = self
+                .analytic_rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| (r.created_at, r.id.as_str()) > (cursor.since, cursor.after_id.as_str()))
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+            rows.truncate(limit as usize);
+            let next = rows.last().map(|r| crate::analytic::Cursor { since: r.created_at, after_id: r.id.clone() });
+            Ok(crate::analytic::EventsPage { more: rows.len() == limit as usize, rows, next })
+        }
     }
     const USER_ADDRESS: &str = "0x00000000000000000000000000000000000000cc";
     const MISSING_ID: &str = "0190f0a0-0000-7000-8000-0000000000ee";
@@ -797,7 +896,54 @@ mod tests {
         let server = std::sync::Arc::new(FakeServer::new());
         let outbox = Outbox::open(temp_dir("commands")).await.unwrap();
         let evaluator = Evaluator::new(server.clone(), AxisEmbedder, LocalFilter::default());
-        (AppCore::new(evaluator, outbox), server)
+        let analytic = crate::analytic::AnalyticStore::open(temp_dir("commands-analytic")).await.unwrap();
+        (AppCore::new(evaluator, outbox).with_analytic(analytic), server)
+    }
+
+    fn raw_click(id: &str, created_at: i64, text: &str) -> crate::analytic::RawEventRow {
+        let event = json!({"schema": "web-event/1", "type": "click", "href": "https://shop.example.com/order/cart", "seq": 1, "t_ms": 1000,
+                           "target": {"chain": [{"tag": "button", "id": "pay"}], "pug": format!("button | {text}")}});
+        crate::analytic::RawEventRow {
+            id: id.into(),
+            kind: "click".into(),
+            session: "0xsession".into(),
+            seq: 1,
+            data: premium_discount_analytic::blob::encode_base64(event.as_object().unwrap()),
+            created_at,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn web_analytics_sync_report_and_forget_go_through_the_core() {
+        let (core, server) = core().await;
+        *server.analytic_rows.lock().unwrap() = vec![raw_click("e1", 1_000, "간편결제"), raw_click("e2", 2_000, "쿠폰 적용"), raw_click("e3", 2_000, "주문하기")];
+        // 주소를 넣어도 호스트만 쓴다
+        let site = core.cmd_analytic_site(AnalyticSiteArgs { host: "https://Shop.Example.com/any".into() }).await.unwrap();
+        assert_eq!(site["host"], "shop.example.com");
+        assert_eq!(core.cmd_analytic_site(AnalyticSiteArgs { host: "not a host".into() }).await.unwrap_err().kind, "invalid_input");
+
+        let first = core.cmd_analytic_sync(AnalyticSyncArgs { host: "shop.example.com".into(), max_pages: None }).await.unwrap();
+        assert_eq!((first["ingest"]["inserted"].as_u64(), first["structured"].as_u64()), (Some(3), Some(3)), "{first}");
+        // 다음 받기는 커서 뒤부터: 새 사건만
+        server.analytic_rows.lock().unwrap().push(raw_click("e4", 3_000, "간편결제"));
+        let second = core.cmd_analytic_sync(AnalyticSyncArgs { host: "shop.example.com".into(), max_pages: Some(1) }).await.unwrap();
+        assert_eq!((second["ingest"]["received"].as_u64(), second["structured"].as_u64()), (Some(1), Some(1)), "{second}");
+
+        let report = core
+            .cmd_analytic_report(AnalyticReportArgs { host: "shop.example.com".into(), query: "장바구니 페이지 클릭".into(), lang: Some("ko".into()), top_k: Some(2) })
+            .await
+            .unwrap();
+        assert_eq!(report.events, 4);
+        assert!(report.query.page_kinds.contains(&"cart".to_string()));
+        assert_eq!(report.matches.len(), 2);
+
+        let forgot = core.cmd_analytic_forget(AnalyticForgetArgs { ids: vec!["e1".into()] }).await.unwrap();
+        assert_eq!(forgot["deleted"], 1);
+        // 분석 저장소가 없는 코어는 not_ready
+        let outbox = Outbox::open(temp_dir("commands-no-analytic")).await.unwrap();
+        let bare = AppCore::new(Evaluator::new(server.clone(), AxisEmbedder, LocalFilter::default()), outbox);
+        assert_eq!(bare.cmd_analytic_forget(AnalyticForgetArgs { ids: vec![] }).await.unwrap_err().kind, "not_ready");
     }
 
     fn submit(text: &str) -> SubmitArgs {
@@ -1149,7 +1295,7 @@ mod tests {
             assert!(res.is_ok(), "{cmd}: {res:?}");
             seen.push(cmd.clone());
         }
-        assert_eq!(seen.len(), 17, "계약에 있는 명령 수: {seen:?}");
+        assert_eq!(seen.len(), 21, "계약에 있는 명령 수: {seen:?}");
         assert!(model_command(&fetcher, "cmd_submit_evaluation", Value::Null).is_none(), "모델 명령이 아니면 코어로 간다");
         let bad = model_command(&fetcher, "cmd_model_download", json!({"variant": "huge"})).unwrap().unwrap_err();
         assert_eq!(bad.kind, "invalid_input");

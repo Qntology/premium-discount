@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-const MIGRATIONS = ['0002_create_evaluations.sql', '0003_add_request_id.sql', '0004_eval_queue.sql', '0005_eval_bcc.sql', '0006_votes_verdicts.sql', '0007_nav_trials.sql']
+const MIGRATIONS = ['0002_create_evaluations.sql', '0003_add_request_id.sql', '0004_eval_queue.sql', '0005_eval_bcc.sql', '0006_votes_verdicts.sql', '0007_nav_trials.sql', '0008_web_analytics.sql']
 
 function toSqliteValue(v: unknown): unknown {
 	// D1처럼 ArrayBuffer를 BLOB으로 받는다

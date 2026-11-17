@@ -1393,3 +1393,160 @@ raon-zena 의 범용 엔진을 `crates/` 로 옮기고, Relay · 창 계산 crat
   - 키 몇 개의 띠는 0.881 이라 아무것도 묶지 못했습니다.
 - Relay 의 포함률 하한(0.5)은 아직 고정값입니다. Relay 는 새로 만들었고 아직 부르는 곳이 없습니다(판정 cron 의 `superseded` 입력에 잇는 것은 다음 일).
 - `premium-discount-window` 의 누르기와 끌기 · 제자리 돌아가기 · 점 아래 창 찾기는 raon-zena 오버레이가 아직 쓰지 않습니다. `zena-core::window` 는 스타일 비트 · 알파 · 프레임 간격만 이 crate 로 계산합니다.
+
+## 24. 웹 행동 분석 이관: logis-center analytic · tracker-logis-center (2026-11-18)
+
+logis-center 의 웹 행동 분석(analytic) 파이프라인과 tracker-logis-center(사이트에 심는 수집 스크립트 + Cloudflare Worker)를 이 저장소로 옮겼습니다.
+- 수집: www Worker 의 `/analytic/*` 와 수집 스크립트 `www/public/static/js/tracker.js`
+- 해석 코어: `crates/premium-discount-analytic`
+- 기기 쪽 받기 · 구조화 · 리포트: 앱 `app/src/analytic.rs`
+
+같은 기획서의 raon-zena 쪽 일(대화 맥락 · 코스 · 투트랙 RAG 배선, 언어팩)은 그 저장소의 `docs/MASTER_PLAN_GLOBAL_LOCAL_COURSE_RAG.md` 입니다.
+
+| 원본 | 옮긴 곳 | 한 일 |
+| --- | --- | --- |
+| tracker-logis-center `tracker/tracker.js` (ethers · marked 묶음 포함 537 KB) | `www/public/static/js/tracker.js` (묶음 없음) | 누름 · 머묾 · 바꿈에 들어옴 · 스크롤 · 제출 · 뒤로 · 떠남을 더함. `outerHTML` 대신 속성 없는 PUG + 셀렉터용 조상 모양을 브라우저에서 만듦. 원본 결함 네 가지를 고침(24-5) |
+| tracker-logis-center `workers/src/index.ts` | `www/src/analytic.ts`, `www/migrations/0008_web_analytics.sql` | 사이트마다 쌓고 확인된 주인에게만 돌려줌. 방문자 쿠키 · S3 계정 · IP · 지역은 받지도 남기지도 않음 |
+| logis-center `analytic.rs` · `parsing.rs` · `ai_utils.rs` (`strip_pug_attributes`, `pug_line_parts`, `sanitize_llm_input`, HTML → PUG) | `premium-discount-analytic::pug` | 그대로 옮기되 입력값을 내지 않고, 숨은 글을 접지 않음 |
+| logis-center `utils/time_guide.rs` | `premium-discount-analytic::time` | `this_week` · `last_week` 를 더함. 날짜는 모델이 아니라 코드가 사용자 시계로 정함 |
+| logis-center `model/query_analytic.rs` 의 사전 단계 + `full_bias.json` 의 분석 항목 | `premium-discount-analytic::query`, `data/analytic_dictionary.json` | 사건 5 · 행동 4 · 페이지 10 · 기간 7(+2) · 계절 4 · 인사이트 3. 일치는 premium-discount-nms 도메인 은행 |
+| logis-center `runtime.ts` `decodeAnalyticBlob` | `www/src/blob.ts`, `premium-discount-analytic::blob` | BUG-RT-2 · 3 · 4 를 고침. 두 쪽이 `contracts/analytic_blob_v1.json` 을 함께 통과 |
+| logis-center `modes/analytic.ts` (받기 · DELTA GUARD), `commerce.ts` (TOMBSTONE GUARD) | `app/src/analytic.rs` | LanceDB `web_events_local` · `web_event_tombstones` |
+| (없음) | `premium-discount-analytic::funnel` | Track 1: 웹 체크포인트 · 선택 대조 · 마찰 에피소드 · 퍼널 (premium-discount-nav 규칙) |
+
+### 24-1. 흐름
+
+1. 사이트 주인이 사이트에 두 줄을 넣고 앱에서 사이트를 확인합니다(`cmd_analytic_site {host}`).
+   ```html
+   <meta name="premium-discount-site" content="<주인 주소>">
+   <script src="https://premium.discount/static/js/tracker.js" async></script>
+   ```
+   - 주인 주소는 QR 로그인 세션이면 `hashId(이메일)` 입니다(logis-center oauth 의 사이트 확인 meta 와 같은 식). 지갑 서명(`x-pd-*`)으로 확인할 수도 있습니다.
+   - Worker 가 `https://<host>/` 를 받아 meta 를 봅니다. 한 사이트에 주인이 여럿일 수 있습니다.
+2. 방문자의 브라우저가 사건을 모아 `POST /analytic/events` 로 보냅니다.
+   - `text/plain` JSON 이라 사전 요청이 없습니다.
+   - 5초마다 · 20개마다 보냅니다. 떠날 때는 keepalive 로 4개씩 보냅니다(keepalive 본문 한도 64 KB).
+3. Worker 가 모양을 검사하고 다시 다듬어(`sanitizeEvent`) D1 `web_events` 에 넣습니다.
+   - `cc = hashId(호스트)`, `session = hashId(cc + sid)`, `data = gzip(JSON)`, `updated_at = 0`(원시).
+   - 브라우저가 보낸 `Origin` 의 호스트와 사건 주소의 호스트가 다르면 403 입니다.
+4. 앱 `cmd_analytic_sync {host}` 이 사건을 받아 정리합니다.
+   - `GET /analytic/events?host&since&after_id` 를 (시각, id) 커서로 빠짐없이 받습니다.
+   - BLOB 을 풀어 LanceDB 에 넣습니다.
+   - 기기에서 구조화합니다(24-4).
+5. 앱 `cmd_analytic_report {host, query, lang}` 이 리포트를 냅니다.
+   - 질의 해석 → 기간 → 그 기간의 사건으로 퍼널 · 병목 · 선택 대조를 구합니다.
+   - 요약글을 벡터 검색합니다.
+   - 사람이 읽는 `lines` 몇 줄을 냅니다. raon-zena 가 `[참고]` 줄로도 쓸 수 있는 모양입니다.
+
+명령은 공용 계약(`premium-discount-schema` `COMMANDS`, 17 → 21)에 들어갔습니다. 함께 등록한 곳은 다음과 같습니다.
+- 앱 코어(`dispatch`)
+- Tauri 창
+- 화면(`ui/commands.ts`)
+- 계약 파일(`ui/fixtures/command_contract.json`)
+
+### 24-2. 보내는 것과 보내지 않는 것 (`web-event/1`)
+
+| tracker-logis-center | 여기 |
+| --- | --- |
+| `action`: 누른 요소의 `outerHTML` | `target`: 속성 없는 PUG(`{들여쓰기}{태그} \| {글}`) + 셀렉터용 조상 모양(태그 · id · class · `role`/`name`/`type`/시험용 속성 · 같은 태그 중 순서, 깊이 5) |
+| (없음) | `item`: 누른 요소가 목록 안에 있으면 그 목록 항목(형제와 같은 단위) |
+| `relate`: 같은 목록의 형제 `outerHTML` (그림 주소만 지움, 최대 100) | `related`: 같은 모양 (최대 100) |
+| 주소 전체(쿼리 포함) | 쿼리 · 문서 안 위치를 뺀 주소(해시 라우팅 `#/…` 만 남김) |
+| 쿠키의 `hash` · `token` (S3 에 방문자 계정을 만듦) | 탭마다 새로 만드는 무작위 `sid`. 서버에는 `hashId(cc + sid)` 만 남음 |
+
+- 보내지 않습니다.
+  - 입력값: 바꿈 사건은 칸의 종류(`text` · `select` …)만 보냅니다. 비밀번호 칸은 사건이 없습니다.
+  - PUG 의 `input` · `textarea` 값: 결제 화면에 미리 채운 이름 · 주소가 값으로 들어 있기 때문입니다.
+  - 속성(`href` · `src` · `value` · `style` …), 숨은 층(`position: fixed/absolute`), 스크립트, `data-pd-ignore` 영역.
+- 글의 이메일과, 숫자가 네 개 이상 든 낱말은 `#` 로 바꿉니다. 전화 · 카드 · 주문 번호를 막으려는 것이고, 1,000 이상의 가격도 함께 가려집니다. 브라우저 · Worker · Rust 가 같은 규칙으로 한 번씩 거릅니다.
+- GPC(`navigator.globalPrivacyControl`) · DNT 를 켠 방문자는 수집하지 않습니다.
+- 크기: tracker-logis-center 의 어림식(토큰 어림 × 5 > 7,000)을 그대로 씁니다. 다만 넘치면 형제를 반씩 줄이고, 그래도 크면 버립니다. 원본은 바로 버렸습니다.
+
+### 24-3. 고른 요소 vs 지나친 형제: 기획서와 다른 판정
+
+- 기획서의 규칙: "고른 TARGET 은 Premium, 같은 화면에서 비켜 간 RELATED 는 Discount 로 즉시 집계"하고, 등급 규칙(2/3)을 적용합니다.
+- 문제: 목록이 길수록 모든 후보가 Discount 가 됩니다. 시험 `the_plan_rule_marks_a_random_list_discount` 로 확인했습니다.
+
+| 경우 (상품 10개 목록) | 기획서 규칙 | 여기의 규칙 |
+| --- | --- | --- |
+| 아무 정보 없이 무작위로 2,000번 고름 | 10개 모두 Discount | 결정하지 않음(띠 2σ 를 넘은 것이 하나 이하) |
+| 상품 0 을 40 %, 상품 9 는 한 번도 안 고름 | 상품 0 도 Neutral(40 % < 2/3) | 상품 0 Premium, 상품 9 Discount |
+
+- 여기의 규칙은 선택 묶음의 크기를 n 이라 할 때, 아무 정보 없이 고를 확률 1/n 을 기댓값으로 씁니다.
+  - 후보마다 노출 · 뽑힘 · 기댓값 Σ1/n · 분산 Σ(1/n)(1−1/n)을 쌓습니다.
+  - z 가 ±2 를 넘고 노출이 5 이상일 때만 결정합니다.
+  - 기획서의 수(뽑힘 · 지나침)는 비교용으로 남겼습니다(`ChoiceTally::naive_tier`).
+- 같은 틀의 카드(상품 목록)는 셀렉터 틀이 같아 요소 해시도 같습니다. 셀렉터는 데이터 자리를 지우기 때문입니다. 그래서 선택 대조의 키는 요소 해시 + PUG 의 글입니다.
+- 기획서 4.2 의 쇼핑몰 시나리오를 그대로 시험에 넣었습니다. 세션 40개: 30개는 간편결제로 완료하고, 10개는 쿠폰 칸에서 스크롤을 뒤집고 광클하고 다시 고치다 떠납니다.
+  - 퍼널: 상세 → 장바구니 → 결제 → 완료가 40 · 40 · 40 · 30, 결제에서 10 세션이 빠집니다.
+  - 병목 1위: '쿠폰 적용' (마찰 discount).
+  - 선택 대조: 간편결제 Premium · 쿠폰 Discount (z = ±3.16).
+  - 앱 리포트("어제 결제 이탈 원인이 뭐야?")가 기간 · 인사이트(`conversion_insight`) · 퍼널 · 병목을 냅니다.
+
+### 24-4. 질의 해석과 기기 구조화
+
+- **질의**
+  - 사전은 logis-center `full_bias.json` 의 분석 항목입니다. 12개 언어의 정확 일치 글이 들어 있습니다.
+  - 일치는 premium-discount-nms 의 도메인 은행이 합니다. 띄어쓰기를 무시하고, 한국어 조사를 떼고, 교착어는 접두로 맞춥니다. 일본어 · 중국어처럼 띄어 쓰지 않는 글은 낱말 안에서 찾습니다(`昨日のページビュー` → 어제 · 유입).
+  - 같은 갈래에서 둘이 걸리면 더 긴 글이 이깁니다("결제 이탈" > "이탈" > "원인").
+- **날짜는 코드가 정합니다.**
+  - 해석은 기간 키(`last_week`) · 계절 키(`summer`)만 고르고, 범위는 사용자의 시계로 계산합니다. 시계는 언어에서 정합니다: 시간대 오프셋, 남반구면 계절을 여섯 달 어긋나게, ISO 주(월요일 시작).
+  - 계절은 이미 시작한 가장 최근 회차입니다. 11월의 "겨울"은 작년 겨울입니다.
+  - 평가 시각 고정은 `PD_EVAL_NOW_MS` 이고, 없으면 logis-center 의 `LOGIS_EVAL_NOW_MS` 를 읽습니다.
+- **구조화 (Track 2)**: logis-center 는 이 자리에서 Qwen3.5 2B 에 사건마다 한 번 물어 `action` · `summary` · `relate` 를 받았습니다. 여기서는 모델 없는 요약글을 embeddinggemma(768, 문서 프롬프트)로 임베딩하고 `updated_at` 을 찍습니다.
+  - 요약글 모양: `click | cart shop.example.com/order/cart | 간편결제 | not chosen: 쿠폰 적용`
+  - 기간 · 페이지 · 선택 대조 · 마찰은 Track 1 이 결정론적으로 내므로, 모델 요약은 그 위의 문장일 뿐입니다.
+  - 초안 모델(Qwen3.5-0.8B)은 이 PC 에 가중치가 없어 붙이지 않았습니다.
+- **가드**
+  - DELTA GUARD: 구조화된 행(`updated_at > 0`)은 서버의 원시 사건으로 덮지 않습니다. LanceDB merge 의 조건(`target.updated_at = 0`)으로도 막습니다.
+  - TOMBSTONE GUARD: 지운 사건 id 는 묘비 테이블에 남아 다음 받기에서 다시 들어오지 않습니다.
+
+### 24-5. 원본에서 고친 결함
+
+| 어디 | 결함 | 고친 것 |
+| --- | --- | --- |
+| tracker-logis-center Worker | `pageId = hashId(cookies.cc + pathname)` 를 `cookies.cc` 를 정하기 전에 계산해 `undefined/…` 로 해싱 | 세션 해시는 cc 를 정한 뒤에 계산 |
+| tracker-logis-center Worker | GET 이 `href` 만 바꾸면 누구의 사이트든 1,000건을 돌려줌 | 확인된 주인만, 커서로 |
+| tracker-logis-center `tracker.js` | 광클을 요소와 상관없이 셈(카드를 누르고 쿠폰을 두 번 누르면 광클) | 같은 요소를 700 ms 안에 세 번 |
+| tracker-logis-center `tracker.js` | 바꿈 디바운스가 하나라 600 ms 안에 다른 칸을 바꾸면 앞 칸의 사건이 사라짐 | 칸마다 디바운스 |
+| tracker-logis-center `tracker.js` | 카드 안의 링크를 누르면 링크와 카드의 모양이 달라 형제를 하나도 못 보냄 | `item` = 목록 항목, 형제는 항목의 형제 |
+| tracker-logis-center `tracker.js` | 페이지 배경(html)에 머물면 페이지 전체가 실려 나감(크기 상한에 걸려야 버려짐) | html · body 대상은 보내지 않음 |
+| logis-center `runtime.ts` | BUG-RT-2(50 바이트 이하 base64 gzip 을 풀지 않음) · BUG-RT-3(Uint8Array 조각을 밑의 버퍼 전체로 읽음) · BUG-RT-4(`"42"` · `"null"` 을 그대로 돌려줌) | 셋 다. 계약 사례 19개 |
+| logis-center PUG | 한 줄로 접을 때 숨은 층 · 고르지 않은 option 의 글까지 모음, 버려질 base64 아이콘 하나가 링크 글의 접기를 막음, 조각을 문서로 파싱해 `html` 부터 냄(B23) | 내보내지 않는 요소는 접기 · 데이터 판정에서도 뺌, 조각의 뿌리부터 |
+
+### 24-6. 기획서와 다른 점
+
+- 기획서의 이름이 실제 코드와 다릅니다.
+  - `structure_analytic_event` 는 없고 `run_analytic_structuring` 입니다.
+  - `strip_pug_attributes` 는 `ai_utils.rs` 가 아니라 `analytic.rs` 에 있습니다.
+  - `sales_insight` 는 없고 `conversion_insight` 입니다.
+  - logis-center 의 `insight` · `metrics` · `operators` 는 분석 파이프라인이 쓰지 않습니다(커머스 질의용). 여기서는 `insight` 만 옮겼습니다. 영어 문장뿐이라 한국어 · 일본어 · 중국어 정확 일치 글을 더했습니다(`pd_exact_match`).
+- `time_guide.rs` 에는 "이번 주"가 없습니다. `this_week` · `last_week` 를 더했습니다.
+- 기획서의 "TARGET Premium / RELATED Discount" 대신 기댓값 대비 z 로 결정합니다(24-3).
+- LLM 구조화(Qwen3.5 2B)는 옮기지 않았습니다(24-4).
+- README 10-3 의 레거시 발자국(`auth.js` · `content.js`)은 logis 콘솔 화면에서 온 코드라 수집 경로에 잇지 않았습니다. 수집은 새 Worker 경로뿐입니다.
+- 사이트 확인은 logis-center 의 `api.oauth.network` client_id/secret 대신 meta + 세션 · 지갑입니다.
+
+### 24-7. 배포와 남은 위험
+
+1. 마이그레이션: `npx wrangler d1 migrations apply DB --remote` (`0008_web_analytics.sql`).
+2. `wrangler.json` 에 요청 제한 `ANALYTIC_WRITE_LIMITER`(namespace 1003, IP 마다 분당 120)를 더했습니다. 없으면 평가 쓰기 제한을 함께 씁니다.
+3. 수집 스크립트는 `public/static/js/tracker.js` 로 함께 배포됩니다.
+
+남은 위험은 다음과 같습니다.
+- 누구나 남의 사이트 이름으로 가짜 사건을 보낼 수 있습니다. 브라우저는 Origin 으로 막지만 직접 보낸 요청은 막지 못하고, 요청 제한만 받습니다. 주인만 읽으므로 새는 것은 없지만 리포트가 오염될 수 있습니다.
+- 지갑 서명은 경로만 덮고 쿼리를 덮지 않습니다(평가 · 타임트라이얼과 같음). 5분 안에 서명을 가로챈 쪽이 같은 주인의 다른 사이트를 읽을 수 있습니다.
+- 보관 기한 cron 은 없습니다. 주인이 `DELETE /analytic/events?host&before` 로 지웁니다.
+
+### 24-8. 검증
+
+| 묶음 | 결과 |
+| --- | --- |
+| `cd crates && cargo test -p premium-discount-analytic` | 33 통과: 단위 24(시간 6 · BLOB 4 · 사건 3 · PUG 5 · 질의 6), 계약 2(BLOB 19 · PUG 13 사례), 퍼널 7(무작위 목록 · 우세한 선택 · 카드 안 링크 · 4.2 시나리오) |
+| www (`node --test www/tests/*.test.ts`) | 94 통과. 분석 10(다듬기 · 수집 · gzip · 다른 사이트 403 · 요청 제한 · meta 확인 · 세션 주인 · 커서 · BLOB 계약 · BUG-RT), 수집 스크립트 6(linkedom: PUG 계약 13 사례 · 조상 모양 · 목록 형제 · 거르기 · 크기) |
+| 실제 Chrome (headless, `playwright-core` + 설치된 Chrome) | 사건 13개(들어옴 · 카드 누름 · 쿠폰 3번 · 머묾 · 바꿈 3 · 스크롤 · 제출 · 떠남). 모두 `sanitizeEvent` 통과. 입력값 · 쿼리 · 비밀번호 · `data-pd-ignore` · 숨은 층 글 없음. 광클은 세 번째 쿠폰만, 떠남의 `dirty` 1. 원본 결함 네 가지(24-5)를 이 확인에서 찾음 |
+| 앱 `cargo test --release --lib` | 240 통과(기존 237 + 분석 3). 저장소 2(받기 · DELTA · TOMBSTONE · 구조화 · 검색, 어제 기간 리포트: 퍼널 40/40/40/30 · 병목 '쿠폰 적용' · 간편결제 premium), 명령 계층 1(사이트 · 커서대로 두 번 받기 · 리포트 · 지우기 · 저장소 없으면 not_ready). UI 계약 시험이 명령 21개를 모두 부름 |
+| `cd crates && cargo test --release --workspace` | 전부 통과, 경고 없음(새 analytic 33 포함, 실제 모델 granite · Stanza 시험 포함) |
+| 화면 (`app/ui`) · cron | 71 · 41 통과 |
+| `premium-discount-schema` | 8 통과 (명령 21개 = 계약 파일) |
+| src-tauri `cargo check` | 통과, 경고 없음 (분석 명령 4개 등록) |

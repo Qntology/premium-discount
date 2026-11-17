@@ -20,8 +20,8 @@ pub fn blank_to_none(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
-/// 앱이 여는 명령 이름. 코어(`AppCore::dispatch`) 13개, 셸이 모델 없이도 답하는 모델 명령 3개, 셸의 초안 엔진 1개.
-pub const COMMANDS: [&str; 17] = [
+/// 앱이 여는 명령 이름. 코어(`AppCore::dispatch`) 17개(웹 행동 분석 4개 포함), 셸이 모델 없이도 답하는 모델 명령 3개, 셸의 초안 엔진 1개.
+pub const COMMANDS: [&str; 21] = [
     "cmd_submit_evaluation",
     "cmd_sync_cache",
     "cmd_search_local",
@@ -39,6 +39,10 @@ pub const COMMANDS: [&str; 17] = [
     "cmd_model_download",
     "cmd_model_download_cancel",
     "cmd_item_draft",
+    "cmd_analytic_site",
+    "cmd_analytic_sync",
+    "cmd_analytic_report",
+    "cmd_analytic_forget",
 ];
 
 /// [`CommandError::kind`] 의 값. 앞의 열 개는 앱 오류(`AppError`)에서, `not_ready` · `unknown_command` · `internal` 은
@@ -133,6 +137,42 @@ pub struct VerdictsArgs {
     /// true면 캐시가 새것이어도 서버에 묻는다
     #[serde(default)]
     pub refresh: bool,
+}
+
+/// 웹 행동 분석: 사이트 확인 (`cmd_analytic_site`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticSiteArgs {
+    /// 사이트 호스트 (`shop.example.com`, 주소를 넣어도 호스트만 쓴다)
+    pub host: String,
+}
+
+/// 웹 행동 분석: 원시 사건 받기 + 기기 구조화 (`cmd_analytic_sync`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticSyncArgs {
+    pub host: String,
+    /// 받을 쪽 수 상한 (한 쪽 최대 500행). 생략하면 앱의 기본값
+    #[serde(default)]
+    pub max_pages: Option<u32>,
+}
+
+/// 웹 행동 분석: 자연어 질의 리포트 (`cmd_analytic_report`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticReportArgs {
+    pub host: String,
+    /// "이번 달 결제 이탈 원인이 뭐야?" 같은 질의. 기간은 앱이 사용자 시계로 다시 계산한다
+    pub query: String,
+    /// 사용자 언어 (시간대 · 반구). 생략하면 ko
+    #[serde(default)]
+    pub lang: Option<String>,
+    /// 벡터 검색 결과 수
+    #[serde(default)]
+    pub top_k: Option<u32>,
+}
+
+/// 웹 행동 분석: 사건 지우기 (`cmd_analytic_forget`). 지운 id 는 다시 받지 않는다(묘비)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticForgetArgs {
+    pub ids: Vec<String>,
 }
 
 /// 저장 결과. `status`로 구분한다.
@@ -336,6 +376,14 @@ mod tests {
         let d: VerdictsArgs = serde_json::from_value(args("cmd_verdicts")).unwrap();
         assert_eq!(d.ids.len(), 1);
         let _: SessionArgs = serde_json::from_value(args("cmd_session")).unwrap();
+        let s: AnalyticSiteArgs = serde_json::from_value(args("cmd_analytic_site")).unwrap();
+        assert_eq!(s.host, "shop.example.com");
+        let y: AnalyticSyncArgs = serde_json::from_value(args("cmd_analytic_sync")).unwrap();
+        assert_eq!(y.max_pages, Some(5));
+        let r: AnalyticReportArgs = serde_json::from_value(args("cmd_analytic_report")).unwrap();
+        assert_eq!((r.lang.as_deref(), r.top_k), (Some("ko"), Some(5)));
+        let f: AnalyticForgetArgs = serde_json::from_value(args("cmd_analytic_forget")).unwrap();
+        assert_eq!(f.ids.len(), 1);
         // 생략한 개수는 기본값
         let a: SearchArgs = serde_json::from_value(serde_json::json!({"query": "q"})).unwrap();
         assert_eq!(a.top_k, DEFAULT_TOP_K);

@@ -120,7 +120,12 @@ async fn build_core(config: &Config, filter: Arc<SwitchFilter>) -> Result<Core, 
     std::fs::create_dir_all(&config.data_dir).map_err(|e| AppError::Storage(format!("cannot create {}: {e}", config.data_dir)))?;
     let outbox = Outbox::open(&config.data_dir).await?;
     let store = SessionStore::new(std::path::Path::new(&config.data_dir).join("session.json"));
-    Ok(AppCore::new(Evaluator::new(backend, embedder, filter), outbox).with_session_store(store).with_info(config.info()))
+    // 웹 행동 분석 (사이트 주인이 받아 온 사건, 기기에서 구조화). 평가 보관함과 따로 둔다
+    let analytic = premium_discount_app::analytic::AnalyticStore::open(std::path::Path::new(&config.data_dir).join("analytic")).await?;
+    Ok(AppCore::new(Evaluator::new(backend, embedder, filter), outbox)
+        .with_session_store(store)
+        .with_info(config.info())
+        .with_analytic(analytic))
 }
 
 /// 코어의 상태. 실패는 기억하되, 그 뒤에 모델 설치가 끝났으면(세대가 바뀌면) 다시 만든다.

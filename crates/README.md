@@ -1,6 +1,6 @@
 # premium-discount 공용 라이브러리 (`crates/`)
 
-앱(`app/`)과 raon-zena 가 함께 링크하는 crate 입니다. 앱과 따로 빌드합니다(`cd crates && cargo test`). 이름은 약어 없이 `premium-discount-*` 로 씁니다(2026-11-17 `pd-*` 에서 바꿈). 같은 날 raon-zena 의 범용 엔진(센서 · 비전 · 양자화 · NLP · NMS)도 이리로 옮기고, Relay · 창 계산 crate 를 새로 만들었습니다.
+앱(`app/`)과 raon-zena 가 함께 링크하는 crate 입니다. 앱과 따로 빌드합니다(`cd crates && cargo test`). 이름은 약어 없이 `premium-discount-*` 로 씁니다(2026-11-17 `pd-*` 에서 바꿈). 같은 날 raon-zena 의 범용 엔진(센서 · 비전 · 양자화 · NLP · NMS)도 이리로 옮기고, Relay · 창 계산 crate 를 새로 만들었습니다. 2026-11-18 에는 logis-center 의 웹 행동 분석과 tracker-logis-center 를 `premium-discount-analytic` 으로 옮겼습니다.
 
 **원칙**
 - LanceDB · Tauri · 비동기 런타임(tokio)에 의존하지 않습니다. 저장은 앱이 맡습니다.
@@ -31,6 +31,7 @@
 | `premium-discount-vision` | SigLIP2 So400m NaFlex 인코더(Raon-VE · google SigLIP2), 천공 패스, 앵커 은행, 텍스트 타워 | raon-zena `raon-vision` |
 | `premium-discount-relay` | Relay Key 뽑기 · 다국어 키 묶기, 문장 맞추기, 신구 대체(Supersedes) · 중복 · 의미 연결 | (새로 만듦, 아직 부르는 곳 없음) |
 | `premium-discount-window` | 오버레이 창 계산(3단계 크기 · 자리 · 누르기와 끌기 · 스타일 비트 · 알파 · 프레임 간격 · 제자리 돌아가기), 점 아래 창 · 앞 창 찾기(Win32) | raon-zena `zena-core::window`, 앱 `ui/stage.ts`(같은 시험 벡터) |
+| `premium-discount-analytic` | 웹 행동 분석: 수집 사건(`web-event/1`) · 속성 없는 PUG · 결정론적 시간 해석 · 분석 질의 사전 · 사건 BLOB 코덱 · 퍼널(웹 체크포인트 · 고른 요소 vs 지나친 형제 · 마찰 에피소드). logis-center analytic · tracker-logis-center 를 옮김(README 24절) | 앱 `app/src/analytic.rs` |
 
 **계약 값은 그대로입니다.** crate 이름만 바뀌었고, 아래 값은 서버 · DB · 다른 클라이언트와 맞물려 있어 바꾸지 않았습니다.
 - 판정 recipe(`pd-verdict/1` · `pd-verdict/2`)
