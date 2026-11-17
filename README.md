@@ -1225,3 +1225,64 @@ VCToolsInstallDir='C:\Program Files\Microsoft Visual Studio\2022\Community\VC\To
 - **GPU 를 쓴 프로세스는 끝나기 전에 `release_gpu` 를 부릅니다.** 이 PC 의 Windows HIP 는 GPU 시험 뒤 프로세스가 종료 단계에서 멈춘 적이 있습니다(noto-sandbox 에서 11번 중 7번). 멈춘 프로세스는 재부팅 전까지 코어 하나와 VRAM 0.8 ~ 1.2 GB 를 쥡니다. 원인은 포크의 비동기 메모리 풀이 남은 채 끝나는 것이었습니다(gravity-ocr). GPU 대조 시험은 `release_gpu` 를 부르고 정상 종료했습니다. GPU 시험은 다른 GPU 작업이 없을 때 한 프로세스에서만 돌립니다(8 GB VRAM).
 - **Android 빌드**는 포크로 바꾼 뒤 확인하지 않았습니다.
 - 기존 임베딩(embeddinggemma)은 CPU 그대로이므로, 평가 동기화의 임베딩 공간은 바뀌지 않습니다.
+
+## 20. 3단계 오버레이 창 (2026-11-17)
+
+데스크톱 창을 raon-zena 처럼 화면 오른쪽 아래에 붙는 3단계 오버레이로 바꿨습니다. 캐릭터는 없습니다. 앱 코어(`app/src/*`)는 한 줄도 바꾸지 않았습니다. 바꾼 것은 Tauri 셸(`app/src-tauri`)과 화면(`app/ui`)입니다.
+
+### 20-1. 세 단계
+
+| 단계 | 크기 (논리 픽셀) | 보여 주는 것 | 옮기기 |
+| --- | --- | --- | --- |
+| 0 알약 | 360 x 56 | 동기화 점과 짧은 말(등록됨 · 전송 대기 N건 · 검수 중 N건 · 오프라인 · 설정 필요), 최근 한 줄(1분 안의 알림, 아니면 가장 최근 내 글). 배경은 82% 불투명 | 누르면 1단계. 5px 넘게 움직이면 누르기가 아니라 창 끌기(`startDragging`) |
+| 1 미니 피드 | 360 x 260 | 최근 내 평가 3개. 새 글이 맨 아래이고 불투명도는 아래부터 1 · 0.8 · 0.55, 맨 위 줄은 `mask-image` 그라디언트와 `backdrop-filter` 로 흐려집니다. 줄마다 `[cc · 상태]` 와 미리보기, 상태 · 판정 아이콘(⭐ 추천 · 🔻 비추천 · ✓ 등록됨 · 📤 전송 대기 · ⏳ 검수 중 · ⛔ 거부됨 · ⚠ 실패). 아래에 빠른 입력 한 줄 | 맨 위 줄이나 "전체 ▸" 는 2단계. Esc · 접기 버튼 · 창 바깥 누르기(창이 포커스를 잃음)는 0단계. 빠른 입력에 쓰던 글이 있으면 바깥을 눌러도 접지 않습니다 |
+| 2 서랍 | 400 x 580 | 검색(`cmd_search_merged`), 걸러 보기 칩 [전체] [⭐ 추천] [🔻 비추천] [⏳ 전송 대기/검수 중] 과 [현재 도메인만], 가운데 타임라인(접이식 평가 쓰기 · 검색 결과 · 내 평가 카드, 추천 / 비추천 버튼, 답글), 아래 접이식 "계정 · 지갑 · 모델" | Esc 는 1단계, 접기 버튼은 0단계, ✕ 는 앱 끄기 |
+
+- 단계 규칙(크기, 옮기기, 누르기 / 끌기 경계 5px, 창 자리, 피드 줄 고르기, 동기화 점, 걸러 보기, 지갑 · 모델 한 줄)은 순수 함수로 `app/ui/stage.ts` 에 두고 `stage.test.ts` 로 시험합니다.
+- 창 크기와 위치는 화면이 바꿉니다. `window.__TAURI__.window.getCurrentWindow()` 의 `setSize(LogicalSize)` · `setPosition(PhysicalPosition)` 을 쓰고, 자리는 `currentMonitor()` 의 작업 영역(작업 표시줄을 뺀 곳) 오른쪽 아래에서 16px 띄웁니다. 배율(scaleFactor)을 곱해 물리 픽셀로 계산합니다. 사용자가 끌어 옮긴 뒤에는 지금 창의 오른쪽 아래 모서리를 지키며 커지고 작아지고, 작업 영역 밖으로는 나가지 않게 자릅니다. 커질 때는 먼저 옮기고 키우며, 작아질 때는 먼저 줄이고 옮깁니다. 창 조작은 하나씩 차례로 합니다.
+- `data-stage="0|1|2"` 는 `#shell` 에 붙고, 단계마다 보이는 부분은 CSS 가 고릅니다. `style.css` 의 `--stage-w` · `--stage-h` 는 `STAGE_SIZE` 와 같아야 하며 시험이 확인합니다.
+- 개발용 브라우저(`dev-server.mjs`)에는 `__TAURI__` 가 없으므로 CSS 만 바뀝니다. 같은 크기의 상자가 페이지 오른쪽 아래에 놓입니다. 오류는 나지 않습니다. 미리보기용으로 `?stage=0|1|2` 를 받습니다.
+
+### 20-2. 창 설정과 권한
+
+- `tauri.conf.json` 의 창: 360 x 56, `transparent` · `decorations: false` · `alwaysOnTop` · `skipTaskbar: false` · `resizable: false` · `shadow: false`. 예전의 `minWidth` 380 · `minHeight` 520 은 알약 높이(56)를 막으므로 지웠습니다.
+- macOS 의 투명 창에는 `app.macOSPrivateApi: true` 가 필요합니다(키 이름은 tauri-utils 2.10.2 의 `config.rs` 에서 확인). 이 값을 켜면 tauri-build 가 `tauri` 의존성에 `macos-private-api` 기능이 있는지 확인하고 다르면 빌드를 멈추므로, `app/src-tauri/Cargo.toml` 에 그 기능을 더했습니다. 새 의존성은 생기지 않습니다(`Cargo.lock` 그대로). 이 비공개 API 를 쓰면 Mac App Store 에는 낼 수 없습니다.
+- `capabilities/default.json` 에 `core:window:allow-set-size` · `allow-set-position` · `allow-start-dragging` · `allow-close` 를 더했습니다. 모니터 · 창 위치 · 창 크기 읽기(`allow-current-monitor` · `allow-outer-position` · `allow-outer-size`)는 이미 `core:default` 에 있습니다. 항상 위 켜고 끄기는 쓰지 않으므로 `allow-set-always-on-top` 은 넣지 않았습니다.
+- 처음 뜰 때 창은 운영체제가 정한 자리에 360 x 56 으로 나타났다가, 화면이 첫 명령을 부르는 동안 오른쪽 아래로 옮겨집니다. 숨긴 채 띄우고 옮긴 뒤 보이게 하는 방법은, 화면 스크립트가 실패하면 창이 영영 보이지 않으므로 쓰지 않았습니다.
+- 투명 창의 `backdrop-filter` 는 웹뷰 안의 내용만 흐립니다. 창 뒤의 바탕 화면은 흐려지지 않습니다.
+
+### 20-3. 투표 명령 등록 (고친 것)
+
+- `cmd_vote` · `cmd_verdicts` 는 코어(`app/src/commands.rs`)와 화면(`ui/commands.ts`)에는 있었지만 `src-tauri/src/lib.rs` 의 `generate_handler!` 에 없어서, Tauri 창에서는 추천 / 비추천이 실패했습니다(18절의 작업은 dev-server 브리지로만 확인됨). 다른 명령과 같은 방식으로 감싸 등록했습니다. 인자 타입(`VoteArgs` · `VerdictsArgs`)은 상위 크레이트가 다시 내보내지 않아 `premium_discount_app::commands::` 경로로 가져옵니다.
+- 화면은 이제 내 글(서버 id 가 있는 등록된 글)의 판정을 `cmd_verdicts` 로 읽어 피드 아이콘 · 내 평가 배지 · 추천 / 비추천 칩에 씁니다. 코어가 판정을 10분 캐시하므로 10초마다의 확인이 서버에 매번 묻지 않습니다. 명령을 모르는 이전 실행 파일이면 판정 없이 보여 줍니다.
+
+### 20-4. 알아 둘 것
+
+- **피드 명령은 없습니다.** 미니 피드와 알약은 서랍의 "내 평가" 와 같은 행(Rust → Dexie 캐시, 최신순 50개)을 씁니다. 남의 새 평가가 흘러오는 피드가 아닙니다.
+- **지갑 명령은 없습니다.** 지갑 칸은 로그인 세션의 계정 주소만 보여 주고 "지갑(시드 구문) 명령은 아직 앱에 없습니다" 라고 적습니다. 시드 지갑 서명은 `crates/pd-identity` 에만 있고 앱 명령으로 이어 붙이지 않았습니다.
+- **빠른 입력**은 평가 쓰기와 같은 `cmd_submit_evaluation` 을 현재 도메인(평가 쓰기의 도메인 칸, 마지막에 쓴 값을 기억)으로 부릅니다. 도메인이 비어 있으면 보내지 않고 서랍의 평가 쓰기를 펼쳐 도메인 칸으로 보냅니다. 답글은 서랍에서만 답니다.
+- **[현재 도메인만]** 칩은 예전의 "입력한 도메인에서만 찾기" 체크와 같은 칸(`#onlyCc`)입니다. 이제 검색뿐 아니라 내 평가 목록과 검색 결과도 그 도메인으로 거릅니다. 다른 칩은 화면에서 거르기만 합니다(검색을 다시 하지 않습니다).
+- **시작 안내**(모델 없음 · 설정 오류)는 2단계 크기로 바로 보여 줍니다. 접으면 알약이 "설정 필요" 를 보여 주고, 누르면 1단계를 건너뛰고 시작 안내로 돌아옵니다. 모델 내려받기 화면은 그대로입니다.
+- **모바일(Android · iOS)** 은 창 크기를 바꿀 수 없어 Tauri 가 창 속성을 무시합니다. 화면은 `cmd_app_status` 의 platform(답이 오기 전에는 사용자 에이전트)으로 모바일을 알아보고, 2단계 서랍을 전체 화면으로만 씁니다(`html[data-mode="full"]`). 접기 · 끄기 버튼은 숨기고 Esc 로 단계가 바뀌지 않습니다. 안전 영역 여백(`env(safe-area-inset-*)`)을 둡니다. Android 빌드는 이번에 돌려 보지 않았습니다.
+- 서랍 아래 접이식에는 로그인(기존 QR · 메일 로그인 창), 지갑, 모델(임베딩 모델 설치 상태 한 줄, 욕설 필터 laya 받기, items 초안 모델과 초안 만들기)이 있습니다. 예전에 평가 쓰기 아래에 있던 욕설 필터 줄과 오른쪽 열의 초안 카드를 여기로 옮겼습니다.
+
+### 20-5. 검증
+
+| 묶음 | 실행 | 결과 |
+| --- | --- | --- |
+| 화면 단위 | `cd app/ui && npm test` | 70개 통과(기존 52 + `stage.test.ts` 18: 단계 크기와 CSS 값 일치, 오버레이 · 전체 화면, 단계 옮기기, 5px 경계, 창 자리(배율 150%, 음수 좌표의 왼쪽 모니터, 끌어 옮긴 모서리 고정, 작업 영역 밖 자르기), 커질 때 · 작아질 때 순서, 피드 순서 · 불투명도, 판정 등급 · 아이콘, 동기화 점, 알약 한 줄, 걸러 보기, 지갑 · 모델 한 줄) |
+| 화면 묶기 | `npm run build` | 성공 (`dist/main.js` 346 KB) |
+| 타입 | `tsc --noEmit --strict … main.ts stage.ts` (전역 tsc 5.6.3) | 오류 없음 |
+| Tauri 셸 | `cd app/src-tauri && cargo check` (`CARGO_BUILD_JOBS=2`, `PROTOC`) | 성공, 경고 없음. 처음에는 `ui/dist` 가 없어 `generate_context!` 가 멈췄고(`frontendDist` 경로 없음), `npm run build` 뒤 다시 돌려 통과. 창 권한 이름과 `macos-private-api` 기능 짝도 이 단계(tauri-build)가 확인합니다 |
+| 화면 동작 (헤드리스 Edge · CDP, 가짜 명령 서버) | 저장소 밖 스크립트 | 30개 확인 통과, 스크립트 오류 없음. 알약 → 피드 → 맨 위 줄 → 서랍, Esc 한 단계씩, 칩 거르기(5건 → 추천 1 · 대기 2), 도메인 없는 빠른 입력 → 서랍 평가 쓰기, 지갑 · 모델 한 줄, 모바일 전체 화면(가로 넘침 없음, 접기 숨김), 시작 실패 → 2단계 · 알약 "설정 필요", 가짜 Tauri 창 API(배율 1.5, 작업 영역 2880 x 1560)로 창 조작 순서와 값(처음 `pos 2316,1452 → size 360x56`, 1단계 `pos 2316,1146 → size 360x260`, 접기 `size → pos`), 5px 넘는 움직임은 `startDragging` 이고 단계 그대로, 3px 는 누르기 |
+
+GUI 앱 자체(`tauri dev` · `tauri build`)는 돌려 보지 않았습니다. 실제 Windows · macOS 창에서의 투명 배경, 항상 위, 끌기, 작업 표시줄 위치에 따른 자리는 앱을 켜서 한 번 확인해야 합니다.
+
+## 21. raon-zena 와의 연결 · 역할 분담 (2026-11-17)
+
+마스터 기획서(5대 과업) 중 이 저장소 밖에서 한 일과, 이 저장소 기준으로 확인한 것입니다. raon-zena 쪽 기록은 그 저장소의 `docs/MASTER_PLAN_5.md` 입니다.
+
+- **`crates/` 를 raon-zena 가 링크합니다.** raon-zena 작업 공간이 `pd-verdict` · `pd-identity` · `pd-nav` 를 이 저장소의 git 리비전 `540311b` 로 고정해 씁니다. `zena-verdict` 는 판정 수식 사본을 지우고 `pd_verdict` 를 다시 내보내며, `premium-discount-mcp` 의 `hashId` 는 `pd_identity::hash_id` 를 부릅니다. `pd-nav` 는 MCP 도구 `pd_nav_number`(합치기 · 1 ~ 9 번호 · 개인정보 화면)로 연결했습니다. 따라서 이 크레이트들의 공개 API(`Params` · `verdict` · `hash_id` · `merge` · `number` · `Region` 등)를 바꾸면, raon-zena 가 리비전을 올릴 때 함께 고쳐야 합니다.
+- **데스크톱 설치본에서 코어 찾기.** raon-zena 의 `premium-discount-mcp` 는 `premium-discount-app`(헤드리스 코어, `serve_lines`)을 `%LOCALAPPDATA%\premium.discount\` · `%ProgramFiles%\premium.discount\` 에서도 찾습니다. 지금의 Tauri 번들은 창 실행 파일만 넣으므로, 이 단계가 동작하려면 코어를 `bundle.externalBin` 사이드카로 함께 넣어야 합니다(아직 하지 않음: 빌드 전에 코어를 대상 삼중항 이름으로 만들어 두는 단계가 필요합니다).
+- **embeddinggemma-2 와 granite 의 역할.** 새 코드는 없습니다. 기획서 4절의 표(Q8_0 520.1 → 138.1 MB · 코사인 0.999906, 임베딩 표 mmap, 타워 지연 상주 · 교차 스왑, 비전 층 0 · 오디오 층 8 F32)는 16 ~ 17절에 이미 구현 · 실측되어 있습니다. 숫자 하나만 다릅니다. "짧은 문장 단건 120 ~ 160 ms" 는 F32 기준(약 0.15초)이고, Q8_0 Dequant 경로는 약 0.28초입니다(16-5). granite(`granite-97m-r2-cls-v1`)는 raon-zena 의 실시간 라우팅과 `pd-nav` 라벨 공간에서만 씁니다.
+- **SigLIP2.** raon-zena 의 `raon-vision` 이 이제 `google/siglip2-so400m-patch16-naflex` 를 직접 읽습니다(transformers 참조와 이미지 코사인 1.000000 · 텍스트 0.999999). 이 앱의 접근성 비전도 같은 체크포인트를 쓸 계획(19절)이므로, 전처리(평균 · 표준편차 0.5, bilinear)와 위치표 antialias 는 그 구현을 기준으로 맞추면 됩니다.

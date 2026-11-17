@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko">
+<html lang="ko" data-mode="overlay">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,96 +7,151 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="top">
-  <h1>premium.discount</h1>
-  <div class="top-right">
-    <p id="net" class="net" hidden></p>
-    <div class="acct" id="acct" hidden>
-      <span id="acctLabel" class="acct-label">게스트</span>
-      <button type="button" id="loginBtn" class="link">로그인</button>
-      <button type="button" id="logoutBtn" class="link" hidden>로그아웃</button>
-    </div>
-  </div>
-</header>
-<p id="accountWarn" class="banner" role="status" hidden></p>
+<!-- 3단계 오버레이 (ui/stage.ts): 0 알약 · 1 미니 피드 · 2 서랍. 데스크톱은 단계마다 창 크기가 바뀌고, 모바일은 2단계를 전체 화면으로 쓴다 -->
+<div id="shell" class="shell" data-stage="0">
 
-<main id="setup" class="setup" hidden>
-  <section class="card">
-    <h2 id="setupTitle">앱을 시작하지 못했습니다</h2>
-    <p id="setupError" class="setup-error"></p>
-    <ul id="setupHints" class="setup-hints"></ul>
-    <div id="modelFetch" class="model-fetch" hidden>
-      <h3>모델 내려받기</h3>
-      <p class="muted">Hugging Face에서 google/embeddinggemma-2를 받습니다. 판(리비전)을 고정하고 받은 내용을 해시로 확인합니다. 끊기면 이어받습니다.</p>
-      <div id="dlChoices" class="dl-choices"></div>
-      <progress id="dlProgress" max="100" value="0" hidden></progress>
-      <p id="dlStatus" class="dl-status" role="status"></p>
-      <div class="row"><button type="button" id="dlCancel" hidden>멈추기</button></div>
+  <!-- 0단계: 알약. 누르면 1단계, 끌면 창을 옮긴다 -->
+  <button type="button" id="pill" class="pill-bar only-0" aria-label="최근 평가 펼치기">
+    <span class="dot" id="pillDot" data-tone="muted" aria-hidden="true"></span>
+    <span class="sync-label" id="pillSync">준비 중</span>
+    <span class="pill-line" id="pillLine">premium.discount</span>
+  </button>
+
+  <!-- 1단계: 최근 내 평가 3개와 빠른 입력 -->
+  <section id="mini" class="mini only-1" aria-label="최근 평가">
+    <div class="mini-head drag-area">
+      <span class="dot" id="miniDot" data-tone="muted" aria-hidden="true"></span>
+      <span class="sync-label" id="miniSync">준비 중</span>
+      <span class="mini-cc muted" id="miniCc"></span>
+      <button type="button" id="toDrawer" class="link">전체 ▸</button>
+      <button type="button" id="collapse1" class="icon-btn" aria-label="접기 (Esc)" title="접기 (Esc)">—</button>
     </div>
-    <div class="row"><span class="muted" id="setupVersion"></span><button type="button" id="setupRetry" class="primary">다시 시도</button></div>
+    <ol id="feed" class="feed" aria-live="polite"></ol>
+    <p id="quickNotice" class="quick-notice" role="status" hidden></p>
+    <form id="quickForm" class="quick" autocomplete="off">
+      <input id="quickText" aria-label="빠른 메모" placeholder="현재 도메인(cc)에 빠른 메모/평가 남기기..." spellcheck="false">
+      <button type="submit" id="quickSubmit" class="primary">등록</button>
+    </form>
   </section>
-</main>
 
-<main class="layout" id="layout">
-  <div class="col">
-    <section class="card" aria-labelledby="h-compose">
-      <h2 id="h-compose">평가 쓰기</h2>
-      <form id="form" autocomplete="off">
-        <label class="field">
-          <span>도메인</span>
-          <input id="cc" name="cc" placeholder="example.com" inputmode="url" spellcheck="false" required>
-        </label>
-        <div id="replyTo" class="reply" hidden>
-          <span id="replyLabel"></span>
-          <button type="button" id="clearReply" class="link">답글 취소</button>
-        </div>
-        <label class="field">
-          <span>평가</span>
-          <textarea id="text" name="text" rows="6" placeholder="이 도메인에 대한 평가를 적으세요" required></textarea>
-        </label>
-        <div class="row">
-          <span id="bytes" class="muted num">0 / 8,192 바이트</span>
-          <button id="submit" class="primary" type="submit">등록</button>
-        </div>
-        <p id="author" class="author muted"></p>
-        <p id="filterInfo" class="filter-info muted" hidden><span id="filterText"></span> <button type="button" id="filterGet" class="link" hidden></button></p>
-      </form>
-      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
-    </section>
-
-    <section class="card" aria-labelledby="h-mine">
-      <div class="row head">
-        <h2 id="h-mine">내 평가 <small id="mineCount" class="muted num"></small></h2>
-        <button type="button" id="recheck" class="link">지금 확인</button>
+  <!-- 2단계: 검색 · 걸러 보기 · 타임라인 · 계정/지갑/모델 -->
+  <div id="drawer" class="drawer only-2">
+    <header class="top drag-area">
+      <h1>premium.discount</h1>
+      <div class="top-right">
+        <p id="net" class="net" hidden></p>
+        <button type="button" id="collapse2" class="icon-btn only-overlay" aria-label="알약으로 접기" title="접기 (Esc는 한 단계)">—</button>
+        <button type="button" id="closeApp" class="icon-btn only-overlay" aria-label="앱 끄기" title="앱 끄기">✕</button>
       </div>
-      <ul id="list" class="list"><li class="empty">앱을 준비하는 중…</li></ul>
-    </section>
-  </div>
+    </header>
+    <p id="accountWarn" class="banner" role="status" hidden></p>
 
-  <div class="col">
-    <section class="card" aria-labelledby="h-search">
-      <h2 id="h-search">검색</h2>
+    <main id="setup" class="setup" hidden>
+      <section class="card">
+        <h2 id="setupTitle">앱을 시작하지 못했습니다</h2>
+        <p id="setupError" class="setup-error"></p>
+        <ul id="setupHints" class="setup-hints"></ul>
+        <div id="modelFetch" class="model-fetch" hidden>
+          <h3>모델 내려받기</h3>
+          <p class="muted">Hugging Face에서 google/embeddinggemma-2를 받습니다. 판(리비전)을 고정하고 받은 내용을 해시로 확인합니다. 끊기면 이어받습니다.</p>
+          <div id="dlChoices" class="dl-choices"></div>
+          <progress id="dlProgress" max="100" value="0" hidden></progress>
+          <p id="dlStatus" class="dl-status" role="status"></p>
+          <div class="row"><button type="button" id="dlCancel" hidden>멈추기</button></div>
+        </div>
+        <div class="row"><span class="muted" id="setupVersion"></span><button type="button" id="setupRetry" class="primary">다시 시도</button></div>
+      </section>
+    </main>
+
+    <main class="layout" id="layout">
       <form id="searchForm" class="search" autocomplete="off">
         <input id="q" name="q" type="search" placeholder="찾고 싶은 내용을 문장으로 적으세요" aria-label="검색어" required>
         <button class="primary" type="submit">검색</button>
       </form>
-      <label class="check"><input id="onlyCc" type="checkbox"> 입력한 도메인에서만 찾기</label>
-      <div id="searchNotice" class="notice" role="status" aria-live="polite" hidden></div>
-      <ul id="results" class="list"></ul>
-    </section>
-    <section class="card" aria-labelledby="h-draft" id="draftCard" hidden>
-      <h2 id="h-draft">페이지 초안 <span class="muted">로컬 AI · 실험</span></h2>
-      <p class="muted draft-note">쇼핑 페이지 글을 넣으면 이 기기의 Qwen3.5-0.8B가 items 초안(제목·요약·premium/discount)을 만듭니다. 서버로 보내지 않습니다.</p>
-      <p class="filter-info muted"><span id="draftModelText"></span> <button type="button" id="draftGet" class="link" hidden></button></p>
-      <form id="draftForm" autocomplete="off" hidden>
-        <label class="field"><span>페이지 글</span><textarea id="pageText" rows="4" placeholder="상품 설명, 할인 문구 등"></textarea></label>
-        <label class="field"><span>링크</span><input id="pageLink" placeholder="https://" inputmode="url" spellcheck="false"></label>
-        <div class="row"><span id="draftStatus" class="muted" role="status"></span><button class="primary" id="draftBtn" type="submit">초안 만들기</button></div>
-      </form>
-      <pre id="draftOut" class="draft-out" hidden></pre>
-    </section>
+      <div class="chips" role="group" aria-label="걸러 보기">
+        <span id="chips" class="chips-set"></span>
+        <label class="chip chip-cc"><input id="onlyCc" type="checkbox"> <span id="ccChipLabel">현재 도메인만</span></label>
+      </div>
+
+      <div class="scroll" id="timeline">
+        <details id="composeBox" class="compose">
+          <summary>평가 쓰기</summary>
+          <form id="form" autocomplete="off">
+            <label class="field">
+              <span>도메인</span>
+              <input id="cc" name="cc" placeholder="example.com" inputmode="url" spellcheck="false" required>
+            </label>
+            <div id="replyTo" class="reply" hidden>
+              <span id="replyLabel"></span>
+              <button type="button" id="clearReply" class="link">답글 취소</button>
+            </div>
+            <label class="field">
+              <span>평가</span>
+              <textarea id="text" name="text" rows="4" placeholder="이 도메인에 대한 평가를 적으세요" required></textarea>
+            </label>
+            <div class="row">
+              <span id="bytes" class="muted num">0 / 8,192 바이트</span>
+              <button id="submit" class="primary" type="submit">등록</button>
+            </div>
+            <p id="author" class="author muted"></p>
+          </form>
+        </details>
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+        <section id="resultsBox" aria-labelledby="h-results" hidden>
+          <div class="row head">
+            <h2 id="h-results">검색 결과 <small id="resultsCount" class="muted num"></small></h2>
+            <button type="button" id="clearSearch" class="link">검색 지우기</button>
+          </div>
+          <div id="searchNotice" class="notice" role="status" aria-live="polite" hidden></div>
+          <ul id="results" class="list"></ul>
+        </section>
+
+        <section aria-labelledby="h-mine">
+          <div class="row head">
+            <h2 id="h-mine">내 평가 <small id="mineCount" class="muted num"></small></h2>
+            <button type="button" id="recheck" class="link">지금 확인</button>
+          </div>
+          <ul id="list" class="list"><li class="empty">앱을 준비하는 중…</li></ul>
+        </section>
+      </div>
+
+      <details id="foot" class="foot">
+        <summary>계정 · 지갑 · 모델</summary>
+        <div class="foot-body">
+          <section aria-labelledby="h-acct">
+            <h3 id="h-acct">로그인</h3>
+            <div class="acct" id="acct" hidden>
+              <span id="acctLabel" class="acct-label">게스트</span>
+              <button type="button" id="loginBtn" class="link">QR 메일 로그인</button>
+              <button type="button" id="logoutBtn" class="link" hidden>로그아웃</button>
+            </div>
+          </section>
+          <section aria-labelledby="h-wallet">
+            <h3 id="h-wallet">지갑</h3>
+            <code id="walletAddr" class="mail-addr" hidden></code>
+            <p id="walletNote" class="muted small"></p>
+          </section>
+          <section aria-labelledby="h-model">
+            <h3 id="h-model">모델</h3>
+            <p id="modelLine" class="muted small">모델 상태를 읽는 중…</p>
+            <p id="filterInfo" class="filter-info muted" hidden><span id="filterText"></span> <button type="button" id="filterGet" class="link" hidden></button></p>
+            <div id="draftCard" hidden>
+              <p class="muted small" id="h-draft">페이지 초안 · 로컬 AI · 실험. 쇼핑 페이지 글을 넣으면 이 기기의 Qwen3.5-0.8B가 items 초안(제목·요약·premium/discount)을 만듭니다. 서버로 보내지 않습니다.</p>
+              <p class="filter-info muted"><span id="draftModelText"></span> <button type="button" id="draftGet" class="link" hidden></button></p>
+              <form id="draftForm" autocomplete="off" hidden>
+                <label class="field"><span>페이지 글</span><textarea id="pageText" rows="3" placeholder="상품 설명, 할인 문구 등"></textarea></label>
+                <label class="field"><span>링크</span><input id="pageLink" placeholder="https://" inputmode="url" spellcheck="false"></label>
+                <div class="row"><span id="draftStatus" class="muted" role="status"></span><button class="primary" id="draftBtn" type="submit">초안 만들기</button></div>
+              </form>
+              <pre id="draftOut" class="draft-out" hidden></pre>
+            </div>
+          </section>
+        </div>
+      </details>
+    </main>
   </div>
-</main>
+</div>
 
 <div id="loginModal" class="modal" hidden>
   <div class="modal-card" data-mode="qr" role="dialog" aria-modal="true" aria-labelledby="loginTitle">

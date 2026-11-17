@@ -1,10 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "메인 창이 쓰는 권한. 앱 명령(cmd_*)은 이 크레이트가 직접 등록한 것만 부를 수 있고, 외부 앱 열기는 mailto: 링크만 허용한다 (opener:default를 쓰지 않는다: http(s)까지 열린다).",
+  "description": "메인 창이 쓰는 권한. 앱 명령(cmd_*)은 이 크레이트가 직접 등록한 것만 부를 수 있고, 외부 앱 열기는 mailto: 링크만 허용한다 (opener:default를 쓰지 않는다: http(s)까지 열린다). 창 권한은 3단계 오버레이(ui/stage.ts)가 쓰는 크기 바꾸기 · 위치 옮기기 · 끌어 옮기기 · 닫기만 더한다 (모니터 · 위치 · 크기 읽기는 core:default에 있다).",
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "mailto:*" }]
