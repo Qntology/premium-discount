@@ -1,0 +1,60 @@
+{
+  "scheme": "pd-wallet/1",
+  "generated_by": "contracts/gen_wallet_v1.mjs",
+  "ethers": "6.17.0",
+  "path": "m/44'/60'/0'/0/0",
+  "max_skew_ms": 300000,
+  "wallets": [
+    {
+      "phrase": "test test test test test test test test test test test junk",
+      "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "private_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+    },
+    {
+      "phrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+      "address": "0x9858effd232b4033e47d90003d41ec34ecaeda94",
+      "private_key": "0x1ab42cc412b618bdea3a599e3c9bae199ebf030895b039e9db1e30dafb12b727"
+    }
+  ],
+  "messages": [
+    {
+      "text": "hello",
+      "signature": "0xf16ea9a3478698f695fd1401bfe27e9e4a7e8e3da94aa72b021125e31fa899cc573c48ea3fe1d4ab61a9db10c19032026e3ed2dbccba5a178235ac27f94504311c"
+    },
+    {
+      "text": "패치 1.4: 보스 체력 15% 너프",
+      "signature": "0xdd5178aceaef1756ec6a572534f98fc93c1817020bc999c1c8372cd182312150649228b421ef60621824e3182fd3d34ac1e1eab7cb007dbb2845f8e0dd9628171b"
+    },
+    {
+      "text": "",
+      "signature": "0xc1977b761f1dd36c29795783460d241885c8e7f9d962dbe7bba2753fd94e89b444a1cd9ed855dd09afa3b73f7c2bd097ec9abc2d2775d737505a02d3f0cafa591b"
+    }
+  ],
+  "requests": [
+    {
+      "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "time_ms": 1763380800000,
+      "method": "POST",
+      "path": "/nav/trials",
+      "body": "{\"runs\":[{\"schema\":\"trial/1\",\"type\":\"premium\"}]}",
+      "body_sha256": "3faa934e51486eacadda6d472e43edf09d3fb5432bb49e4df075f6d0e2bcded2",
+      "message": "premium.discount request v1\naddress: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266\ntime: 1763380800000\nmethod: POST\npath: /nav/trials\nbody-sha256: 3faa934e51486eacadda6d472e43edf09d3fb5432bb49e4df075f6d0e2bcded2",
+      "signature": "0x031471b45410c5b9d7f7e3c41effca009d8b4dbd4428c4c6dd8c7b319b0a35ad63aa509fd1933e80972ce2d8cf1f8e981636f4f3033c4b3bade7049ef3e60fd51c"
+    },
+    {
+      "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "time_ms": 1763380860123,
+      "method": "get",
+      "path": "/nav/verdicts",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "message": "premium.discount request v1\naddress: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266\ntime: 1763380860123\nmethod: GET\npath: /nav/verdicts\nbody-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "0xbda208bb74a937870e26c1c23f47008870901267e10051e1beb05500fc2f14e63a3cded7e54b3d0b68d92c1bb3cd5f8c8199d70a797da29a5a1a0db0fbb08d591c"
+    }
+  ],
+  "invalid_phrases": [
+    "test test test test test test test test test test test test",
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
+    "test test test test test test test test test test test 장바구니"
+  ]
+}

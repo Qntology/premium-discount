@@ -1,0 +1,8 @@
+# premium-discount 가 소유하는 라이브러리 crate. 앱(app/)과 raon-zena 가 path · git 의존으로 가져다 쓴다.
+# 앱은 따로 빌드한다 (자체 Cargo.lock · 모바일 빌드 설정 · LanceDB). 그래서 이 작업 공간은 crates/ 아래만 묶는다.
+#
+# 원칙: 라이브러리는 LanceDB · HTTP · Tauri 에 의존하지 않는다. 저장과 전송은 앱이 맡는다.
+# candle 을 쓰는 crate 는 "0.11.0" 으로만 적고, 포크로 바꾸는 [patch] 는 빌드하는 쪽 작업 공간이 정한다.
+[workspace]
+resolver = "2"
+members = ["pd-verdict", "pd-nav", "pd-identity"]

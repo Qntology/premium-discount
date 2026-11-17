@@ -1,0 +1,3 @@
+# 코어 크레이트와 같은 빌드 폴더를 써서 lancedb 같은 무거운 의존성을 다시 컴파일하지 않는다
+[build]
+target-dir = "../target"

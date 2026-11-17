@@ -1,0 +1,17 @@
+load 1.989005847s (quantized: false)
+full head 1.51210643s (248320 rows, 1017MB F32)
+vocab plan 185.32214ms: required 7913, fill 240157
+same 32/32  draft(full) {"type":2,"head":"겨울 패딩 최대 70% 할인","body":"겨울 패딩 최대 70% 할인! 오늘 자정까지 쿠폰 적용 시 추가 10% 할인됩니다. 무료 배송.","link":"https://shop.example/padding","digest":"bb3a0763717d4f
+same 16/32  draft(full) {"type":1,"head":"Handcrafted Italian Leather Briefcase","body":"A limited edition briefcase featuring full-grain calfskin and lifetime warranty, crafted with care for luxury and durability.","link":"https://atelier.example/briefcase","
+           draft(trim) {"type":1,"head":"Hand-stitched Italian leather briefcase","body":"A limited edition briefcase made from full-grain calfskin with a lifetime warranty.","link":"https://atelier.example/briefcase","digest":"52a66da2938b71b35a78cfbb92f9c17d
+same 32/32  draft(full) {"type":1,"head":"장인이 한 땀 한 땀 만든 수제 가죽 지갑","body":"이탈리아산 베지터블 가죽을 사용하여 평생 수선 보증과 한정 수량 50 개를 갖춘 고급 가죽 지갑","link":"https://craft.exam
+same 16/32  draft(full) {"type":2,"head":"Flash Sale: 2-for-1 on all T-shirts this weekend only","body":"Use code SUMMER for an extra 15% off to save on your next purchase.","link":"https://outlet.example/tees","digest":"fd848f682240a61d89f4c05833a4623103466a6
+           draft(trim) {"type":2,"head":"Flash sale: 2-for-1 on all T-shirts this weekend only","body":"Save 15% off with code SUMMER on all T-shirts for a weekend deal.","link":"https://outlet.example/tees","digest":"f6d9c368c31f16a7edc6183d58ca2fd26a3e9e3e3a
+same 32/32  draft(full) {"type":1,"head":"스마트폰 케이스 1+1 특가","body":"스마트폰 케이스 1+1 특가 9,900원 오늘만 이 가격! 리뷰 작성 시 적립금 2천원 추가 지급.","link":"https://mall.example/case","digest":"4c4a065bac5bf
+same 15/32  draft(full) {"type":1,"head":"Luxury Swiss Automatic Chronograph","body":"A premium Swiss automatic chronograph featuring a 42mm 18k rose gold case, sapphire crystal, and a hand-finished movement with a 5-year warranty.","link":"https://watch.examp
+           draft(trim) {"type":1,"head":"Swiss automatic chronograph watch","body":"A high-land luxury time piece with a 42mm rose gold case, sapphire crystal, and a hand-finished movement, complete with a 5-year warranty.","link":"https://watch.example/chrono
+same 32/32  draft(full) {"type":1,"head":"프리미엄 한우 1++ 등심 선물세트","body":"산지 직송, 고급 보자기 포장, 명절 한정 판매","link":"https://meat.example/hanwoo","digest":"7cede61bd2ade8cfdc68f245c1cba56c280972df25274cf18ecf075d
+same 17/32  draft(full) {"type":2,"head":"Clearance Sale","body":"Up to 80% off last season's sneakers with free returns available.","link":"https://kicks.example/clearance","digest":"10a3f32e8cf24f1fb099a4e36c190e35e14b682c2fbd7c3f8794189779272003"}
+           draft(trim) {"type":2,"head":"Clearance: Last season's sneakers up to 80% off","body":"The page offers a significant discount on sneakers with free returns, making it a clear discount page.","link":"https://kicks.example/clearance","digest":"885d990
+greedy tokens identical 192/256, drafts identical 4/8; per token (incl. prefill) full 343ms, trimmed 253ms
+mean NLL 2.84420 (quantized: false)

@@ -1,0 +1,44 @@
+[
+  {
+    "request_id": "req-contract-0000000001",
+    "id": "0190f0a0-0000-7000-8000-000000000002",
+    "from": "0x00000000000000000000000000000000000000ab",
+    "to": "0x0000000000000000000000000000000000000002",
+    "cc": "example.com",
+    "bcc": "",
+    "ref": "0190f0a0-0000-7000-8000-000000000001",
+    "root": "0190f0a0-0000-7000-8000-000000000001",
+    "state": "stored",
+    "created_at": 1700000000001,
+    "updated_at": 1700000000999,
+    "data": {
+      "local_id": "local-2",
+      "parent_local": "",
+      "text": "답글 본문",
+      "text_hash": "h-a",
+      "attempts": 2,
+      "reason": ""
+    }
+  },
+  {
+    "request_id": "req-contract-0000000002",
+    "id": "",
+    "from": "",
+    "to": "",
+    "cc": "example.com",
+    "bcc": "",
+    "ref": "",
+    "root": "",
+    "state": "queued",
+    "created_at": 1700000001000,
+    "updated_at": 1700000001000,
+    "data": {
+      "local_id": "local-3",
+      "parent_local": "local-2",
+      "text": "대기 중인 글",
+      "text_hash": "h-b",
+      "attempts": 0,
+      "reason": ""
+    }
+  }
+]

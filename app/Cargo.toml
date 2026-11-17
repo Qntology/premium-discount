@@ -1,0 +1,60 @@
+[package]
+name = "premium-discount-app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "premium_discount_app"
+path = "src/lib.rs"
+
+[features]
+default = []
+# GPU 백엔드. candle은 candle-rocm-vulkan 포크다(아래 [patch.crates-io]): raon-zena · logis-center와 같은 기능 이름이다.
+# 켠 백엔드만 빌드되고, 쓸 장치는 실행할 때 PD_DEVICE로 고른다 (utils.rs)
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+rocm = ["candle-core/rocm", "candle-nn/rocm"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+# 입력 임베딩 표를 파일 매핑에서 행 단위로 읽는다 (candle 포크가 쓰는 판과 같아야 Dtype 타입이 맞는다)
+safetensors = "0.8"
+half = "2"
+futures = "0.3"
+getrandom = "0.3"
+# 로컬 원본 저장소(local.rs). noto-sandbox와 같은 버전이고, 빌드에 protoc가 필요하다 (링크가 무거워 CARGO_BUILD_JOBS를 낮추는 편이 안전하다)
+lancedb = { version = "0.31.0", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokenizers = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# 디버그 정보는 끈다. 모바일 빌드(staticlib·cdylib)는 의존성 전부를 한 파일로 묶는데, 디버그 정보가 있으면 파일 하나가 수 GB가 된다.
+# src-tauri/Cargo.toml에도 같은 설정을 둬야 두 크레이트가 같은 빌드 결과를 나눠 쓴다.
+[profile.dev]
+debug = 0
+
+# aarch64(Android)에서는 최적화가 없는 빌드가 gemm-f16을 컴파일하지 못한다: fp16 어셈블리 헬퍼(#[inline])가
+# fp16 기능이 없는 함수로 따로 만들어져 "instruction requires: fullfp16" 오류가 난다. 두 크레이트만 최적화해 인라인되게 한다.
+# (행렬 곱 속도에도 도움이 된다. 두 매니페스트에 같은 값을 둔다)
+[profile.dev.package.gemm-common]
+opt-level = 3
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
+# candle은 crates.io 판 대신 candle-rocm-vulkan 포크를 쓴다 (CUDA · ROCm-HIP · Vulkan · Metal 백엔드).
+# raon-zena가 Cargo.lock으로 고정한 커밋과 같다. [patch]는 빌드하는 쪽 루트 매니페스트의 것만 적용되므로
+# src-tauri/Cargo.toml에도 같은 줄을 둔다. 이 크레이트를 다른 작업 공간이 가져가면 그쪽 [patch]를 따른다.
+[patch.crates-io]
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }

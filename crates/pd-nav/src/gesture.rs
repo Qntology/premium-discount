@@ -1,0 +1,306 @@
+//! 제스처 감지: 클릭 · 터치(탭) · 스와이프 · 스크롤
+//!
+//! 브라우저 확장(pointer · scroll 이벤트)과 앱(Windows 포인터 입력)이 같은 원시 표본을 넘기고, 여기서 한 규칙으로 가른다.
+//! 좌표 · 시각은 기기를 떠나지 않는다. 밖으로 나가는 것은 제스처 종류([`Gesture`])뿐이고, 타임트라이얼 체크포인트에
+//! 붙는다(`element@swipe-left`, `page@scroll-down`). 마찰 신호로도 쓴다: 짧은 시간에 같은 곳을 여러 번 누르면
+//! [`crate::Signal::RageClick`], 스크롤 방향을 자꾸 뒤집으면 [`crate::Signal::Rescrolled`].
+//!
+//! 기준값(누름 허용 움직임 10 px, 스와이프 50 px · 500 ms 안, 스크롤 묶음 300 ms · 100 px)은 흔히 쓰는 값에서 시작한 초깃값이고
+//! 실측으로 고친다.
+
+use serde::{Deserialize, Serialize};
+
+/// 체크포인트에 붙는 제스처. 누름(클릭 · 탭)은 기본 동작이라 체크포인트에는 붙이지 않는다(붙어 오면 지운다)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Gesture {
+    Press,
+    SwipeLeft,
+    SwipeRight,
+    SwipeUp,
+    SwipeDown,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+}
+
+impl Gesture {
+    pub fn name(self) -> &'static str {
+        match self {
+            Gesture::Press => "press",
+            Gesture::SwipeLeft => "swipe-left",
+            Gesture::SwipeRight => "swipe-right",
+            Gesture::SwipeUp => "swipe-up",
+            Gesture::SwipeDown => "swipe-down",
+            Gesture::ScrollUp => "scroll-up",
+            Gesture::ScrollDown => "scroll-down",
+            Gesture::ScrollLeft => "scroll-left",
+            Gesture::ScrollRight => "scroll-right",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PointerKind {
+    Mouse,
+    Touch,
+    Pen,
+}
+
+/// 포인터 표본 하나 (화면 좌표 px, 아래 · 오른쪽이 +)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PointerSample {
+    pub t_ms: i64,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// 누름부터 뗌까지의 한 획
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stroke {
+    pub pointer: PointerKind,
+    pub samples: Vec<PointerSample>,
+}
+
+/// 스크롤 위치의 변화 하나 (px, 아래 · 오른쪽으로 내려가면 +)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScrollSample {
+    pub t_ms: i64,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GestureParams {
+    /// 누름으로 보는 최대 움직임 (터치 슬롭)
+    pub press_slop_px: f32,
+    /// 누름으로 보는 최대 시간 (더 길면 길게 누름: 제스처로 보지 않는다)
+    pub press_max_ms: i64,
+    /// 스와이프로 보는 최소 거리와 최대 시간 (터치 · 펜만. 마우스로 끄는 것은 드래그)
+    pub swipe_min_px: f32,
+    pub swipe_max_ms: i64,
+    /// 이만큼 쉬면 스크롤 묶음을 끊는다
+    pub scroll_idle_ms: i64,
+    /// 스크롤 묶음이 이만큼 움직여야 체크포인트가 된다
+    pub scroll_min_px: f32,
+    /// rage: `rage_window_ms` 안에 반경 `rage_radius_px` 안에서 `rage_presses` 번 이상 누름
+    pub rage_presses: usize,
+    pub rage_window_ms: i64,
+    pub rage_radius_px: f32,
+}
+
+impl Default for GestureParams {
+    fn default() -> Self {
+        GestureParams {
+            press_slop_px: 10.0,
+            press_max_ms: 500,
+            swipe_min_px: 50.0,
+            swipe_max_ms: 500,
+            scroll_idle_ms: 300,
+            scroll_min_px: 100.0,
+            rage_presses: 3,
+            rage_window_ms: 700,
+            rage_radius_px: 24.0,
+        }
+    }
+}
+
+/// 한 획을 가른다: 거의 움직이지 않고 짧으면 누름(클릭 · 탭), 터치 · 펜으로 빠르게 멀리 밀면 스와이프(주된 축의 방향),
+/// 그 밖(드래그 · 길게 누름 · 느린 끌기)은 None
+pub fn classify_stroke(stroke: &Stroke, p: &GestureParams) -> Option<Gesture> {
+    let first = stroke.samples.first()?;
+    let last = stroke.samples.last()?;
+    let duration = last.t_ms - first.t_ms;
+    let wander = stroke.samples.iter().map(|s| (s.x - first.x).hypot(s.y - first.y)).fold(0.0f32, f32::max);
+    if wander <= p.press_slop_px && duration <= p.press_max_ms {
+        return Some(Gesture::Press);
+    }
+    let (dx, dy) = (last.x - first.x, last.y - first.y);
+    if stroke.pointer != PointerKind::Mouse && dx.hypot(dy) >= p.swipe_min_px && duration <= p.swipe_max_ms {
+        return Some(if dx.abs() >= dy.abs() {
+            if dx < 0.0 {
+                Gesture::SwipeLeft
+            } else {
+                Gesture::SwipeRight
+            }
+        } else if dy < 0.0 {
+            Gesture::SwipeUp
+        } else {
+            Gesture::SwipeDown
+        });
+    }
+    None
+}
+
+/// 쉬지 않고 이어진 스크롤 한 묶음
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScrollBurst {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// 주된 축으로 `scroll_min_px` 이상 움직였으면 그 방향
+    pub gesture: Option<Gesture>,
+    /// 방향을 뒤집은 수: 묶음 안에서 주된 축의 부호가 바뀐 수 + 같은 축에서 앞 묶음과 방향이 반대면 1
+    pub reversals: u32,
+}
+
+fn sign(v: f32) -> i8 {
+    if v > 0.0 {
+        1
+    } else if v < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// 시간순 스크롤 표본을 묶음으로 자르고, 묶음마다 방향과 뒤집은 수를 센다
+pub fn scroll_bursts(samples: &[ScrollSample], p: &GestureParams) -> Vec<ScrollBurst> {
+    let mut groups: Vec<Vec<ScrollSample>> = Vec::new();
+    for s in samples {
+        match groups.last_mut() {
+            Some(g) if s.t_ms - g.last().map_or(s.t_ms, |l| l.t_ms) <= p.scroll_idle_ms => g.push(*s),
+            _ => groups.push(vec![*s]),
+        }
+    }
+    let mut out: Vec<ScrollBurst> = Vec::new();
+    // (세로 축인가, 방향 부호) — 앞 묶음의 방향
+    let mut previous: Option<(bool, i8)> = None;
+    for g in groups {
+        let (net_x, net_y) = g.iter().fold((0.0f32, 0.0f32), |(x, y), s| (x + s.dx, y + s.dy));
+        let (moved_x, moved_y) = g.iter().fold((0.0f32, 0.0f32), |(x, y), s| (x + s.dx.abs(), y + s.dy.abs()));
+        let vertical = moved_y >= moved_x;
+        let along = |s: &ScrollSample| if vertical { s.dy } else { s.dx };
+        let mut reversals = 0u32;
+        let mut last_sign = 0i8;
+        for s in &g {
+            let sg = sign(along(s));
+            if sg != 0 {
+                if last_sign != 0 && sg != last_sign {
+                    reversals += 1;
+                }
+                last_sign = sg;
+            }
+        }
+        let net = if vertical { net_y } else { net_x };
+        let gesture = (net.abs() >= p.scroll_min_px).then(|| match (vertical, net > 0.0) {
+            (true, true) => Gesture::ScrollDown,
+            (true, false) => Gesture::ScrollUp,
+            (false, true) => Gesture::ScrollRight,
+            (false, false) => Gesture::ScrollLeft,
+        });
+        if gesture.is_some() {
+            let dir = (vertical, sign(net));
+            if previous.is_some_and(|(v, sg)| v == dir.0 && sg == -dir.1) {
+                reversals += 1;
+            }
+            previous = Some(dir);
+        }
+        out.push(ScrollBurst {
+            start_ms: g.first().map_or(0, |s| s.t_ms),
+            end_ms: g.last().map_or(0, |s| s.t_ms),
+            gesture,
+            reversals,
+        });
+    }
+    out
+}
+
+/// 시간순 누름(시각, x, y) 중에 rage 가 있는가: `rage_window_ms` 안에 서로 `rage_radius_px` 안에서 `rage_presses` 번 이상
+pub fn rage_presses(presses: &[(i64, f32, f32)], p: &GestureParams) -> bool {
+    presses.iter().enumerate().any(|(i, (t0, x0, y0))| {
+        presses[i..]
+            .iter()
+            .take_while(|(t, _, _)| t - t0 <= p.rage_window_ms)
+            .filter(|(_, x, y)| (x - x0).hypot(y - y0) <= p.rage_radius_px)
+            .count()
+            >= p.rage_presses
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stroke(pointer: PointerKind, points: &[(i64, f32, f32)]) -> Stroke {
+        Stroke {
+            pointer,
+            samples: points.iter().map(|(t_ms, x, y)| PointerSample { t_ms: *t_ms, x: *x, y: *y }).collect(),
+        }
+    }
+
+    #[test]
+    fn taps_clicks_and_swipes() {
+        let p = GestureParams::default();
+        let tap = stroke(PointerKind::Touch, &[(0, 100.0, 100.0), (60, 104.0, 103.0), (120, 103.0, 101.0)]);
+        assert_eq!(classify_stroke(&tap, &p), Some(Gesture::Press));
+        let click = stroke(PointerKind::Mouse, &[(0, 10.0, 10.0), (90, 10.0, 10.0)]);
+        assert_eq!(classify_stroke(&click, &p), Some(Gesture::Press));
+        let left = stroke(PointerKind::Touch, &[(0, 300.0, 200.0), (80, 220.0, 205.0), (160, 120.0, 210.0)]);
+        assert_eq!(classify_stroke(&left, &p), Some(Gesture::SwipeLeft));
+        let up = stroke(PointerKind::Pen, &[(0, 200.0, 400.0), (200, 210.0, 300.0)]);
+        assert_eq!(classify_stroke(&up, &p), Some(Gesture::SwipeUp));
+        let right = stroke(PointerKind::Touch, &[(0, 0.0, 0.0), (100, 80.0, 10.0)]);
+        assert_eq!(classify_stroke(&right, &p), Some(Gesture::SwipeRight));
+        let down = stroke(PointerKind::Touch, &[(0, 0.0, 0.0), (100, 5.0, 90.0)]);
+        assert_eq!(classify_stroke(&down, &p), Some(Gesture::SwipeDown));
+    }
+
+    #[test]
+    fn drags_long_presses_and_slow_moves_are_not_gestures() {
+        let p = GestureParams::default();
+        assert_eq!(classify_stroke(&stroke(PointerKind::Mouse, &[(0, 0.0, 0.0), (100, 200.0, 0.0)]), &p), None, "마우스로 끌기");
+        assert_eq!(classify_stroke(&stroke(PointerKind::Touch, &[(0, 0.0, 0.0), (900, 2.0, 1.0)]), &p), None, "길게 누름");
+        assert_eq!(classify_stroke(&stroke(PointerKind::Touch, &[(0, 0.0, 0.0), (1200, 300.0, 0.0)]), &p), None, "느린 끌기");
+        assert_eq!(classify_stroke(&stroke(PointerKind::Touch, &[(0, 0.0, 0.0), (100, 30.0, 0.0)]), &p), None, "짧은 밀기");
+        assert_eq!(classify_stroke(&stroke(PointerKind::Touch, &[]), &p), None);
+    }
+
+    #[test]
+    fn scrolls_are_grouped_and_reversals_counted() {
+        let p = GestureParams::default();
+        let s = |t_ms: i64, dx: f32, dy: f32| ScrollSample { t_ms, dx, dy };
+        let samples = [
+            // 아래로 240 px (한 묶음)
+            s(0, 0.0, 80.0),
+            s(50, 0.0, 80.0),
+            s(100, 0.0, 80.0),
+            // 쉰 뒤 위로 150 px: 앞 묶음과 반대 → 뒤집음 1
+            s(800, 0.0, -100.0),
+            s(850, 0.0, -50.0),
+            // 쉰 뒤 위아래로 헤맴: 묶음 안에서 3번 뒤집고, 순이동이 작아 방향 없음
+            s(2000, 0.0, 30.0),
+            s(2050, 0.0, -30.0),
+            s(2100, 0.0, 30.0),
+            s(2150, 0.0, -20.0),
+            // 쉰 뒤 옆으로 120 px
+            s(3000, 60.0, 5.0),
+            s(3050, 60.0, 0.0),
+        ];
+        let bursts = scroll_bursts(&samples, &p);
+        let summary: Vec<(Option<Gesture>, u32)> = bursts.iter().map(|b| (b.gesture, b.reversals)).collect();
+        assert_eq!(
+            summary,
+            vec![(Some(Gesture::ScrollDown), 0), (Some(Gesture::ScrollUp), 1), (None, 3), (Some(Gesture::ScrollRight), 0)]
+        );
+        assert_eq!((bursts[0].start_ms, bursts[0].end_ms), (0, 100));
+        assert_eq!(scroll_bursts(&[], &p), vec![]);
+    }
+
+    #[test]
+    fn rage_needs_three_presses_close_in_time_and_space() {
+        let p = GestureParams::default();
+        assert!(rage_presses(&[(0, 10.0, 10.0), (200, 12.0, 11.0), (450, 9.0, 14.0)], &p));
+        assert!(!rage_presses(&[(0, 10.0, 10.0), (200, 12.0, 11.0), (900, 9.0, 14.0)], &p), "창 밖");
+        assert!(!rage_presses(&[(0, 10.0, 10.0), (200, 120.0, 11.0), (450, 9.0, 14.0)], &p), "다른 곳");
+        assert!(!rage_presses(&[(0, 10.0, 10.0), (200, 12.0, 11.0)], &p));
+    }
+
+    #[test]
+    fn gestures_serialize_as_kebab_case_names() {
+        for g in [Gesture::Press, Gesture::SwipeLeft, Gesture::ScrollDown, Gesture::ScrollRight] {
+            assert_eq!(serde_json::to_value(g).unwrap(), g.name());
+        }
+    }
+}

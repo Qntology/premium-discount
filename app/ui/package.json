@@ -1,0 +1,19 @@
+{
+  "name": "premium-discount-ui",
+  "private": true,
+  "type": "module",
+  "description": "앱 웹뷰 화면 (Tauri 웹뷰, 개발 중에는 dev-server.mjs 브리지)",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs && node dev-server.mjs",
+    "test": "node --experimental-strip-types --test *.test.ts"
+  },
+  "dependencies": {
+    "dexie": "4.0.11",
+    "qrcode-generator": "2.0.4"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.5",
+    "jsqr": "1.4.0"
+  }
+}

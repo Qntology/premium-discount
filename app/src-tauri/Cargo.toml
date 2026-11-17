@@ -1,0 +1,49 @@
+[package]
+name = "premium-discount-desktop"
+version = "0.1.0"
+description = "premium.discount 데스크톱 앱 (Tauri 창)"
+edition = "2021"
+
+# 앱 코어(premium-discount-app, 상위 폴더)와 화면(../ui/dist)을 묶는 창이다. 코어는 GUI 의존성이 없도록 따로 둔다.
+# Android·iOS 빌드는 앱을 라이브러리로 만든다 (tauri mobile_entry_point). 데스크톱은 main.rs가 이 라이브러리의 run()을 부른다.
+# 이름은 바이너리와 겹치지 않게 따로 둔다.
+[lib]
+name = "premium_discount_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+# 앱 코어의 GPU 백엔드를 그대로 넘긴다 (app/Cargo.toml)
+cuda = ["premium-discount-app/cuda"]
+rocm = ["premium-discount-app/rocm"]
+vulkan = ["premium-discount-app/vulkan"]
+metal = ["premium-discount-app/metal"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+premium-discount-app = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tokio = { version = "1", features = ["sync"] }
+
+# 디버그 정보는 끈다. 모바일 빌드(staticlib·cdylib)는 의존성 전부를 한 파일로 묶는데, 디버그 정보가 있으면 파일 하나가 수 GB가 된다.
+# 상위 앱 크레이트(app/Cargo.toml)와 같은 값이어야 빌드 결과를 나눠 쓴다.
+[profile.dev]
+debug = 0
+
+# aarch64(Android)에서는 최적화가 없는 빌드가 gemm-f16을 컴파일하지 못한다: fp16 어셈블리 헬퍼(#[inline])가
+# fp16 기능이 없는 함수로 따로 만들어져 "instruction requires: fullfp16" 오류가 난다. 두 크레이트만 최적화해 인라인되게 한다.
+# (행렬 곱 속도에도 도움이 된다. 두 매니페스트에 같은 값을 둔다)
+[profile.dev.package.gemm-common]
+opt-level = 3
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
+# 앱 코어와 같은 candle 포크 커밋 (app/Cargo.toml의 [patch.crates-io]와 같은 값이어야 한다)
+[patch.crates-io]
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
