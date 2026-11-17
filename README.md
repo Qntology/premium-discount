@@ -1317,3 +1317,79 @@ GUI 앱 자체(`tauri dev` · `tauri build`)는 돌려 보지 않았습니다. �
 | `cd app && cargo test --release --lib` | 237 통과, 2 무시 (사전 필터 시험 8개는 `premium-discount-filter` 로 옮겨 감) |
 | `app/ui` `npm test` | 70 통과 |
 | src-tauri `cargo check` + `TAURI_CONFIG` 로 사이드카 지정 | 통과. tauri-build 가 `binaries/<이름>-x86_64-pc-windows-msvc.exe` 를 삼중항 없는 이름으로 실행 파일 옆에 복사함을 확인. 설치 파일(`tauri build`)은 만들지 않았습니다 |
+
+## 23. 범용 엔진 통합 · 런타임 판 맞추기 (2026-11-17)
+
+raon-zena 의 범용 엔진을 `crates/` 로 옮기고, Relay · 창 계산 crate 를 새로 만들고, 두 저장소의 런타임 판을 맞췄습니다.
+- crate 목록과 도메인 경계(이 저장소 = 장소 · 대상 · 화면 영역의 열린 집합, raon-zena = 제나 표현 사전의 닫힌 집합)는 [`crates/README.md`](crates/README.md) 에 있습니다.
+- raon-zena 쪽 기록은 그 저장소의 `docs/MASTER_PLAN_ENGINE_UNIFICATION_AND_VERSION_SYNC.md` 입니다.
+
+| crate | 출처 | 한 일 |
+| --- | --- | --- |
+| `onnxruntime-sys` · `onnxruntime` | raon-zena (onnxruntime-rs 0.0.14 벤더 판) | 실행 시 라이브러리 찾는 곳에 `%LOCALAPPDATA%\premium.discount\models\onnxruntime` 을 더함. 오래된 시험 대상 오류 두 가지(`test_env_log` 가져오기, bindgen 배치 시험 261개의 null 역참조)와 libc 기호 경고 25개(`memcpy` 등 다시 선언)를 없앰 |
+| `premium-discount-nlp` | raon-zena `zena-nlp` | 기능 `granite`(candle) · `stanza`(ONNX). 모델은 `PD_*` → `RAON_*` → `premium.discount` · `RaonZena` · `logis-center` 의 `models` 순서로 찾음 |
+| `premium-discount-nms` | raon-zena `nlp-nms-router` 의 중립 부분 | `DomainBank<M, E>`(항목 내용 `M` 은 부르는 쪽 타입, `DomainSpec` 으로 만듦), 호출어는 `set_wake_words` 로 정함(기본 없음) |
+| `premium-discount-sds` | raon-zena `zena-sds` 전체 | `Moments` 와 합침. 장부 recipe 그대로 |
+| `premium-discount-sensor` | raon-zena `zena-sensor` + `zena-core::geometry` | 화면 종류 `VisionKind` 도 여기로(사전 · 앵커 은행이 같은 값) |
+| `premium-discount-vision` | raon-zena `raon-vision` | 사전(`zena-lexicon`) 의존을 뺌: `AnchorBank::from_specs`(`VisionDomainSpec`), `compute_anchors(… forms: Fn …)`. 예제는 CPU |
+| `premium-discount-quant` | raon-zena `raon-quant` 의 범용 부분 | 새 `trim`: logis-center 의 어휘 잘라 내기 규칙(아래) |
+| `premium-discount-relay` | 새로 만듦 (raon-zena `relative-value-sds.md` 3.4 · 4.1절) | Relay Key 뽑기 · 다국어 키 묶기 · 문장 맞추기 · 바뀐 주장 → 대체(`Supersedes`) · 중복 · 의미 연결 |
+| `premium-discount-window` | 새로 만듦 (`app/ui/stage.ts` + raon-zena `zena-core::window`) | 3단계 크기 · 자리 · 누르기와 끌기 · 스타일 비트 · 알파 · 프레임 간격 · 제자리 돌아가기, 점 아래 창 · 앞 창 찾기(Win32). `stage.ts` 와 같은 시험 벡터(`tests/stage_cases.json`)를 Rust · TS 가 함께 읽음 |
+
+**런타임 판 맞추기**
+
+| | 전 (app/) | 전 (raon-zena) | 후 (둘 다) |
+| --- | --- | --- | --- |
+| lancedb · lance | 0.31 · 8.0.0 | 0.41 · 14.0.2 | 0.41 · 14.0.2 |
+| tokenizers | 0.21.4 + 0.22.2(포크 경유) | 0.22.2 | 0.22.2 하나 (`default-features = false`, `onig`) |
+| candle 포크 | `rev = ebaf93d` | `branch = master` (잠금은 ebaf93d) | `rev = ebaf93d` (raon-infer 의 `candle-rocm` 포함), crates/ 도 같은 rev |
+| datafusion | 53.1 | 54.1 | 54.1 |
+
+앱 코드는 한 줄도 바뀌지 않았습니다. lancedb 0.41 은 앱이 부르는 API 서명이 0.31 과 같습니다. 바뀐 것은 내부입니다(lance 14 의 새 데이터는 파일 형식 V2_2).
+
+**어휘 잘라 내기 규칙 (`premium-discount-quant::trim`)**
+- logis-center `models/common/vocab_trim.rs`(PR #84)의 규칙을 이 crate 에서 다시 썼습니다.
+  - 남김: 공통 코어 · 문서 언어의 문자 체계 전부 · ASCII 전부 · 도메인 글 · 섞인 한자 상위 4,096, 64의 배수.
+  - 행 수 예산을 두는 규칙은 두지 않습니다.
+- raon-quant 의 `ColdGuard` 와 합쳤습니다: `trim::slice` → `VocabSlice{kept, cold}`. 규칙이 무엇을 놓쳐도 탐욕 디코딩은 전체 어휘와 같습니다.
+- 실제 Qwen3.5 어휘(248,320)에서 남는 행 수:
+
+  | 언어 | 남는 행 |
+  | --- | --- |
+  | en | 131,328 |
+  | ko + en | 138,112 |
+  | ja + en | 190,272 |
+  | 12개 언어 | 220,160 |
+
+  앱의 초안 모델(`qwen35.rs`)은 지금 16,384행 고정 예산을 쓰고 영어가 15 ~ 17번째 토큰부터 달라집니다(17-4절).
+- 이 앱에 그 모델(Qwen3.5-0.8B safetensors)이 이 PC 에 없어, 초안 경로는 바꾸지 않았습니다. 두 가지를 실측한 뒤 정할 일입니다.
+  - 새 규칙(영어 전부): 속도 이득이 줄어듭니다.
+  - 작은 예산 + ColdGuard: 결과는 같고, 속도는 잘린 행 묶음을 다시 계산하는 횟수에 달립니다.
+
+**검증**
+
+| 묶음 | 결과 |
+| --- | --- |
+| `cd crates && cargo test --release --workspace` | 전부 통과. 새 crate: nlp 11 + granite 참조 4 · 벤치 1 · Stanza ko 1 · 런타임 5(실제 모델), nms 15(`--features stanza` 도), sds 30 + 장부 파일 6, sensor 12, quant 11, vision 10, relay 4, window 24 + 공유 벡터 5. 경고 없음 |
+| Relay 실제 모델 (`--features neural --test real_models`) | 한국어 패치 노트 "피해가 20% 감소" → "15% 감소" 를 `Supersedes`(문장 맞추기 코사인 0.994, 포함률 1.0)로. 키 묶기: 말레니아 → malenia, 라다곤 → radagon, 다른 이름끼리는 따로 |
+| google SigLIP2 (`premium-discount-vision` 예제 `ve_xcheck`, CPU) | 옮기기 전과 같음: 이미지 코사인 0.999999 ~ 1.000001, 텍스트 0.999999, 토크나이저 6/6 |
+| 창 찾기 (Win32) | 앞 창 · 점 아래 창: `explorer.exe` · `app://explorer.exe` |
+| 앱 `cargo test --release --lib` (lancedb 0.41 · tokenizers 0.22) | 237 통과 |
+| lance 8 ↔ 14 호환 | 옛 실행 파일(lancedb 0.31)이 쓴 보관함을 새 실행 파일이 읽고(행 2 · 벡터 검색 0.901) 이어 쓰며(행 3), 그 뒤 옛 실행 파일도 다시 읽음 |
+| 실제 E2E (`premium-discount-mcp` → 새 앱 → `mock_server.py`) | 통과(14.8초) |
+| src-tauri `cargo check` + 사이드카 | 통과 |
+| 잠금 파일 | `app/` · `app/src-tauri/` · `crates/` · raon-zena 모두 tokenizers 0.22.2 하나, candle `rev=ebaf93d` |
+
+**기획서와 다른 점**
+- "단일 Cargo.lock" 은 저장소가 둘이라 없습니다. 네 잠금 파일이 같은 판을 고르게 맞췄습니다.
+- premium-discount-app 은 여전히 프로세스로 둡니다(Tauri · tokio · 앱 상태). 다만 이제 판 충돌은 링크하지 않는 이유가 아닙니다.
+- raon-zena 에는 기획서의 트리와 달리 얇은 접착 crate 가 남습니다.
+  - `raon-vision`: 사전 → 앵커 은행.
+  - `raon-quant`: Raon 피라미드 계획 · 블록 캐시.
+  - `zena-sds`: 다시 내보내기, 경로 유지.
+- Relay 의 키 묶기는 SDS 띠(평균 + 2σ) 대신 "서로 가장 가까운 짝 + 바닥 0.80 + 차이 0.03" 입니다. 실측 근거:
+  - 같은 이름의 한 · 영 짝: 0.833 · 0.848.
+  - 다른 이름끼리: 0.739 ~ 0.771.
+  - 키 몇 개의 띠는 0.881 이라 아무것도 묶지 못했습니다.
+- Relay 의 포함률 하한(0.5)은 아직 고정값입니다. Relay 는 새로 만들었고 아직 부르는 곳이 없습니다(판정 cron 의 `superseded` 입력에 잇는 것은 다음 일).
+- `premium-discount-window` 의 누르기와 끌기 · 제자리 돌아가기 · 점 아래 창 찾기는 raon-zena 오버레이가 아직 쓰지 않습니다. `zena-core::window` 는 스타일 비트 · 알파 · 프레임 간격만 이 crate 로 계산합니다.

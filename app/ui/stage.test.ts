@@ -130,6 +130,21 @@ test('커지는 쪽이면 먼저 옮기고, 작아지는 쪽이면 먼저 줄인
 	assert.equal(growsTo(1, 1), false)
 })
 
+// Rust crate(premium-discount-window)가 같은 표를 읽는다. stage.ts 를 고치면 표를 다시 만들고(아래 명령) Rust 쪽도 맞춘다:
+//   node --experimental-strip-types crates/premium-discount-window/tests/gen_stage_cases.mjs  (premium-discount 폴더에서)
+test('Rust crate와 같은 표: 창 자리 · 단계 옮기기 · 누르기와 끌기 · 커지는 쪽', () => {
+	const cases = JSON.parse(readFileSync(new URL('../../crates/premium-discount-window/tests/stage_cases.json', import.meta.url), 'utf8'))
+	assert.deepEqual(cases.constants, { stage_size: [STAGE_SIZE[0], STAGE_SIZE[1], STAGE_SIZE[2]], dock_margin: DOCK_MARGIN, drag_threshold: DRAG_THRESHOLD })
+	assert.ok(cases.place_window.length > 0)
+	for (const c of cases.place_window) assert.deepEqual(placeWindow(c.size, c.area, c.scale, c.anchor, c.margin), c.expected, c.name)
+	assert.equal(cases.next_stage.length, 3 * 5 * 2, '단계 3 x 사건 5 x ready 2')
+	for (const c of cases.next_stage) assert.equal(nextStage(c.current, c.event, { ready: c.ready }), c.expected, JSON.stringify(c))
+	assert.ok(cases.classify_pointer.length > 0)
+	for (const c of cases.classify_pointer) assert.equal(classifyPointer(c.dx, c.dy, c.threshold), c.expected, JSON.stringify(c))
+	assert.equal(cases.grows_to.length, 9)
+	for (const c of cases.grows_to) assert.equal(growsTo(c.from, c.to), c.expected, JSON.stringify(c))
+})
+
 const row = (n: number, state = 'stored', cc = 'example.com') => ({ created_at: n * 1000, state, cc, text: `글 ${n}` })
 
 test('미니 피드: 최근 3개, 오래된 것이 위 · 새것이 맨 아래', () => {

@@ -1,9 +1,10 @@
 # premium-discount 가 소유하는 라이브러리 crate. 앱(app/)과 raon-zena 가 path · git 의존으로 가져다 쓴다.
 # 앱은 따로 빌드한다 (자체 Cargo.lock · 모바일 빌드 설정 · LanceDB). 그래서 이 작업 공간은 crates/ 아래만 묶는다.
 #
-# 원칙: 라이브러리는 LanceDB · Tauri · 비동기 런타임(tokio) · 모델 런타임(candle)에 의존하지 않는다. 저장과 무거운 계산은
-# 앱이 맡는다. 네트워크는 premium-discount-mcp 의 블로킹 HTTP(ureq, GET /graph*) 하나뿐이고, 내려받기 검증
-# (premium-discount-manifest)도 HTTP 는 부르는 쪽이 고른다. 이름은 약어(pd-*) 없이 premium-discount-* 로 쓴다.
+# 원칙: 라이브러리는 LanceDB · Tauri · 비동기 런타임(tokio)에 의존하지 않는다. 저장은 앱이 맡는다.
+# 모델 런타임은 AI 엔진 crate(nlp · vision · onnxruntime)에만 있고, 나머지(판정 · 내비게이션 · 계약 · 통계 · 센서 · 양자화 형식)는
+# 모델 없이 돈다. candle 은 raon-zena · premium-discount-app 과 같은 candle-rocm-vulkan 포크 커밋으로 고정한다(아래 [patch]).
+# 네트워크는 premium-discount-mcp 의 블로킹 HTTP(ureq, GET /graph*) 하나뿐이다. 이름은 약어(pd-*) 없이 premium-discount-* 로 쓴다.
 [workspace]
 resolver = "2"
 members = [
@@ -16,6 +17,15 @@ members = [
     "premium-discount-mcp",
     "premium-discount-sds",
     "premium-discount-manifest",
+    "premium-discount-sensor",
+    "premium-discount-nlp",
+    "premium-discount-window",
+    "premium-discount-nms",
+    "premium-discount-quant",
+    "premium-discount-vision",
+    "premium-discount-relay",
+    "onnxruntime-sys",
+    "onnxruntime",
 ]
 
 [workspace.package]
@@ -31,6 +41,13 @@ serde_json = "1"
 sha2 = "0.10"
 unicode-normalization = "0.1"
 ureq = "2"
+half = "2"
+memmap2 = "0.9"
+rayon = "1.10"
+safetensors = "0.8"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 premium-discount-identity = { path = "premium-discount-identity" }
 premium-discount-verdict = { path = "premium-discount-verdict" }
@@ -40,3 +57,23 @@ premium-discount-filter = { path = "premium-discount-filter" }
 premium-discount-mcp-protocol = { path = "premium-discount-mcp-protocol" }
 premium-discount-sds = { path = "premium-discount-sds" }
 premium-discount-manifest = { path = "premium-discount-manifest" }
+premium-discount-sensor = { path = "premium-discount-sensor" }
+premium-discount-nlp = { path = "premium-discount-nlp", default-features = false }
+premium-discount-window = { path = "premium-discount-window" }
+premium-discount-nms = { path = "premium-discount-nms" }
+premium-discount-quant = { path = "premium-discount-quant" }
+premium-discount-vision = { path = "premium-discount-vision" }
+premium-discount-relay = { path = "premium-discount-relay" }
+
+# candle → Qntology/candle-rocm-vulkan 포크 (CUDA · ROCm-HIP · Vulkan · Metal). raon-zena · app/ 과 같은 커밋.
+# [patch] 는 빌드하는 쪽 루트의 것만 적용되므로, 이 crate 들을 링크하는 작업 공간도 같은 줄을 둔다.
+[patch.crates-io]
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.gemm]
+opt-level = 3

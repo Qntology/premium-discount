@@ -1,0 +1,32 @@
+//! # premium-discount-nms
+//!
+//! 자연어 요청 · 화면 후보에서 "여럿 중 무엇 하나"를 고르는 도메인 중립 NMS 코어. raon-zena 의 `nlp-nms-router` 에서
+//! 캐릭터 전용 부분(제나의 사전 · 동작 · 호출어)을 빼고 옮겼다(2026-11-17). 원 설계는 Qntology/logis-center 의 자연어 검색 +
+//! NMS 다(Apache-2.0, `NOTICE`). raon-zena 의 라우터는 이 위에 `zena_lexicon` 사전과 제나의 동작을 얹는다.
+//!
+//! 1. [`korean`] / [`normalize`] – 호출어 떼기([`normalize::set_wake_words`] 로 정함), 받침 조화를 보는 조사 · 서술격 떼기.
+//! 2. [`analyze`] – 역할 분석([`analyze::Analyzer`]): 규칙 분석기, (기능 `stanza`) Stanza 분석기, 부정 범위 표시.
+//! 3. [`embed`]   – [`embed::TextEmbedder`]: 의존 없는 384차원 글자 · 자모 해시 임베더, (기능 `neural`) granite 임베더.
+//! 4. [`domain`]  – [`domain::DomainBank`]`<M, E>`: 정확 · 교착어 접두 일치 먼저, 그다음 bias / prejudice 최대 코사인.
+//!    항목의 내용 `M` 은 부르는 쪽 타입이다.
+//! 5. [`span`]    – 구간 NMS (v1 그리디, v2 이중 센터링 + 마진 게이트 1:1 배정 + SDS 혼동 장부 동점 깨기).
+//! 6. [`semantic`]– 시간 창 안의 의미 NMS, 적응 중복 하한 `clamp(μ + 3σ, τ, 0.995)`.
+//! 7. [`spatial`] – 공간-글 NMS: 글 유사도 신뢰도, snap / twin IoU 규칙의 상자 억제, 1:1 배타 배정.
+
+pub mod analyze;
+pub mod domain;
+pub mod embed;
+pub mod korean;
+pub mod normalize;
+pub mod semantic;
+pub mod span;
+pub mod spatial;
+
+pub use domain::{DomainBank, DomainEntry, DomainSpec, Hit};
+
+/// granite 모델이 설치된 곳 (시험 · 진단용)
+#[cfg(feature = "neural")]
+#[doc(hidden)]
+pub fn __granite_dir() -> Option<std::path::PathBuf> {
+    premium_discount_nlp::models::granite_dir()
+}

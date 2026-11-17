@@ -30,14 +30,15 @@ safetensors = "0.8"
 half = "2"
 futures = "0.3"
 getrandom = "0.3"
-# 로컬 원본 저장소(local.rs). noto-sandbox와 같은 버전이고, 빌드에 protoc가 필요하다 (링크가 무거워 CARGO_BUILD_JOBS를 낮추는 편이 안전하다)
-lancedb = { version = "0.31.0", default-features = false }
+# 로컬 원본 저장소(local.rs). raon-zena(zena-lexicon)와 같은 0.41 이고, 빌드에 protoc가 필요하다 (링크가 무거워 CARGO_BUILD_JOBS를 낮추는 편이 안전하다)
+lancedb = { version = "0.41", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokenizers = "0.21"
+# raon-zena 와 같은 판 · 기능 (학습용 C++ 확장 esaxx 와 진행 막대 indicatif 는 쓰지 않는다)
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std"] }
 
 [dev-dependencies]

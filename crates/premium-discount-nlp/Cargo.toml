@@ -1,0 +1,49 @@
+[package]
+name = "premium-discount-nlp"
+description = "다국어 텍스트 이해: Stanza(ONNX, 12개 언어) 형태소 · 구문 분석과 granite-embedding-97m-multilingual-r2(384차원 CLS) 임베딩. raon-zena zena-nlp 에서 옮김 (원 출처 Qntology/logis-center)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+once_cell = "1"
+regex = "1"
+whatlang = "0.18"
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+# Stanza 는 ONNX Runtime 위에서 돈다 (onnxruntime-rs 를 옮긴 것, 실행할 때 라이브러리를 불러옴)
+ndarray = { version = "0.15", optional = true }
+onnxruntime = { path = "../onnxruntime", optional = true }
+onnxruntime-sys = { path = "../onnxruntime-sys", optional = true }
+
+[dev-dependencies]
+onnxruntime-sys = { path = "../onnxruntime-sys" }
+
+[features]
+default = ["stanza", "granite"]
+stanza = ["dep:ndarray", "dep:onnxruntime", "dep:onnxruntime-sys"]
+granite = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
+cuda = ["granite", "candle-core/cuda", "candle-nn/cuda"]
+rocm = ["granite", "candle-core/rocm", "candle-nn/rocm"]
+vulkan = ["granite", "candle-core/vulkan", "candle-nn/vulkan"]
+metal = ["granite", "candle-core/metal", "candle-nn/metal"]
+
+[[test]]
+name = "granite_reference"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_bench"
+required-features = ["granite"]
+
+[[test]]
+name = "stanza_ko"
+required-features = ["stanza"]
+
+[[test]]
+name = "stanza_runtime"
+required-features = ["stanza"]

@@ -1,0 +1,21 @@
+[package]
+name = "premium-discount-relay"
+description = "Relay Key(고유명사 · 식별자 · 기호 · 복합 명사 · 따옴표 이름) 뽑기와 다국어 키 묶기, 문장 맞추기(이중 센터링 · 1:1), 바뀐 주장으로 신구 대체(Supersedes) · 중복 · 의미 연결 판정"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+premium-discount-nms.workspace = true
+premium-discount-sds.workspace = true
+# 기능 `stanza`: Stanza 분석 결과를 문장으로 바꾸기 (premium-discount-nlp)
+premium-discount-nlp = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[features]
+default = []
+stanza = ["dep:premium-discount-nlp", "premium-discount-nlp/stanza"]
+# 실제 모델(granite · Stanza)로 하는 시험
+neural = ["stanza", "premium-discount-nms/neural"]
