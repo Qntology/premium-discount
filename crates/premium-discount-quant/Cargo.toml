@@ -1,0 +1,14 @@
+[package]
+name = "premium-discount-quant"
+description = "양자화 형식 · 인코더 · 커널: safetensors mmap 리더, GGUF v3 리더 · 라이터, imatrix, K-quant(Q4_K ~ Q8_0) 인코더, 융합 dequant-dot 커널, 어휘 잘라 내기(언어 규칙 + ColdGuard 정확 arg-max). raon-zena raon-quant 에서 옮김"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,5 +1,5 @@
 // 접근성 내비게이션 타임트라이얼(trial/1)의 서버 보관 규칙. www(받기 · 보여 주기: www/src/navtrials.ts)와 cron(지갑 기록 지우기)이 함께 쓴다.
-// 기기 쪽 같은 규칙은 crates/pd-nav trial.rs 다(MAX_STEPS · MAX_COURSES · tier).
+// 기기 쪽 같은 규칙은 crates/premium-discount-nav trial.rs 다(MAX_STEPS · MAX_COURSES · tier).
 //
 // - 플로우(코스) 하나는 체크포인트 maxSteps 개까지, 계정 · 앱(웹)마다 코스 maxCourses 개까지. 받는 수 제한(10분에 100개)은 없앴다.
 // - 같은 코스를 다시 달리면 내 콜렉션의 내 기록(내가 달린 횟수 · 최고 · 마지막)만 고치고, 새 코스가 넘치면 가장 오래 달리지 않은
@@ -46,7 +46,7 @@ export function walletOldestDay(nowMs: number): number {
 }
 
 // 코스 등급: 결정이 난 런이 3개보다 적으면 unrated, premium 이 2/3 이상이면 premium, discount 가 2/3 이상이면 discount,
-// 그 사이는 neutral. crates/pd-nav trial.rs 의 tier 와 같은 정수 비교다
+// 그 사이는 neutral. crates/premium-discount-nav trial.rs 의 tier 와 같은 정수 비교다
 export function tier(premium: number, discount: number): Tier {
 	const decided = premium + discount
 	if (decided < TRIAL_POLICY.tierMinDecided) return 'unrated'

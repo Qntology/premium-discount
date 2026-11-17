@@ -1,0 +1,12 @@
+[package]
+name = "premium-discount-sds"
+description = "SDS(상대 가치 판정) 통계: 합치고 뺄 수 있는 Welford(Moments · 최근 값 고리), 스코프 백오프 장부(Ledger), 혼동 장부 · 전이 사전확률, 이중 센터링과 적응 배타 배정. logis-center 에서 옮겨 온 raon-zena zena-sds 를 합침"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+

@@ -21,7 +21,7 @@
 
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
@@ -36,37 +36,17 @@ use crate::pipeline::{Evaluator, MergedSearch, SearchOptions, SubmitInput, Submi
 use crate::queue::RejectedItem;
 use crate::session::{SavedSession, SessionStore};
 
-/// 검색 개수 기본값 (인자를 생략했을 때)
-pub const DEFAULT_TOP_K: u32 = 10;
-
-fn default_top_k() -> u32 {
-    DEFAULT_TOP_K
-}
-
-/// UI는 "없음"을 빈 문자열로 들고 있다 (`app/ui/localdb.ts`). 빈 문자열과 공백은 "없음"으로 읽는다.
-fn blank_to_none(v: Option<String>) -> Option<String> {
-    v.filter(|s| !s.trim().is_empty())
-}
+// 명령의 인자 · 결과 · 오류 타입은 공용 crate(`crates/premium-discount-schema` 의 `contract`)에 있다. premium-discount-mcp
+// 와 raon-zena 가 같은 정의를 쓴다. 앱 안의 타입에 기대는 결과(`VerdictsResult`, `AppStatus`)만 여기에 남는다.
+use premium_discount_schema::contract::blank_to_none;
+pub use premium_discount_schema::contract::{
+    AppInfo, CommandError, FlushSummary, LocalMatchDto, LoginStartResult, LoginStatus, RejectedDto, SearchArgs, SearchLocalArgs,
+    SessionArgs, SessionInfo, SubmitArgs, SubmitResult, SyncArgs, VerdictsArgs, VoteArgs, VoteRejectedDto, VoteResult, COMMANDS,
+    DEFAULT_TOP_K, ERROR_KINDS,
+};
 
 // ---- 인자 ----
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SubmitArgs {
-    pub text: String,
-    pub cc: String,
-    #[serde(default)]
-    pub from: Option<String>,
-    #[serde(default)]
-    pub to: Option<String>,
-    /// 콘텐츠 해시 주소 (0x + 40자리)
-    #[serde(default)]
-    pub bcc: Option<String>,
-    #[serde(default, rename = "ref")]
-    pub ref_: Option<String>,
-    /// 부모가 아직 서버에 없을 때 보관함의 로컬 id
-    #[serde(default)]
-    pub local_parent: Option<String>,
-}
 
 impl From<SubmitArgs> for SubmitInput {
     fn from(a: SubmitArgs) -> Self {
@@ -82,99 +62,24 @@ impl From<SubmitArgs> for SubmitInput {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SyncArgs {
-    /// 마지막으로 반영한 updated_at (밀리초). 처음에는 0
-    #[serde(default)]
-    pub since: i64,
-}
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SearchLocalArgs {
-    pub query: String,
-    #[serde(default = "default_top_k")]
-    pub top_k: u32,
-    #[serde(default)]
-    pub cc: Option<String>,
-}
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SearchArgs {
-    pub query: String,
-    #[serde(default = "default_top_k")]
-    pub top_k: u32,
-    #[serde(default)]
-    pub cc: Option<String>,
-    #[serde(default)]
-    pub root: Option<String>,
-    #[serde(default, rename = "ref")]
-    pub ref_: Option<String>,
-    #[serde(default)]
-    pub to: Option<String>,
-    /// 등급 필터: premium | discount | rated (빈 문자열은 없음)
-    #[serde(default)]
-    pub tier: Option<String>,
-}
 
-impl SearchArgs {
-    fn options(&self) -> SearchOptions {
-        SearchOptions {
-            top_k: self.top_k,
-            cc: blank_to_none(self.cc.clone()),
-            root: blank_to_none(self.root.clone()),
-            ref_: blank_to_none(self.ref_.clone()),
-            to: blank_to_none(self.to.clone()),
-            tier: blank_to_none(self.tier.clone()),
-        }
+fn search_options(a: &SearchArgs) -> SearchOptions {
+    SearchOptions {
+        top_k: a.top_k,
+        cc: blank_to_none(a.cc.clone()),
+        root: blank_to_none(a.root.clone()),
+        ref_: blank_to_none(a.ref_.clone()),
+        to: blank_to_none(a.to.clone()),
+        tier: blank_to_none(a.tier.clone()),
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct VoteArgs {
-    /// 평가의 서버 id
-    pub id: String,
-    /// 1 추천 | -1 비추천 | 0 철회
-    pub value: i32,
-    /// vote(기본) | vote_outcome
-    #[serde(default)]
-    pub kind: Option<String>,
-}
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct VerdictsArgs {
-    pub ids: Vec<String>,
-    /// true면 캐시가 새것이어도 서버에 묻는다
-    #[serde(default)]
-    pub refresh: bool,
-}
 
 // ---- 결과 ----
 
-/// 저장 결과. `status`로 구분한다.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum SubmitResult {
-    /// 로컬 필터에서 욕설로 판정되었다. 임베딩도 로컬 저장도 전송도 하지 않았다
-    Blocked,
-    /// 서버에 저장이 끝났다
-    Saved {
-        id: String,
-        root: String,
-        #[serde(rename = "ref")]
-        ref_: Option<String>,
-        from: String,
-    },
-    /// 서버가 접수했고 욕설 검사와 저장이 진행 중이다. 최종 결과는 `cmd_flush_outbox`가 확인한다
-    Accepted {
-        id: String,
-        root: String,
-        #[serde(rename = "ref")]
-        ref_: Option<String>,
-        from: String,
-    },
-    /// 연결이 없거나 앞선 항목을 기다린다. 로컬에는 저장되어 있고 나중에 전송된다
-    Queued { local_id: String },
-}
 
 impl From<SubmitOutcome> for SubmitResult {
     fn from(o: SubmitOutcome) -> Self {
@@ -187,17 +92,6 @@ impl From<SubmitOutcome> for SubmitResult {
     }
 }
 
-/// 내 글 검색 결과 한 건 (원문 포함)
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LocalMatchDto {
-    pub request_id: String,
-    pub local_id: String,
-    pub id: Option<String>,
-    pub cc: String,
-    pub state: String,
-    pub text: String,
-    pub score: f32,
-}
 
 impl From<LocalMatch> for LocalMatchDto {
     fn from(m: LocalMatch) -> Self {
@@ -213,11 +107,6 @@ impl From<LocalMatch> for LocalMatchDto {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct RejectedDto {
-    pub local_id: String,
-    pub reason: String,
-}
 
 impl From<RejectedItem> for RejectedDto {
     fn from(r: RejectedItem) -> Self {
@@ -225,15 +114,6 @@ impl From<RejectedItem> for RejectedDto {
     }
 }
 
-/// 투표 결과. `status`로 구분한다 (서버가 거부하면 rejected 오류)
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum VoteResult {
-    /// 서버가 받았다. counted가 false면 판정에 들어가지 않는 표다 (로그인 확인이 안 됐거나 내 글)
-    Sent { request_id: String, counted: bool },
-    /// 연결이 없어 보관함에 남았다. 다음 `cmd_flush_outbox`가 보낸다
-    Queued { request_id: String },
-}
 
 /// `cmd_verdicts` 결과
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -246,58 +126,13 @@ pub struct VerdictsResult {
     pub remote_error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct VoteRejectedDto {
-    pub request_id: String,
-    pub eval_id: String,
-    pub reason: String,
-}
 
-/// `cmd_flush_outbox` 결과: 전송 결과와 상태 확인 결과
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
-pub struct FlushSummary {
-    /// 이번에 서버로 보낸 항목 수
-    pub sent: usize,
-    /// 서버가 영구적으로 거부해서 버린 항목
-    pub rejected: Vec<RejectedDto>,
-    /// 아직 못 보낸 항목 수
-    pub remaining: usize,
-    /// 연결이나 서버 일시 오류로 전송이 멈춘 이유
-    pub stopped: Option<String>,
-    /// 이번에 저장 완료로 확인된 항목 수
-    pub stored: usize,
-    /// 확인 결과 서버가 욕설 등으로 거부했거나 실패로 끝낸 항목
-    pub sync_rejected: Vec<RejectedDto>,
-    /// 서버가 기록을 지워서 결과를 알 수 없는 항목 수
-    pub missing: usize,
-    /// 아직 결과를 기다리는 항목 수
-    pub still_pending: usize,
-    /// 상태 확인이 멈춘 이유
-    pub sync_stopped: Option<String>,
-    /// 로컬 저장소 기록에 실패한 이유
-    pub persist_error: Option<String>,
-    /// 이번에 보낸 투표 수
-    pub votes_sent: usize,
-    /// 아직 못 보낸 투표 수
-    pub votes_remaining: usize,
-    /// 서버가 거부했거나 재시도 한도를 넘긴 투표
-    pub votes_rejected: Vec<VoteRejectedDto>,
-    /// 투표 전송이 멈춘 이유
-    pub votes_stopped: Option<String>,
-}
 
 // ---- 로그인 ----
 
 /// QR 로그인을 기다리는 시간 (이 시간이 지나면 새로 시작해야 한다)
 pub const LOGIN_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// 앱이 쓰는 경로와 서버 (화면의 안내문에 보여 준다)
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct AppInfo {
-    pub model_dir: String,
-    pub data_dir: String,
-    pub server_url: String,
-}
 
 /// 앱이 실행 중인 플랫폼 종류. 화면이 로그인 방식(QR 또는 메일 링크)을 고르는 데 쓴다.
 /// 같은 기기의 메일 앱으로 바로 갈 수 있는 모바일(android, ios)과 그 밖(desktop)을 구분한다.
@@ -431,42 +266,9 @@ where
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct SessionArgs {
-    /// true면 서버에 물어 로그인이 아직 유효한지 확인한다. 서버가 아니라고 하면 로그아웃한다 (연결이 없으면 그대로 둔다)
-    #[serde(default)]
-    pub verify: bool,
-}
 
-/// 지금 로그인 상태
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct SessionInfo {
-    /// anonymous | signed_in
-    pub state: &'static str,
-    pub address: Option<String>,
-    /// 알려 줄 일이 있을 때의 문구 (예: 저장된 로그인 정보를 읽지 못함, 로그인이 만료됨)
-    pub warning: Option<String>,
-}
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LoginStartResult {
-    /// 메일을 보낼 주소 (QR을 못 쓰는 환경에서 직접 보낸다)
-    pub address: String,
-    /// QR에 넣을 mailto: 링크
-    pub mailto: String,
-    pub expires_in_sec: u64,
-}
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LoginStatus {
-    /// none(시작한 로그인 없음) | pending(메일 대기) | signed_in | expired(시간이 지났거나 서버가 세션을 모른다)
-    pub state: &'static str,
-    pub address: Option<String>,
-    /// pending일 때 남은 시간
-    pub remaining_sec: Option<u64>,
-    /// 로그인은 되었지만 이 기기에 저장하지 못한 경우 등
-    pub warning: Option<String>,
-}
 
 struct PendingLogin {
     session: Session,
@@ -479,18 +281,6 @@ struct Account {
     warning: Option<String>,
 }
 
-/// UI로 돌려주는 오류. `kind`로 분기하고 `message`는 사람이 읽는 설명이다.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct CommandError {
-    pub kind: &'static str,
-    pub message: String,
-}
-
-impl CommandError {
-    pub fn new(kind: &'static str, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
-    }
-}
 
 impl From<AppError> for CommandError {
     fn from(e: AppError) -> Self {
@@ -592,7 +382,7 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
     }
 
     pub async fn cmd_search_remote(&self, args: SearchArgs) -> Result<SearchResponse, CommandError> {
-        let mut found = self.evaluator.search(&args.query, args.options()).await?;
+        let mut found = self.evaluator.search(&args.query, search_options(&args)).await?;
         let ids: Vec<String> = found.matches.iter().map(|m| m.id.clone()).collect();
         let mine = self.outbox.read().await.votes().my_votes(&ids).await?;
         for m in &mut found.matches {
@@ -603,7 +393,7 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
 
     pub async fn cmd_search_merged(&self, args: SearchArgs) -> Result<MergedSearch, CommandError> {
         let outbox = self.outbox.read().await;
-        let mut found = self.evaluator.search_merged(&args.query, args.options(), &outbox).await?;
+        let mut found = self.evaluator.search_merged(&args.query, search_options(&args), &outbox).await?;
         let ids: Vec<String> = found.matches.iter().filter_map(|m| m.id.clone()).collect();
         let mine = outbox.votes().my_votes(&ids).await?;
         for m in &mut found.matches {

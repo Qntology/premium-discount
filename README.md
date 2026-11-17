@@ -1149,9 +1149,9 @@ VCToolsInstallDir='C:\Program Files\Microsoft Visual Studio\2022\Community\VC\To
 
 | crate | 내용 |
 | --- | --- |
-| `pd-verdict` | PD-Verdict 의 Rust 구현. raon-zena `crates/zena-verdict` 의 판정 함수를 옮겨 왔습니다(캐릭터 말투 · 대화 피드백 모듈은 raon-zena 에 남습니다). `Params::v1()` · `Params::v2()` · `Params::for_recipe()` |
-| `pd-nav` | 접근성 내비게이션 코어. 후보 영역 합치기(`merge`: IoU 0.4, 트리 > 비전 > 이벤트, 이벤트는 바뀜 표시), 번호 매기기(`number`: premium 이 앞 · discount 가 뒤, 종류, 읽는 순서, 1 ~ 9), 이름 · 위치 단서의 개인정보 거르기(`scrub_name` · `scrub_anchor`), 영역 지도(`NavMap`, `navmap/1`), 행동 기록 → SDS 결정 → 결정 기록(아래) |
-| `pd-identity` | 인증의 지갑 갈래(익명 계정): 시드 구문 만들기 · 되살리기(BIP-39 영어 12단어, 경로 m/44'/60'/0'/0/0 — ethers 와 같음), `hashId`, EIP-191 서명 · 주소 복원, 요청 서명(`Wallet::sign_request` → 헤더 `x-pd-address` · `x-pd-time` · `x-pd-signature`). BIP-39 · BIP-32 는 직접 구현했고(`bip32` crate 는 24단어만 받음), 시드 구문 · 개인 키는 지울 때 0 으로 덮습니다 |
+| `premium-discount-verdict` | PD-Verdict 의 Rust 구현. raon-zena `crates/zena-verdict` 의 판정 함수를 옮겨 왔습니다(캐릭터 말투 · 대화 피드백 모듈은 raon-zena 에 남습니다). `Params::v1()` · `Params::v2()` · `Params::for_recipe()` |
+| `premium-discount-nav` | 접근성 내비게이션 코어. 후보 영역 합치기(`merge`: IoU 0.4, 트리 > 비전 > 이벤트, 이벤트는 바뀜 표시), 번호 매기기(`number`: premium 이 앞 · discount 가 뒤, 종류, 읽는 순서, 1 ~ 9), 이름 · 위치 단서의 개인정보 거르기(`scrub_name` · `scrub_anchor`), 영역 지도(`NavMap`, `navmap/1`), 행동 기록 → SDS 결정 → 결정 기록(아래) |
+| `premium-discount-identity` | 인증의 지갑 갈래(익명 계정): 시드 구문 만들기 · 되살리기(BIP-39 영어 12단어, 경로 m/44'/60'/0'/0/0 — ethers 와 같음), `hashId`, EIP-191 서명 · 주소 복원, 요청 서명(`Wallet::sign_request` → 헤더 `x-pd-address` · `x-pd-time` · `x-pd-signature`). BIP-39 · BIP-32 는 직접 구현했고(`bip32` crate 는 24단어만 받음), 시드 구문 · 개인 키는 지울 때 0 으로 덮습니다 |
 
 **인증은 두 갈래입니다.** 클라우드 세션(익명 아님)은 지금의 QR 메일 로그인(OAuth3 hash · token)입니다. 지갑(익명)은 사용자가 시드 구문을 보관하는 ethers 지갑이고, 요청마다 EIP-191 서명을 붙입니다. 서버는 `www/src/auth.ts` 의 `verifyWalletRequest` 로 확인합니다(시각 5분 안, 서명에서 되살린 주소가 헤더의 주소와 같을 것). 서명 글의 형식과 기준값은 `contracts/gen_wallet_v1.mjs` → `wallet_v1.json` 이고(ethers 6.17 로 뽑음), Rust 와 서버가 같은 계약을 시험합니다. 타임트라이얼 경로(19-3)가 두 갈래를 모두 받습니다.
 
@@ -1165,7 +1165,7 @@ VCToolsInstallDir='C:\Program Files\Microsoft Visual Studio\2022\Community\VC\To
 
 ### 19-3. 타임트라이얼: `/nav/trials` (2026-11-17)
 
-사용자의 플로우를 레이싱 게임의 타임트라이얼처럼 기록합니다. 기기 쪽은 `crates/pd-nav` 의 `trial` 모듈이고, 서버는 `www/src/navtrials.ts`, 보관 규칙(`TRIAL_POLICY`)은 `cron/src/navtrials.ts`, 표는 `www/migrations/0007_nav_trials.sql` 입니다.
+사용자의 플로우를 레이싱 게임의 타임트라이얼처럼 기록합니다. 기기 쪽은 `crates/premium-discount-nav` 의 `trial` 모듈이고, 서버는 `www/src/navtrials.ts`, 보관 규칙(`TRIAL_POLICY`)은 `cron/src/navtrials.ts`, 표는 `www/migrations/0007_nav_trials.sql` 입니다.
 
 | 레이싱 | 접근성 내비게이션 |
 | --- | --- |
@@ -1206,7 +1206,7 @@ VCToolsInstallDir='C:\Program Files\Microsoft Visual Studio\2022\Community\VC\To
 | 앱 ROCm 빌드 | `cargo test --release --lib --features rocm --no-run` (`VCToolsInstallDir` = 14.44) | 컴파일 성공(2분 42초) |
 | GPU 대조 (ROCm, RX 6600) | 위에서 만든 시험 실행 파일에 `utils::tests::gpu_backend_runs_and_matches_cpu --exact` (PATH 에 HIP SDK `bin`) | 통과: 장치 `Rocm { gpu_id: 0 }`, 0.93초. 프로세스는 정상 종료했고, 남은 프로세스 · VRAM 점유는 없었습니다 |
 | 데스크톱 창 (Tauri) | `cd app/src-tauri && cargo build --release` | 빌드 성공(34분, lance 묶음까지 다시 컴파일). 실행은 하지 않음 |
-| crates | `cd crates && cargo test` | 60개 통과: `pd-verdict` 5개(v1 사례 19개 · v2 사례 25개), `pd-nav` 46개(`hashId` 는 ethers 기준값 4개와 같음, 행동 기록 → 결정 기록 → 서버 판정 한 줄 시험, 개인정보 화면 시험, 타임트라이얼 11개: 앱 · 코스 해시가 ethers 와 같음, 구간 시간 반올림 · 결승 날짜, 끝 쪽 10개, 코스 10개 덮어쓰기, 고스트 안내, 고스트 따라가기 판정, 웹 코스(페이지 · 요소 · 제스처, ethers 기준값)), 웹 링크 · 셀렉터 5개(해시 라우팅, 같은 틀의 링크는 같은 페이지, 셀렉터에서 해시 class · 상태 class · 글자 빠짐, 깊이 5), 제스처 5개(탭 · 클릭 · 스와이프 4방향, 드래그 · 길게 누름 제외, 스크롤 묶음 · 뒤집기, rage), `pd-identity` 9개(시드 구문 → 개인 키 · 주소, 서명이 ethers 와 바이트까지 같음, 단어표는 공식 english.txt 의 SHA-256 과 같음) |
+| crates | `cd crates && cargo test` | 60개 통과: `premium-discount-verdict` 5개(v1 사례 19개 · v2 사례 25개), `premium-discount-nav` 46개(`hashId` 는 ethers 기준값 4개와 같음, 행동 기록 → 결정 기록 → 서버 판정 한 줄 시험, 개인정보 화면 시험, 타임트라이얼 11개: 앱 · 코스 해시가 ethers 와 같음, 구간 시간 반올림 · 결승 날짜, 끝 쪽 10개, 코스 10개 덮어쓰기, 고스트 안내, 고스트 따라가기 판정, 웹 코스(페이지 · 요소 · 제스처, ethers 기준값)), 웹 링크 · 셀렉터 5개(해시 라우팅, 같은 틀의 링크는 같은 페이지, 셀렉터에서 해시 class · 상태 class · 글자 빠짐, 깊이 5), 제스처 5개(탭 · 클릭 · 스와이프 4방향, 드래그 · 길게 누름 제외, 스크롤 묶음 · 뒤집기, rage), `premium-discount-identity` 9개(시드 구문 → 개인 키 · 주소, 서명이 ethers 와 바이트까지 같음, 단어표는 공식 english.txt 의 SHA-256 과 같음) |
 | cron | `node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test cron/test/*.test.ts` | 41개 통과(v2 계약 2개 포함) |
 | www | `node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts` | 78개 통과. 지갑 서명 확인 4개(계약의 요청, 본문 · 경로 · 주소 · 형식 · 시각 위조, 새 ethers 지갑)와 타임트라이얼 16개(체크포인트 id · 코스 id 체인이 Rust 와 같음, 같은 길은 한 번만 등록 · 갈라진 길은 이전 코스 id 에 이어 새 코스, 사용자마다 같은 코스는 한 번만 등록(다시 달림 · 밀려난 뒤 · 지운 뒤), 코스 id 가 없으면 새 코스(created), 런마다 셈, 웹 페이지 · 요소 · 제스처 코스, 제스처까지 보는 따라가기 판정, 고스트 따라가기 판정 표 · 따라감 premium · 비켜 감 discount · 판정하지 않는 경우, 등급 표, 다시 달리기 · 새 코스 생성, 코스 10개 덮어쓰기, 받는 수 제한 없음(150개), 체크포인트 10개 · 형식, 공개 하한 11 · 고스트, 지갑 30일 · cron, 계정 키, 지우기, 인증). 한도를 일부러 늦추면(코스 11 · 체크포인트 11 · 공개 10 · 매번 셈 · 결승 비교 없음 · 세지 않은 런도 판정) 1 ~ 3개씩 실패합니다 |
 
@@ -1259,7 +1259,7 @@ VCToolsInstallDir='C:\Program Files\Microsoft Visual Studio\2022\Community\VC\To
 ### 20-4. 알아 둘 것
 
 - **피드 명령은 없습니다.** 미니 피드와 알약은 서랍의 "내 평가" 와 같은 행(Rust → Dexie 캐시, 최신순 50개)을 씁니다. 남의 새 평가가 흘러오는 피드가 아닙니다.
-- **지갑 명령은 없습니다.** 지갑 칸은 로그인 세션의 계정 주소만 보여 주고 "지갑(시드 구문) 명령은 아직 앱에 없습니다" 라고 적습니다. 시드 지갑 서명은 `crates/pd-identity` 에만 있고 앱 명령으로 이어 붙이지 않았습니다.
+- **지갑 명령은 없습니다.** 지갑 칸은 로그인 세션의 계정 주소만 보여 주고 "지갑(시드 구문) 명령은 아직 앱에 없습니다" 라고 적습니다. 시드 지갑 서명은 `crates/premium-discount-identity` 에만 있고 앱 명령으로 이어 붙이지 않았습니다.
 - **빠른 입력**은 평가 쓰기와 같은 `cmd_submit_evaluation` 을 현재 도메인(평가 쓰기의 도메인 칸, 마지막에 쓴 값을 기억)으로 부릅니다. 도메인이 비어 있으면 보내지 않고 서랍의 평가 쓰기를 펼쳐 도메인 칸으로 보냅니다. 답글은 서랍에서만 답니다.
 - **[현재 도메인만]** 칩은 예전의 "입력한 도메인에서만 찾기" 체크와 같은 칸(`#onlyCc`)입니다. 이제 검색뿐 아니라 내 평가 목록과 검색 결과도 그 도메인으로 거릅니다. 다른 칩은 화면에서 거르기만 합니다(검색을 다시 하지 않습니다).
 - **시작 안내**(모델 없음 · 설정 오류)는 2단계 크기로 바로 보여 줍니다. 접으면 알약이 "설정 필요" 를 보여 주고, 누르면 1단계를 건너뛰고 시작 안내로 돌아옵니다. 모델 내려받기 화면은 그대로입니다.
@@ -1282,7 +1282,114 @@ GUI 앱 자체(`tauri dev` · `tauri build`)는 돌려 보지 않았습니다. �
 
 마스터 기획서(5대 과업) 중 이 저장소 밖에서 한 일과, 이 저장소 기준으로 확인한 것입니다. raon-zena 쪽 기록은 그 저장소의 `docs/MASTER_PLAN_5.md` 입니다.
 
-- **`crates/` 를 raon-zena 가 링크합니다.** raon-zena 작업 공간이 `pd-verdict` · `pd-identity` · `pd-nav` 를 이 저장소의 git 리비전 `540311b` 로 고정해 씁니다. `zena-verdict` 는 판정 수식 사본을 지우고 `pd_verdict` 를 다시 내보내며, `premium-discount-mcp` 의 `hashId` 는 `pd_identity::hash_id` 를 부릅니다. `pd-nav` 는 MCP 도구 `pd_nav_number`(합치기 · 1 ~ 9 번호 · 개인정보 화면)로 연결했습니다. 따라서 이 크레이트들의 공개 API(`Params` · `verdict` · `hash_id` · `merge` · `number` · `Region` 등)를 바꾸면, raon-zena 가 리비전을 올릴 때 함께 고쳐야 합니다.
+- **`crates/` 를 raon-zena 가 링크합니다.** raon-zena 작업 공간이 `premium-discount-verdict` · `premium-discount-identity` · `premium-discount-nav` 를 이 저장소의 git 리비전 `540311b` 로 고정해 씁니다. `zena-verdict` 는 판정 수식 사본을 지우고 `premium_discount_verdict` 를 다시 내보내며, `premium-discount-mcp` 의 `hashId` 는 `premium_discount_identity::hash_id` 를 부릅니다. `premium-discount-nav` 는 MCP 도구 `pd_nav_number`(합치기 · 1 ~ 9 번호 · 개인정보 화면)로 연결했습니다. 따라서 이 크레이트들의 공개 API(`Params` · `verdict` · `hash_id` · `merge` · `number` · `Region` 등)를 바꾸면, raon-zena 가 리비전을 올릴 때 함께 고쳐야 합니다.
 - **데스크톱 설치본에서 코어 찾기.** raon-zena 의 `premium-discount-mcp` 는 `premium-discount-app`(헤드리스 코어, `serve_lines`)을 `%LOCALAPPDATA%\premium.discount\` · `%ProgramFiles%\premium.discount\` 에서도 찾습니다. 지금의 Tauri 번들은 창 실행 파일만 넣으므로, 이 단계가 동작하려면 코어를 `bundle.externalBin` 사이드카로 함께 넣어야 합니다(아직 하지 않음: 빌드 전에 코어를 대상 삼중항 이름으로 만들어 두는 단계가 필요합니다).
-- **embeddinggemma-2 와 granite 의 역할.** 새 코드는 없습니다. 기획서 4절의 표(Q8_0 520.1 → 138.1 MB · 코사인 0.999906, 임베딩 표 mmap, 타워 지연 상주 · 교차 스왑, 비전 층 0 · 오디오 층 8 F32)는 16 ~ 17절에 이미 구현 · 실측되어 있습니다. 숫자 하나만 다릅니다. "짧은 문장 단건 120 ~ 160 ms" 는 F32 기준(약 0.15초)이고, Q8_0 Dequant 경로는 약 0.28초입니다(16-5). granite(`granite-97m-r2-cls-v1`)는 raon-zena 의 실시간 라우팅과 `pd-nav` 라벨 공간에서만 씁니다.
+- **embeddinggemma-2 와 granite 의 역할.** 새 코드는 없습니다. 기획서 4절의 표(Q8_0 520.1 → 138.1 MB · 코사인 0.999906, 임베딩 표 mmap, 타워 지연 상주 · 교차 스왑, 비전 층 0 · 오디오 층 8 F32)는 16 ~ 17절에 이미 구현 · 실측되어 있습니다. 숫자 하나만 다릅니다. "짧은 문장 단건 120 ~ 160 ms" 는 F32 기준(약 0.15초)이고, Q8_0 Dequant 경로는 약 0.28초입니다(16-5). granite(`granite-97m-r2-cls-v1`)는 raon-zena 의 실시간 라우팅과 `premium-discount-nav` 라벨 공간에서만 씁니다.
 - **SigLIP2.** raon-zena 의 `raon-vision` 이 이제 `google/siglip2-so400m-patch16-naflex` 를 직접 읽습니다(transformers 참조와 이미지 코사인 1.000000 · 텍스트 0.999999). 이 앱의 접근성 비전도 같은 체크포인트를 쓸 계획(19절)이므로, 전처리(평균 · 표준편차 0.5, bilinear)와 위치표 antialias 는 그 구현을 기준으로 맞추면 됩니다.
+
+## 22. 공용 라이브러리 통합 · 이름 표준화 (2026-11-17)
+
+`crates/` 를 9개 crate 로 넓히고 이름의 약어(`pd-*`)를 없앴습니다. crate 목록과 원칙은 [`crates/README.md`](crates/README.md) 에 있습니다.
+
+| 한 일 | 내용 |
+| --- | --- |
+| 이름 | `pd-identity` · `pd-verdict` · `pd-nav` → `premium-discount-identity` · `-verdict` · `-nav` (Rust 이름 `premium_discount_*`). 계약 값(`pd-verdict/1` · `/2` recipe, `x-pd-*` 헤더, MCP 도구 `pd_*`)은 서버 · DB 와 맞물려 그대로 둡니다 |
+| `premium-discount-mcp` | raon-zena 에서 옮겨 왔습니다. raon-zena 의 `zena-avatar-mcp` 에 기대던 MCP 틀은 `premium-discount-mcp-protocol` 로 떼어 냈습니다(raon-zena 는 이것을 다시 내보냅니다) |
+| `premium-discount-schema` | `cc` 정규화 · `to`/`bcc` 주소(MCP 에서), 명령 계약(앱 `commands.rs` 에서): 인자 7 · 결과 11 타입, `CommandError`, `COMMANDS`(17) · `ERROR_KINDS`(15). 앱은 다시 내보내고, 앱 안의 타입에 기대는 `VerdictsResult` · `AppStatus` 만 앱에 남았습니다 |
+| `premium-discount-filter` | 사전 필터 `LocalFilter` · `Verdict`(앱 `filter.rs` 에서). 앱의 `ProfanityFilter` 트레이트는 오류 타입이 앱의 `AppError` 라 앱에 두고 이 타입을 감쌉니다. `premium-discount-mcp` 는 앱을 띄우기 전에 이 사전으로 먼저 거릅니다(`status: blocked`, `filter: dictionary`) |
+| `premium-discount-sds` | `Moments`(Welford 더하기 · 합치기 · 빼기, 모집단 · 표본 분산)와 스코프 백오프. nav 의 마찰 기준선과 raon-zena `zena-sds` 가 씁니다(직렬화 모양 `n` · `mean` · `m2` 그대로) |
+| `premium-discount-manifest` | `.part` · SHA-256 · 확인 뒤 이름 바꾸기 · 안전한 상대 경로(앱 `model_fetch.rs` 의 함수들). raon-zena 아바타 카탈로그도 씁니다 |
+| 사이드카 | `app/src-tauri/tauri.sidecar.conf.json` + `sidecars.mjs`: 설치본에 `premium-discount-app` · `premium-discount-mcp` 를 함께 넣습니다. 기본 `tauri.conf.json` 에 넣지 않은 이유: tauri-build 는 `externalBin` 파일이 없으면 `cargo build` 자체를 멈춥니다 |
+| 바로잡은 것 | `cmd_vote`(20절) 외에, `premium-discount-identity` 의 단어표 해시 시험이 Windows 체크아웃(`core.autocrlf`)에서 실패하던 것: 시험이 줄 끝을 LF 로 맞추고 `.gitattributes` 로 `english.txt` 를 LF 고정 |
+
+**기획서와 다른 점**
+- 필터 판정은 기획서의 `Pass` · `Block { reason }` 이 아니라 기존 그대로 `Clean` · `Profane` 입니다. 사전 필터는 실패하지 않으므로 crate 의 `LocalFilter::judge` 는 `Verdict` 를 바로 돌려줍니다.
+- 명령은 기획서의 16개가 아니라 17개입니다(코어 13 + 모델 3 + `cmd_item_draft`).
+- crates 의 원칙 문구를 "HTTP 없음"에서 "블로킹 `GET /graph*`(ureq) 하나뿐"으로 고쳤습니다(`premium-discount-mcp` 가 들어왔으므로).
+
+**검증**
+
+| 묶음 | 결과 |
+| --- | --- |
+| `cd crates && cargo test` | 전부 통과: identity 9, verdict 5, nav 46, schema 8 (계약 3 · 주소 · cc 5), filter 8, mcp-protocol 2, mcp 13 + 서버 7 + E2E 1 (환경 변수가 없으면 건너뜀), sds 5, manifest 3 |
+| 실제 E2E (`premium-discount-mcp` → 릴리스 `premium-discount-app` → `mock_server.py`, 텍스트 모델) | 통과: 오프라인 queued → 병합 flush → stored, 게스트 · 로그인 투표와 판정, 서버가 받은 768차원 벡터(노름 1.0000003) |
+| `premium-discount-mcp` 릴리스 바이너리 MCP 왕복 | 도구 9개, 욕설은 앱 없이 `blocked` |
+| `cd app && cargo test --release --lib` | 237 통과, 2 무시 (사전 필터 시험 8개는 `premium-discount-filter` 로 옮겨 감) |
+| `app/ui` `npm test` | 70 통과 |
+| src-tauri `cargo check` + `TAURI_CONFIG` 로 사이드카 지정 | 통과. tauri-build 가 `binaries/<이름>-x86_64-pc-windows-msvc.exe` 를 삼중항 없는 이름으로 실행 파일 옆에 복사함을 확인. 설치 파일(`tauri build`)은 만들지 않았습니다 |
+
+## 23. 범용 엔진 통합 · 런타임 판 맞추기 (2026-11-17)
+
+raon-zena 의 범용 엔진을 `crates/` 로 옮기고, Relay · 창 계산 crate 를 새로 만들고, 두 저장소의 런타임 판을 맞췄습니다.
+- crate 목록과 도메인 경계(이 저장소 = 장소 · 대상 · 화면 영역의 열린 집합, raon-zena = 제나 표현 사전의 닫힌 집합)는 [`crates/README.md`](crates/README.md) 에 있습니다.
+- raon-zena 쪽 기록은 그 저장소의 `docs/MASTER_PLAN_ENGINE_UNIFICATION_AND_VERSION_SYNC.md` 입니다.
+
+| crate | 출처 | 한 일 |
+| --- | --- | --- |
+| `onnxruntime-sys` · `onnxruntime` | raon-zena (onnxruntime-rs 0.0.14 벤더 판) | 실행 시 라이브러리 찾는 곳에 `%LOCALAPPDATA%\premium.discount\models\onnxruntime` 을 더함. 오래된 시험 대상 오류 두 가지(`test_env_log` 가져오기, bindgen 배치 시험 261개의 null 역참조)와 libc 기호 경고 25개(`memcpy` 등 다시 선언)를 없앰 |
+| `premium-discount-nlp` | raon-zena `zena-nlp` | 기능 `granite`(candle) · `stanza`(ONNX). 모델은 `PD_*` → `RAON_*` → `premium.discount` · `RaonZena` · `logis-center` 의 `models` 순서로 찾음 |
+| `premium-discount-nms` | raon-zena `nlp-nms-router` 의 중립 부분 | `DomainBank<M, E>`(항목 내용 `M` 은 부르는 쪽 타입, `DomainSpec` 으로 만듦), 호출어는 `set_wake_words` 로 정함(기본 없음) |
+| `premium-discount-sds` | raon-zena `zena-sds` 전체 | `Moments` 와 합침. 장부 recipe 그대로 |
+| `premium-discount-sensor` | raon-zena `zena-sensor` + `zena-core::geometry` | 화면 종류 `VisionKind` 도 여기로(사전 · 앵커 은행이 같은 값) |
+| `premium-discount-vision` | raon-zena `raon-vision` | 사전(`zena-lexicon`) 의존을 뺌: `AnchorBank::from_specs`(`VisionDomainSpec`), `compute_anchors(… forms: Fn …)`. 예제는 CPU |
+| `premium-discount-quant` | raon-zena `raon-quant` 의 범용 부분 | 새 `trim`: logis-center 의 어휘 잘라 내기 규칙(아래) |
+| `premium-discount-relay` | 새로 만듦 (raon-zena `relative-value-sds.md` 3.4 · 4.1절) | Relay Key 뽑기 · 다국어 키 묶기 · 문장 맞추기 · 바뀐 주장 → 대체(`Supersedes`) · 중복 · 의미 연결 |
+| `premium-discount-window` | 새로 만듦 (`app/ui/stage.ts` + raon-zena `zena-core::window`) | 3단계 크기 · 자리 · 누르기와 끌기 · 스타일 비트 · 알파 · 프레임 간격 · 제자리 돌아가기, 점 아래 창 · 앞 창 찾기(Win32). `stage.ts` 와 같은 시험 벡터(`tests/stage_cases.json`)를 Rust · TS 가 함께 읽음 |
+
+**런타임 판 맞추기**
+
+| | 전 (app/) | 전 (raon-zena) | 후 (둘 다) |
+| --- | --- | --- | --- |
+| lancedb · lance | 0.31 · 8.0.0 | 0.41 · 14.0.2 | 0.41 · 14.0.2 |
+| tokenizers | 0.21.4 + 0.22.2(포크 경유) | 0.22.2 | 0.22.2 하나 (`default-features = false`, `onig`) |
+| candle 포크 | `rev = ebaf93d` | `branch = master` (잠금은 ebaf93d) | `rev = ebaf93d` (raon-infer 의 `candle-rocm` 포함), crates/ 도 같은 rev |
+| datafusion | 53.1 | 54.1 | 54.1 |
+
+앱 코드는 한 줄도 바뀌지 않았습니다. lancedb 0.41 은 앱이 부르는 API 서명이 0.31 과 같습니다. 바뀐 것은 내부입니다(lance 14 의 새 데이터는 파일 형식 V2_2).
+
+**어휘 잘라 내기 규칙 (`premium-discount-quant::trim`)**
+- logis-center `models/common/vocab_trim.rs`(PR #84)의 규칙을 이 crate 에서 다시 썼습니다.
+  - 남김: 공통 코어 · 문서 언어의 문자 체계 전부 · ASCII 전부 · 도메인 글 · 섞인 한자 상위 4,096, 64의 배수.
+  - 행 수 예산을 두는 규칙은 두지 않습니다.
+- raon-quant 의 `ColdGuard` 와 합쳤습니다: `trim::slice` → `VocabSlice{kept, cold}`. 규칙이 무엇을 놓쳐도 탐욕 디코딩은 전체 어휘와 같습니다.
+- 실제 Qwen3.5 어휘(248,320)에서 남는 행 수:
+
+  | 언어 | 남는 행 |
+  | --- | --- |
+  | en | 131,328 |
+  | ko + en | 138,112 |
+  | ja + en | 190,272 |
+  | 12개 언어 | 220,160 |
+
+  앱의 초안 모델(`qwen35.rs`)은 지금 16,384행 고정 예산을 쓰고 영어가 15 ~ 17번째 토큰부터 달라집니다(17-4절).
+- 이 앱에 그 모델(Qwen3.5-0.8B safetensors)이 이 PC 에 없어, 초안 경로는 바꾸지 않았습니다. 두 가지를 실측한 뒤 정할 일입니다.
+  - 새 규칙(영어 전부): 속도 이득이 줄어듭니다.
+  - 작은 예산 + ColdGuard: 결과는 같고, 속도는 잘린 행 묶음을 다시 계산하는 횟수에 달립니다.
+
+**검증**
+
+| 묶음 | 결과 |
+| --- | --- |
+| `cd crates && cargo test --release --workspace` | 전부 통과. 새 crate: nlp 11 + granite 참조 4 · 벤치 1 · Stanza ko 1 · 런타임 5(실제 모델), nms 15(`--features stanza` 도), sds 30 + 장부 파일 6, sensor 12, quant 11, vision 10, relay 4, window 24 + 공유 벡터 5. 경고 없음 |
+| Relay 실제 모델 (`--features neural --test real_models`) | 한국어 패치 노트 "피해가 20% 감소" → "15% 감소" 를 `Supersedes`(문장 맞추기 코사인 0.994, 포함률 1.0)로. 키 묶기: 말레니아 → malenia, 라다곤 → radagon, 다른 이름끼리는 따로 |
+| google SigLIP2 (`premium-discount-vision` 예제 `ve_xcheck`, CPU) | 옮기기 전과 같음: 이미지 코사인 0.999999 ~ 1.000001, 텍스트 0.999999, 토크나이저 6/6 |
+| 창 찾기 (Win32) | 앞 창 · 점 아래 창: `explorer.exe` · `app://explorer.exe` |
+| 앱 `cargo test --release --lib` (lancedb 0.41 · tokenizers 0.22) | 237 통과 |
+| lance 8 ↔ 14 호환 | 옛 실행 파일(lancedb 0.31)이 쓴 보관함을 새 실행 파일이 읽고(행 2 · 벡터 검색 0.901) 이어 쓰며(행 3), 그 뒤 옛 실행 파일도 다시 읽음 |
+| 실제 E2E (`premium-discount-mcp` → 새 앱 → `mock_server.py`) | 통과(14.8초) |
+| src-tauri `cargo check` + 사이드카 | 통과 |
+| 잠금 파일 | `app/` · `app/src-tauri/` · `crates/` · raon-zena 모두 tokenizers 0.22.2 하나, candle `rev=ebaf93d` |
+
+**기획서와 다른 점**
+- "단일 Cargo.lock" 은 저장소가 둘이라 없습니다. 네 잠금 파일이 같은 판을 고르게 맞췄습니다.
+- premium-discount-app 은 여전히 프로세스로 둡니다(Tauri · tokio · 앱 상태). 다만 이제 판 충돌은 링크하지 않는 이유가 아닙니다.
+- raon-zena 에는 기획서의 트리와 달리 얇은 접착 crate 가 남습니다.
+  - `raon-vision`: 사전 → 앵커 은행.
+  - `raon-quant`: Raon 피라미드 계획 · 블록 캐시.
+  - `zena-sds`: 다시 내보내기, 경로 유지.
+- Relay 의 키 묶기는 SDS 띠(평균 + 2σ) 대신 "서로 가장 가까운 짝 + 바닥 0.80 + 차이 0.03" 입니다. 실측 근거:
+  - 같은 이름의 한 · 영 짝: 0.833 · 0.848.
+  - 다른 이름끼리: 0.739 ~ 0.771.
+  - 키 몇 개의 띠는 0.881 이라 아무것도 묶지 못했습니다.
+- Relay 의 포함률 하한(0.5)은 아직 고정값입니다. Relay 는 새로 만들었고 아직 부르는 곳이 없습니다(판정 cron 의 `superseded` 입력에 잇는 것은 다음 일).
+- `premium-discount-window` 의 누르기와 끌기 · 제자리 돌아가기 · 점 아래 창 찾기는 raon-zena 오버레이가 아직 쓰지 않습니다. `zena-core::window` 는 스타일 비트 · 알파 · 프레임 간격만 이 crate 로 계산합니다.

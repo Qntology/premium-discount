@@ -1,0 +1,13 @@
+[package]
+name = "premium-discount-sensor"
+description = "화면 센서: 가상 이벤트 카메라(WGSL · CPU 로그 휘도 변화), ROI 묶기 · 추적, 화면 극좌표, NaFlex 16×16 패치(Raon-VE · google SigLIP2 전처리)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+# event_diff.wgsl 검증 (런타임에는 wgpu 를 쓰는 앱이 셰이더를 올린다)
+naga = { version = "30", features = ["wgsl-in"] }

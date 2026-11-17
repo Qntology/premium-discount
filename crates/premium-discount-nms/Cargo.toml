@@ -1,0 +1,23 @@
+[package]
+name = "premium-discount-nms"
+description = "도메인 중립 NLP-NMS 코어: 조사 떼기 · 역할 · 부정 분석, 해시 · granite 임베딩, 제네릭 도메인 은행(정확 · 접두 일치 + bias/prejudice), 구간 · 시간 의미 · 공간-글 NMS. raon-zena nlp-nms-router 에서 옮김 (원 설계 Qntology/logis-center)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+premium-discount-sds.workspace = true
+premium-discount-sensor.workspace = true
+# 기능 `neural`: granite 임베딩, `stanza`: + Stanza 역할 분석 (ONNX Runtime)
+premium-discount-nlp = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+default = []
+neural = ["dep:premium-discount-nlp", "premium-discount-nlp/granite", "dep:candle-core"]
+stanza = ["neural", "premium-discount-nlp/stanza"]

@@ -1,0 +1,10 @@
+[package]
+name = "premium-discount-mcp-protocol"
+description = "Minimal MCP (JSON-RPC 2.0 over stdio, one message per line): McpClient (spawn, handshake, tool calls) and serve() for a ToolHandler. Threads only, no async runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true

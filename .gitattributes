@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# BIP-39 단어표는 해시로 확인하므로 줄 끝을 LF 로 고정한다
+crates/premium-discount-identity/src/english.txt text eol=lf
