@@ -1,0 +1,22 @@
+[package]
+name = "premium-discount-mcp"
+description = "premium.discount for Raon Zena: a headless MCP server (JSON-RPC 2.0 over stdio) that wraps premium-discount-app's line protocol (local LanceDB outbox, votes, verdict cache, embeddinggemma-2, QR login), plus the coalesced sync client a host app drives it with"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+premium-discount-mcp-protocol.workspace = true
+premium-discount-schema.workspace = true
+premium-discount-nav.workspace = true
+premium-discount-verdict.workspace = true
+premium-discount-filter.workspace = true
+# GET /graph* (premium-discount-app has no graph command): blocking, no async runtime
+ureq.workspace = true
+
+[[bin]]
+name = "premium-discount-mcp"
+path = "src/bin/premium-discount-mcp.rs"

@@ -17,6 +17,10 @@ vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
+# 공용 crate (crates/): 명령 계약, 사전 욕설 필터, 내려받기 검증 규칙
+premium-discount-schema = { path = "../crates/premium-discount-schema" }
+premium-discount-filter = { path = "../crates/premium-discount-filter" }
+premium-discount-manifest = { path = "../crates/premium-discount-manifest" }
 anyhow = "1"
 async-trait = "0.1"
 candle-core = "0.11.0"

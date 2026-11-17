@@ -28,7 +28,7 @@ const session = { 'x-oauth-hash': HASH, 'x-oauth-token': TOKEN }
 const NOW = Date.UTC(2026, 10, 17, 3, 0, 0)
 const TODAY = dayOf(NOW)
 const MINUTE = 60_000
-// ethers 6.17 로 뽑은 기준값 (crates/pd-nav trial.rs 시험과 같다)
+// ethers 6.17 로 뽑은 기준값 (crates/premium-discount-nav trial.rs 시험과 같다)
 const APP = '0x39206c971297059b89e4e6fc35844ee87feb0407'
 // 코스 S1 → R2 → S3 의 코스 id 체인 (마지막이 코스 id)
 const CHAIN = ['0x826797e39016c80c7db39259352ad3af843f0acf', '0x517cbe9e479a79a6ef66e403072e9776000d90fc', '0xa9c45e19240962f6cb2dfb7aa8381e3ec3d80340']
@@ -123,7 +123,7 @@ const withIds = (steps: { kind: Kind; hash: string; gesture?: string }[], app = 
 	return steps.map((s, i) => ({ ...s, id: checkpointId(s as any), course: chain[i] }))
 }
 
-test('체크포인트 id · 코스 id 는 기기(crates/pd-nav)와 같은 기준값이다', () => {
+test('체크포인트 id · 코스 id 는 기기(crates/premium-discount-nav)와 같은 기준값이다', () => {
 	assert.equal(hashId('nav-app/1|shop.example.com'), APP)
 	const steps = [
 		{ kind: 'screen' as const, hash: S1 },
@@ -427,7 +427,7 @@ test('인증 · 요청 형식', async () => {
 	assert.equal(await handleNavTrials(new Request('https://premium.discount/nav/marks', { method: 'POST' }), env, NOW), null)
 })
 
-// crates/pd-nav trial.rs 시험과 같은 사례: 고스트 S1 → A → B → 결승, 런 S1 → A → C → 결승
+// crates/premium-discount-nav trial.rs 시험과 같은 사례: 고스트 S1 → A → B → 결승, 런 S1 → A → C → 결승
 test('고스트 따라가기 판정: 따라간 체크포인트는 premium, 고르지 않은 체크포인트는 discount (Rust route_marks 와 같은 표)', () => {
 	const step = (kind: Kind, hash: string) => ({ kind, hash })
 	const [start, a, b, c, finish] = [step('screen', S1), step('region', R2), step('region', h(0x44)), step('region', h(0x55)), step('screen', S3_HASH)]
@@ -523,7 +523,7 @@ test('다른 사용자의 코스를 따라 달리면 체크포인트에 premium,
 	])
 })
 
-// 웹 코스: 페이지(링크값) · 요소(DOM 셀렉터)와 제스처. crates/pd-nav trial.rs 와 같은 기준값
+// 웹 코스: 페이지(링크값) · 요소(DOM 셀렉터)와 제스처. crates/premium-discount-nav trial.rs 와 같은 기준값
 const WEB_COURSE = '0xe8c5279f506af6687f43eee19360173c51f44cce'
 const fill = (c: string) => '0x' + c.repeat(40)
 const webRun = (pressGesture: string | null, over: Record<string, unknown> = {}) =>

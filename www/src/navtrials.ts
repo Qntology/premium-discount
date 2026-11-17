@@ -1,5 +1,5 @@
 // 접근성 내비게이션 타임트라이얼(trial/1). 보관 규칙은 cron/src/navtrials.ts(TRIAL_POLICY), 표는 migrations/0007_nav_trials.sql,
-// 기기 쪽은 crates/pd-nav trial.rs 다.
+// 기기 쪽은 crates/premium-discount-nav trial.rs 다.
 //
 // POST   /nav/trials              본문 { "runs": [trial/1, ...] } (최대 10개). 런마다 결과를 보낸 순서대로 돌려준다
 // GET    /nav/trials?app=0x…      그 앱 · 웹의 내 콜렉션(인증했을 때)과 다른 사용자의 공개 코스(고스트)
@@ -21,7 +21,7 @@
 // 한 번만 등록한다: 공개 합계(등록한 사용자 수 · premium · discount · 평균)와 판정(nav_counts · 고스트 따라가기)에는 처음 한 번만
 // 들어가고, 다시 달린 런은 내 콜렉션의 내 기록만 고친다. 콜렉션에서 밀려나거나 지운 코스를 다시 달려도 마찬가지다.
 //
-// id 정의 (crates/pd-nav trial.rs 와 같다). 웹의 hashId(cc + pathname) 처럼 앞의 id 에 다음 조각을 이어 붙여 해싱한다(구분자 없음)
+// id 정의 (crates/premium-discount-nav trial.rs 와 같다). 웹의 hashId(cc + pathname) 처럼 앞의 id 에 다음 조각을 이어 붙여 해싱한다(구분자 없음)
 // - 체크포인트 id = hashId(<종류> + <해시> + <제스처>)
 // - 코스 id 체인: 첫 체크포인트에서 hashId(<앱 id> + <체크포인트 id>), 다음부터 hashId(<이전 코스 id> + <체크포인트 id>).
 //   결승의 값이 그 코스의 id 다. 저장하는 steps 에는 체크포인트마다 id 와 그 지점까지의 코스 id(course)가 붙는다
@@ -29,7 +29,7 @@
 // 고스트 따라가기 판정(route): 런이 ghost(따라간 다른 사용자의 공개 코스)를 밝히면, 시작 · 결승이 그 코스와 같을 때 그 코스의
 // 중간 체크포인트 중 런이 지난 것은 premium, 지나지 않은(다른 길로 간) 것은 discount 로 nav_counts 에 센다(체크포인트 id).
 // 공개되지 않은 코스 · 다른 앱의 코스 · 결승이 다른 런은 판정하지 않는다(route: null).
-// 기기 쪽 같은 규칙은 crates/pd-nav trial.rs 의 route_marks 다.
+// 기기 쪽 같은 규칙은 crates/premium-discount-nav trial.rs 의 route_marks 다.
 //
 // 체크포인트 종류: 앱은 screen(UIA 구조 지문) · region(영역), 웹은 page(링크값 = URL 틀) · element(DOM 셀렉터 틀).
 // 스와이프 · 스크롤로 지난 체크포인트에는 gesture 가 붙고(swipe-left … scroll-down), 같은 해시라도 다른 체크포인트다.
@@ -67,7 +67,7 @@ export interface NavAccount {
 }
 const STEP_KINDS = ['screen', 'region', 'page', 'element'] as const
 type StepKind = (typeof STEP_KINDS)[number]
-// crates/pd-nav gesture.rs 의 Gesture 이름. press 는 체크포인트에 남기지 않는다
+// crates/premium-discount-nav gesture.rs 의 Gesture 이름. press 는 체크포인트에 남기지 않는다
 const GESTURES = ['swipe-left', 'swipe-right', 'swipe-up', 'swipe-down', 'scroll-up', 'scroll-down', 'scroll-left', 'scroll-right'] as const
 type Gesture = (typeof GESTURES)[number]
 interface StepRef {
@@ -79,7 +79,7 @@ interface StepRef {
 	course?: string
 }
 
-// 체크포인트 키: <종류>:<해시> 또는 <종류>:<해시>@<제스처> (crates/pd-nav StepRef::key)
+// 체크포인트 키: <종류>:<해시> 또는 <종류>:<해시>@<제스처> (crates/premium-discount-nav StepRef::key)
 export function stepKey(s: StepRef): string {
 	return s.gesture ? `${s.kind}:${s.hash}@${s.gesture}` : `${s.kind}:${s.hash}`
 }
@@ -97,13 +97,13 @@ function cachedHashId(text: string): string {
 	return id
 }
 
-// 체크포인트 id = hashId(<종류> + <해시> + <제스처>) (crates/pd-nav checkpoint_id). 해시가 0x + 40자로 길이가 정해져 있어
+// 체크포인트 id = hashId(<종류> + <해시> + <제스처>) (crates/premium-discount-nav checkpoint_id). 해시가 0x + 40자로 길이가 정해져 있어
 // 구분자 없이 이어도 겹치지 않는다
 export function checkpointId(s: StepRef): string {
 	return cachedHashId(`${s.kind}${s.hash}${s.gesture ?? ''}`)
 }
 
-// 코스 id 체인 (crates/pd-nav course_chain): 첫 값은 hashId(<앱 id> + <체크포인트 id>), 다음부터 hashId(<이전 코스 id> + <체크포인트 id>).
+// 코스 id 체인 (crates/premium-discount-nav course_chain): 첫 값은 hashId(<앱 id> + <체크포인트 id>), 다음부터 hashId(<이전 코스 id> + <체크포인트 id>).
 // 앞부분이 같은 코스는 그 지점까지 같은 id 를 갖고, 다른 체크포인트부터 갈라진다
 export function courseChain(app: string, steps: StepRef[]): string[] {
 	let previous = app
@@ -139,12 +139,12 @@ export interface RunResult {
 
 class RunInvalid extends Error {}
 
-// premium.discount 의 hashId: ethers.computeAddress(ethers.hashMessage(text)) (crates/pd-identity hash_id 와 같다)
+// premium.discount 의 hashId: ethers.computeAddress(ethers.hashMessage(text)) (crates/premium-discount-identity hash_id 와 같다)
 export function hashId(text: string): string {
 	return ethers.computeAddress(ethers.hashMessage(text)).toLowerCase()
 }
 
-// 코스 id: 코스 id 체인의 마지막 값 (crates/pd-nav course_hash)
+// 코스 id: 코스 id 체인의 마지막 값 (crates/premium-discount-nav course_hash)
 export function courseHash(app: string, steps: StepRef[]): string {
 	return courseChain(app, steps).at(-1) ?? ''
 }
@@ -186,7 +186,7 @@ function parseVectors(value: unknown, hash: string): ParsedRun['vectors'] {
 	return out
 }
 
-// trial/1 런 하나를 확인한다 (crates/pd-nav trial.rs 의 Run 직렬화와 같은 모양). 코스 해시는 체크포인트로 다시 계산해 맞춰 본다
+// trial/1 런 하나를 확인한다 (crates/premium-discount-nav trial.rs 의 Run 직렬화와 같은 모양). 코스 해시는 체크포인트로 다시 계산해 맞춰 본다
 export function parseRun(value: unknown, today: number): ParsedRun {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RunInvalid('run must be an object')
 	const r = value as Record<string, unknown>
@@ -250,7 +250,7 @@ export function parseRun(value: unknown, today: number): ParsedRun {
 
 const sameStep = (a: StepRef, b: StepRef) => stepKey(a) === stepKey(b)
 
-// 고스트 따라가기 판정 (crates/pd-nav route_marks 와 같은 규칙). 시작과 결승이 고스트와 같을 때만, 고스트의 중간 체크포인트마다
+// 고스트 따라가기 판정 (crates/premium-discount-nav route_marks 와 같은 규칙). 시작과 결승이 고스트와 같을 때만, 고스트의 중간 체크포인트마다
 // 런이 지났으면 premium(1), 아니면 discount(-1). 런에만 있는 체크포인트는 판정하지 않는다. 시작 · 결승이 다르면 null
 export function routeMarks(run: StepRef[], ghost: StepRef[]): { step: StepRef; type: 1 | -1 }[] | null {
 	if (run.length === 0 || ghost.length === 0) return null

@@ -12,7 +12,7 @@
 #
 # v1 의 사례는 v2 에서도 결과가 같아야 한다 (그 사례가 쓰는 트랙 · 종류의 값이 같으므로). main()이 확인한다.
 # 서버(cron/src/verdict.ts)는 아직 v1 로 판정한다. TypeScript 구현은 이 파일의 params 를 넘겨 v2 사례를 통과한다
-# (cron/test/verdict_v2.test.ts). premium-discount 의 crates/pd-verdict 는 Params::v2() 로 같은 사례를 통과한다.
+# (cron/test/verdict_v2.test.ts). premium-discount 의 crates/premium-discount-verdict 는 Params::v2() 로 같은 사례를 통과한다.
 
 import copy
 import json

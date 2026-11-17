@@ -9,7 +9,7 @@
 | `gen_verdict_v2.py` | PD-Verdict v2 참조 구현. v1 의 함수를 그대로 쓰고 매개변수만 넓힙니다. 실행하면 `verdict_v2.json` 을 다시 씁니다 |
 | `verdict_v2.json` | v2 매개변수와 사례 25개(v1 사례 19개 + 접근성 내비게이션 사례 6개) |
 | `gen_wallet_v1.mjs` | 인증의 지갑 갈래(사용자가 시드 구문을 보관하는 익명 계정) 참조 구현. ethers 로 `wallet_v1.json` 을 다시 씁니다 |
-| `wallet_v1.json` | 시드 구문 → 주소 · 개인 키 2건, EIP-191 서명 3건, 요청 서명 2건, 거절할 시드 구문 3건. 서버(`www/src/auth.ts`)와 `crates/pd-identity` 가 같은 값을 냅니다 |
+| `wallet_v1.json` | 시드 구문 → 주소 · 개인 키 2건, EIP-191 서명 3건, 요청 서명 2건, 거절할 시드 구문 3건. 서버(`www/src/auth.ts`)와 `crates/premium-discount-identity` 가 같은 값을 냅니다 |
 
 ```bash
 python contracts/gen_verdict_v1.py   # premium-discount 폴더에서
@@ -72,8 +72,8 @@ v2(`pd-verdict/2`)는 규칙(위 1 ~ 7)이 v1 과 같고, 매개변수 두 가�
 | 참조 (Python) | `contracts/gen_verdict_v1.py`, `gen_verdict_v2.py` | 이 파일이 기대값을 만듭니다 |
 | 서버 cron (TypeScript) | `cron/src/verdict.ts` | `cron/test/verdict.test.ts`(v1), `cron/test/verdict_v2.test.ts`(v2, 계약의 `params` 를 넘겨서) |
 | 앱 E2E 가짜 서버 | `app/tests/e2e/mock_server.py` | 참조 구현을 그대로 import |
-| Rust 라이브러리 | `crates/pd-verdict` (`Params::v1()`, `Params::v2()`) | `cd crates && cargo test`: 두 계약의 매개변수와 사례 전부, v2 가 v1 사례를 그대로 담는지 |
-| raon-zena (Rust) | `crates/zena-verdict` | 사본(`contracts/verdict_v1.json`)의 해시, 옆 저장소 원본과의 대조, 사례 전부. `pd-verdict` 로 옮길 예정 |
+| Rust 라이브러리 | `crates/premium-discount-verdict` (`Params::v1()`, `Params::v2()`) | `cd crates && cargo test`: 두 계약의 매개변수와 사례 전부, v2 가 v1 사례를 그대로 담는지 |
+| raon-zena (Rust) | `crates/zena-verdict` | 사본(`contracts/verdict_v1.json`)의 해시, 옆 저장소 원본과의 대조, 사례 전부. `premium-discount-verdict` 로 옮길 예정 |
 
 ## 관측 종류별 기본 가중치
 

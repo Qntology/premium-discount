@@ -1,0 +1,16 @@
+[package]
+name = "premium-discount-schema"
+description = "premium.discount 의 도메인 규칙과 명령 계약: cc 정규화(envelope), to · bcc 콘텐츠 주소(address), premium-discount-app 명령의 인자 · 결과 · 오류 종류(contract)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+sha2.workspace = true
+unicode-normalization.workspace = true
+premium-discount-identity.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

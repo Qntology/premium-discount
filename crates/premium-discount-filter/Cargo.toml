@@ -1,0 +1,8 @@
+[package]
+name = "premium-discount-filter"
+description = "사전 기반 로컬 욕설 필터 (한국어 어간 · 영어 낱말, 우회 표기 정규화). 모델 · 네트워크 없음"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

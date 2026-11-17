@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "npm --prefix ui install && npm --prefix ui run build && node src-tauri/sidecars.mjs"
+  },
+  "bundle": {
+    "externalBin": ["binaries/premium-discount-app", "binaries/premium-discount-mcp"]
+  }
+}

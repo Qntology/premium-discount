@@ -219,7 +219,7 @@ export function matchesFilter(item: { state?: string | null; tier?: Tier | null;
 
 // ---- 계정 · 지갑 · 모델 (2단계 아래 접이식) ----
 
-/** 지갑 칸. 앱에는 아직 지갑 명령이 없다 (시드 지갑 서명은 crates/pd-identity에만 있다). 세션의 계정 주소만 보여 준다 */
+/** 지갑 칸. 앱에는 아직 지갑 명령이 없다 (시드 지갑 서명은 crates/premium-discount-identity에만 있다). 세션의 계정 주소만 보여 준다 */
 export function walletLine(info: { state: 'anonymous' | 'signed_in'; address: string | null }): { address: string; note: string } {
 	const note = '지갑(시드 구문) 명령은 아직 앱에 없습니다.'
 	if (info.state === 'signed_in' && info.address) return { address: info.address, note: `로그인한 계정 주소입니다. ${note}` }

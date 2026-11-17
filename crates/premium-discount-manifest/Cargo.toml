@@ -1,0 +1,9 @@
+[package]
+name = "premium-discount-manifest"
+description = "고정 파일(이름 · 크기 · SHA-256) 내려받기의 검증 규칙: .part 경로, 해시, 확인 뒤 이름 바꾸기, 안전한 상대 경로. HTTP 없음"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true

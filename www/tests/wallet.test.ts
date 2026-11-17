@@ -1,6 +1,6 @@
 // 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
 // 인증의 지갑 갈래(익명 계정): 요청 서명 확인. 기준은 contracts/wallet_v1.json(ethers 로 뽑은 값)이고,
-// 기기 쪽 Rust(crates/pd-identity)도 같은 계약을 시험한다.
+// 기기 쪽 Rust(crates/premium-discount-identity)도 같은 계약을 시험한다.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'

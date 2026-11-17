@@ -27,13 +27,10 @@ use crate::error::AppError;
 
 pub const DEFAULT_BASE_URL: &str = "https://huggingface.co";
 
-/// 받을 파일 하나 (크기와 SHA-256 고정)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSpec {
-    pub name: String,
-    pub size: u64,
-    pub sha256: String,
-}
+/// 받을 파일 하나 (크기와 SHA-256 고정). 받는 규칙(`.part`, 해시 확인)은 공용 crate(`crates/premium-discount-manifest`)에 있고,
+/// raon-zena 의 아바타 카탈로그도 같은 규칙을 쓴다.
+pub use premium_discount_manifest::FileSpec;
+use premium_discount_manifest::{hash_prefix, hash_range, hex, part_path, sha256_file};
 
 /// 텍스트 전용 파일을 원본의 어느 구간에서 만드는지
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,46 +644,6 @@ impl Job {
 
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(250 * 2u64.pow(attempt.min(5)))
-}
-
-fn part_path(target: &Path) -> PathBuf {
-    let mut s = target.as_os_str().to_owned();
-    s.push(".part");
-    PathBuf::from(s)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn hash_prefix(path: &Path, len: u64, hasher: &mut Sha256) -> std::io::Result<()> {
-    hash_range(path, 0, len, hasher)
-}
-
-fn hash_range(path: &Path, start: u64, end: u64, hasher: &mut Sha256) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::Start(start))?;
-    let mut left = end - start;
-    let mut buf = vec![0u8; 1 << 20];
-    let cap = buf.len() as u64;
-    while left > 0 {
-        let n = f.read(&mut buf[..left.min(cap) as usize])?;
-        if n == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "파일이 예상보다 짧습니다"));
-        }
-        hasher.update(&buf[..n]);
-        left -= n as u64;
-    }
-    Ok(())
-}
-
-/// 파일의 `skip` 바이트 뒤부터 끝까지의 SHA-256
-fn sha256_file(path: &Path, skip: u64) -> std::io::Result<String> {
-    let len = std::fs::metadata(path)?.len();
-    let mut hasher = Sha256::new();
-    hash_range(path, skip.min(len), len, &mut hasher)?;
-    Ok(hex(hasher.finalize().as_slice()))
 }
 
 /// 원본 헤더(앞 8바이트 + JSON)에서 `language_model.*`만 남긴 새 헤더(앞 8바이트 + JSON, 8의 배수로 맞춤)를 만든다.

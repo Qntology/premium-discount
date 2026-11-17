@@ -176,7 +176,7 @@ export async function verifiedAddress(request: Request, env?: SessionEnv): Promi
 
 // 인증의 두 번째 갈래: 지갑(익명 계정). 사용자가 시드 구문을 보관하는 ethers 지갑이고, 요청마다 EIP-191 서명을 붙인다.
 // 위의 세션(익명 아님: QR 메일 로그인)과 달리 서버는 지갑 주소만 안다. 이메일 · 전화번호 같은 식별 정보는 없다.
-// 규칙과 기준값은 contracts/gen_wallet_v1.mjs · wallet_v1.json 이고, 기기 쪽 crates/pd-identity 가 같은 값을 낸다.
+// 규칙과 기준값은 contracts/gen_wallet_v1.mjs · wallet_v1.json 이고, 기기 쪽 crates/premium-discount-identity 가 같은 값을 낸다.
 // 서명하는 글(줄바꿈 \n):
 //   premium.discount request v1 / address: <소문자 주소> / time: <유닉스 ms> / method: <대문자 메서드> / path: <경로> / body-sha256: <hex>
 export const WALLET_REQUEST_VERSION = 'premium.discount request v1'

@@ -2,7 +2,7 @@
 //
 // 실행: node contracts/gen_wallet_v1.mjs   (premium-discount 폴더에서. www/node_modules 의 ethers 를 쓴다. 파일을 다시 쓴다)
 //
-// 이 파일이 지갑 갈래의 기준이다. 서버(www/src/auth.ts)와 Rust 라이브러리(crates/pd-identity)는 이 파일이 만든
+// 이 파일이 지갑 갈래의 기준이다. 서버(www/src/auth.ts)와 Rust 라이브러리(crates/premium-discount-identity)는 이 파일이 만든
 // wallet_v1.json 의 값을 그대로 내야 한다.
 //
 // 규칙
