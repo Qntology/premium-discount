@@ -250,3 +250,100 @@ fn the_coupon_box_is_the_bottleneck_of_the_funnel() {
     assert_eq!(site.choices.items[&pay_key].decide(&p), Some(MarkType::Premium), "{:?}", site.choices.items[&pay_key]);
     assert_eq!(site.choices.items[&coupon_key].decide(&p), Some(MarkType::Discount));
 }
+
+/// 쿠폰을 적용하느라 늦었지만 끝까지 간 세션 (간편결제를 비켜 간 길)
+fn coupon_then_done(sid: &str) -> Vec<WebEvent> {
+    let mut v: Vec<WebEvent> = smooth_session(sid).into_iter().take(5).collect();
+    let mut coupon = ev(EventKind::Click, CHECKOUT, sid, 5, 12_000);
+    coupon.target = Some(button("coupon", "쿠폰 적용"));
+    coupon.related = vec![button("easy-pay", "간편결제")];
+    v.push(coupon);
+    let mut submit = ev(EventKind::Submit, CHECKOUT, sid, 6, 20_000);
+    submit.target = Some(button("coupon", "쿠폰 적용"));
+    v.push(submit);
+    v.push(ev(EventKind::Enter, DONE, sid, 7, 22_000));
+    v
+}
+
+/// 사건 → 접근성 내비게이션 웹 코스까지: 고른 요소(TARGET)와 지나친 형제(RELATED)가 nav 의 요소 체크포인트(page_hash +
+/// selector_template)로 이어지고, 완주한 세션들의 코스를 nav 의 서버 규칙(route_marks)으로 견주면 결제 페이지에 막 들어온
+/// 방문자에게 다음 단계로 간편결제를 premium 으로 권한다(추천 경로). 쿠폰 칸은 같은 세션들의 마찰 에피소드에서 병목(discount)이다.
+#[test]
+fn sessions_become_nav_checkpoints_a_bottleneck_and_a_premium_next_step() {
+    use premium_discount_analytic::funnel::element_of;
+    use premium_discount_nav::{app_hash, element_hash, route_marks, selector_template, CheckpointTally, PublicCourse, Run, StepRef};
+    use std::collections::BTreeMap;
+
+    let checkout = page_hash(CHECKOUT).unwrap();
+    let done = page_hash(DONE).unwrap();
+    let easy = button("easy-pay", "간편결제");
+    let coupon = button("coupon", "쿠폰 적용");
+    // TARGET · RELATED 의 체크포인트는 nav 웹 코스의 요소 해시 (같은 DOM 조상 → 같은 셀렉터 틀)
+    let easy_hash = element_hash(&checkout, &selector_template(&easy.chain).unwrap()).unwrap();
+    assert_eq!(element_of(&checkout, &easy).as_deref(), Some(easy_hash.as_str()));
+    let smooth = trace_session(&smooth_session("probe"));
+    assert!(smooth.checkpoints.iter().any(|c| c.hash == easy_hash), "the pressed TARGET is a course checkpoint");
+    assert_ne!(element_of(&checkout, &coupon).unwrap(), easy_hash);
+
+    // 30 세션은 간편결제로 끝내고, 10 세션은 쿠폰으로 늦게 끝내고, 10 세션은 쿠폰 칸에서 헤매다 떠난다
+    let mut site = SiteAnalysis::new("shop.example.com");
+    let app = app_hash("shop.example.com").unwrap();
+    let mut runs: Vec<Run> = Vec::new();
+    for i in 0..50 {
+        let session = match i % 5 {
+            0..=2 => smooth_session(&format!("s{i}")),
+            3 => coupon_then_done(&format!("d{i}")),
+            _ => coupon_struggle(&format!("c{i}")),
+        };
+        site.add_session(&session);
+        let trace = trace_session(&session);
+        if trace.path.last() == Some(&done) {
+            runs.push(Run::from_checkpoints(&app, &trace.checkpoints, None).expect("a completed session is a run"));
+        }
+    }
+    assert_eq!(runs.len(), 40);
+
+    // 병목 (마찰 에피소드 · FrictionBaselines): 쿠폰 칸
+    let bottlenecks = site.bottlenecks();
+    assert_eq!(bottlenecks.first().map(|(_, t)| t.label.as_str()), Some("쿠폰 적용"), "{bottlenecks:?}");
+    assert_eq!(site.funnel(&[checkout.clone(), done.clone()])[0].dropped, 10);
+
+    // 고스트 = 가장 많이 달린 코스, 체크포인트 판정은 서버와 같은 route_marks
+    let mut by_course: BTreeMap<&str, Vec<&Run>> = BTreeMap::new();
+    for r in &runs {
+        by_course.entry(r.course.as_str()).or_default().push(r);
+    }
+    let (ghost_course, ghost_runs) = by_course.iter().max_by_key(|(_, v)| v.len()).unwrap();
+    assert_eq!(ghost_runs.len(), 30);
+    let ghost: Vec<StepRef> = ghost_runs[0].refs();
+    let mut tallies = vec![CheckpointTally::default(); ghost.len()];
+    for r in &runs {
+        for (step, mark) in route_marks(&r.refs(), &ghost).unwrap_or_default() {
+            let at = ghost.iter().position(|g| *g == step).unwrap();
+            match mark {
+                MarkType::Premium => tallies[at].premium += 1,
+                MarkType::Discount => tallies[at].discount += 1,
+            }
+        }
+    }
+    let easy_at = ghost.iter().position(|s| s.hash == easy_hash).expect("the ghost passes the easy-pay button");
+    assert_eq!((tallies[easy_at].premium, tallies[easy_at].discount), (30, 10), "the coupon finishers went around it");
+    let public = PublicCourse {
+        course: ghost_course.to_string(),
+        steps: ghost.clone(),
+        runs: ghost_runs.len() as u32,
+        premium: 0,
+        discount: 0,
+        record: ghost_runs[0].splits(),
+        average: ghost_runs[0].splits(),
+        checkpoints: tallies,
+    };
+
+    // 결제 페이지에 막 들어온 새 방문자: 다음 단계는 간편결제, premium
+    let progress = trace_session(&smooth_session("visitor").into_iter().take(5).collect::<Vec<_>>()).checkpoints;
+    let guide = premium_discount_nav::Collection::default().guide(&app, &progress, &[public]).expect("a course fits");
+    assert_eq!(guide.course, *ghost_course);
+    let next = guide.next.expect("not at the finish yet");
+    assert_eq!(next.hash, easy_hash);
+    assert_eq!(guide.next_tier, Tier::Premium);
+}

@@ -1550,3 +1550,56 @@ logis-center 의 웹 행동 분석(analytic) 파이프라인과 tracker-logis-ce
 | 화면 (`app/ui`) · cron | 71 · 41 통과 |
 | `premium-discount-schema` | 8 통과 (명령 21개 = 계약 파일) |
 | src-tauri `cargo check` | 통과, 경고 없음 (분석 명령 4개 등록) |
+
+## 25. 신구 대체 연결 · 사이드카 검증 · 웹 분석과 내비게이션 (2026-11-18)
+
+### 25-1. 신구 대체(`Relation::Supersedes`) → PD-Verdict `superseded`
+
+같은 장소(cc) · 대상(to)의 새 평가가 옛 평가의 주장에서 수치 · 단위 · 형용사만 바꿨으면("피해 20% → 15%", "배송비 3,000원 → 무료") 옛 평가는
+근거와 상관없이 discount(grade −2, 이유 `superseded`)입니다. 판정 규칙(`premium-discount-verdict` · `cron/src/verdict.ts`)에는 입력이 이미
+있었고, 이번에 그 입력을 채우는 길을 이었습니다.
+
+```text
+Raon Zena 판정 보조 (Stanza · granite)                premium-discount-app / -mcp                      www · cron
+premium_discount_relay::supersessions ──pd_supersede──▶ cmd_supersede ──POST /evaluations/supersedes──▶ eval_supersedes (0009)
+  같은 cc · to 묶음, 시간순, 대체 쌍                    판정 캐시를 곧바로 discount −2                 → verdict_dirty → cron 판정 superseded
+```
+
+- **relay**: `supersessions(entries, embedder, cfg)` — 같은 cc · to 끼리 시간순(같으면 id 순)으로 놓고 평가마다 더 늦은 평가와 견줘, 한 옛 평가에
+  그것을 대체하는 가장 이른 새 평가 하나를 냅니다. 주장 규칙 세 가지를 고쳤습니다(실제 Stanza ko 로 "배송비 3,000원 → 무료" 가 Duplicate 로
+  나왔음): 숫자로 시작하는 수+단위(`3,000원`, `3,000원이다`)는 식별자 키가 아니라 값, 한국어 계사 서술어(`무료+이+다`)의 명사는 값, 주제어
+  (`dislocated`, 은/는)는 핵심어. 실제 모델(granite · Stanza ko)로 두 사례 모두 Supersedes.
+- **서버**: `POST /evaluations/supersedes {request_id, old, new}`. 비교는 Worker 에서 할 수 없어(모델 없음) 검증할 수 있는 것만 봅니다: 둘 다 저장이
+  끝난 평가, 같은 cc · to, new 가 더 늦음(400), 없는 평가(404), 확인된 로그인(게스트 401), 보고자는 두 평가 중 하나의 작성자(403 — 남의 평가를
+  마음대로 내리지 못하게). 같은 request_id 는 처음 답(200), 다른 쌍이면 409. 받으면 옛 평가를 `verdict_dirty` 에 표시하고, cron 은 판정 행을 읽을 때
+  `EXISTS (eval_supersedes …)` 를 함께 읽어 `judge(…, superseded)` 로 넘깁니다. 표가 하나도 없던 평가도 보고만으로 판정 행이 생겨 discount 가 됩니다.
+- **앱 · MCP**: 명령 `cmd_supersede {old, new}`(계약 22개째, Tauri 셸 · 화면 `supersede` 포함)와 도구 `pd_supersede`. request_id 는
+  `sup-` + sha256(old|new) 앞 48자라 다시 보내도 서버에는 한 번입니다. 서버가 받으면 판정 캐시를 곧바로 discount −2 로 바꾸고(다음 서버 판정도
+  같음), 연결이 없으면 `offline` 오류라 부른 쪽이 다음 동기화 때 다시 보냅니다. 서버의 4xx(408 · 429 빼고)는 `rejected`.
+- 바로잡은 것: `EvalBackend` 의 `Arc<T>` 위임에 새 메서드가 빠지면 기본 구현(지원 안 함)이 불립니다. 앱 시험이 이것을 잡았습니다.
+
+### 25-2. 사이드카(`externalBin`) 검증
+
+`sidecars.mjs` 를 시험할 수 있게 나눴습니다(`stage` · `stagedName` · `hostTriple`). `sidecars.test.mjs` 가 고정하는 약속: 빌드한 두 실행 파일을
+`binaries/<이름>-<삼중항>[.exe]` 로 옮김(Windows · 리눅스 · 교차 빌드 자리), 실행 파일이 없으면 그 경로를 알리고 멈춤, `tauri.sidecar.conf.json`
+의 `externalBin` 은 두 사이드카이고 빌드 전에 `sidecars.mjs` 를 부름, 기본 설정에는 사이드카가 없음, 설치 폴더(`productName` = `premium.discount`)와
+삼중항을 뗀 이름이 `find_pd_app` · `find_mcp_server` 가 찾는 것과 같음. 셸 `cargo check` 는 기본 설정, 사이드카 설정(`TAURI_CONFIG`)으로 모두 통과하고,
+`binaries/` 가 없으면 사이드카 설정은 "resource path … doesn't exist" 로 멈춥니다(그래서 기본 설정에서 뺀 것).
+
+### 25-3. 웹 분석과 접근성 내비게이션
+
+BLOB 코덱의 세 결함(50 바이트 이하 base64 gzip · `subarray` 오프셋 · `"42"`/`"null"` 원시값)과 DELTA GUARD 는 이미 시험(계약 19 사례 · www ·
+앱)으로 고정돼 있었습니다. 빠져 있던 것은 사건 → 내비게이션 코스의 끝에서 끝 시험이라 `crates/premium-discount-analytic/tests/funnel.rs` 에
+더했습니다: 고른 요소(TARGET)의 체크포인트가 nav 요소 해시(`page_hash` + `selector_template`)이고, 간편결제로 끝낸 30 · 쿠폰으로 늦게 끝낸 10 ·
+쿠폰 칸에서 떠난 10 세션에서 쿠폰 칸이 병목(discount)이며, 완주한 런들의 고스트 코스를 서버 규칙(`route_marks`)으로 견주면 간편결제 체크포인트가
+30 premium · 10 discount 라 결제 페이지에 막 들어온 방문자에게 nav `guide` 가 다음 단계로 간편결제를 premium 으로 권합니다.
+
+### 25-4. 검증
+
+| 묶음 | 결과 |
+| --- | --- |
+| `cd crates && cargo test --workspace` | 279 통과 · 0 실패 · 3 무시 (relay 단위 4 · 실제 모델 3 · 대체 → 판정 2, MCP 13, 분석 퍼널 8 포함) |
+| www · cron (`node --test www/tests/*.test.ts cron/test/*.test.ts`) | 139 통과 (대체 보고 4) |
+| 앱 `cargo test --lib` · 통합 | 241 통과 (`cmd_supersede` 1, UI 계약 22개 명령) |
+| 화면 `app/ui` 계약 · 사이드카 `node --test app/src-tauri/sidecars.test.mjs` | 4 · 4 통과 |
+| src-tauri `cargo check` | 기본 설정 · 사이드카 설정 통과 |
