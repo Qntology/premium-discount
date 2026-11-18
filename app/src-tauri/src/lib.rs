@@ -15,7 +15,7 @@ use premium_discount_app::{
     FilterSetting, LoadOptions, LocalMatchDto, LoginStartResult, LoginStatus, MergedSearch, ModelFetcher, ModelStatus, Outbox, SearchArgs, SwitchFilter, Variant,
     SearchLocalArgs, SearchResponse, SessionArgs, SessionInfo, SessionStore, SubmitArgs, SubmitResult, SyncArgs,
 };
-use premium_discount_app::commands::{VerdictsArgs, VerdictsResult, VoteArgs, VoteResult};
+use premium_discount_app::commands::{SupersedeArgs, SupersedeResult, VerdictsArgs, VerdictsResult, VoteArgs, VoteResult};
 use serde_json::Value;
 use settings::Settings;
 use tauri::{Manager, State};
@@ -276,6 +276,12 @@ async fn cmd_vote(shell: State<'_, Shell>, args: VoteArgs) -> Result<VoteResult,
     shell.core().await?.cmd_vote(args).await
 }
 
+/// 신구 대체 보고 (premium-discount-relay 의 비교 결과). 서버가 받으면 옛 평가의 판정 캐시가 곧바로 discount(−2, superseded)
+#[tauri::command]
+async fn cmd_supersede(shell: State<'_, Shell>, args: SupersedeArgs) -> Result<SupersedeResult, CommandError> {
+    shell.core().await?.cmd_supersede(args).await
+}
+
 #[tauri::command]
 async fn cmd_verdicts(shell: State<'_, Shell>, args: VerdictsArgs) -> Result<VerdictsResult, CommandError> {
     shell.core().await?.cmd_verdicts(args).await
@@ -351,6 +357,7 @@ pub fn run() {
             cmd_search_merged,
             cmd_flush_outbox,
             cmd_vote,
+            cmd_supersede,
             cmd_verdicts,
             cmd_session,
             cmd_login_start,

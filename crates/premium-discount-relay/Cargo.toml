@@ -13,6 +13,8 @@ premium-discount-nlp = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
+# 대체 → PD-Verdict superseded 연결 시험 (tests/supersede_verdict.rs)
+premium-discount-verdict.workspace = true
 
 [features]
 default = []

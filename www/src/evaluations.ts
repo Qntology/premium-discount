@@ -379,6 +379,88 @@ async function markDirty(env: EvalEnv, evalId: string, at: number): Promise<void
 	await env.DB.prepare(`INSERT OR REPLACE INTO verdict_dirty ("eval_id", "at") VALUES (?1, ?2)`).bind(evalId, at).run()
 }
 
+// ---- 신구 대체 (premium-discount-relay Relation::Supersedes, migrations/0009) ----
+
+interface SupersedeRecord {
+	old_id: string
+	new_id: string
+	reporter: string
+}
+
+interface EvalHead {
+	from: string
+	cc: string
+	to: string | null
+	created_at: number
+}
+
+// POST /evaluations/supersedes : 새 평가(new)가 옛 평가(old)를 대체한다는 보고. 비교(Stanza · 임베딩)는 보고한 쪽이 했고, 여기서는
+// 검증할 수 있는 것만 본다: 둘 다 저장이 끝난 평가, 같은 장소 · 대상(cc · to), new 가 더 늦게 쓰임, 보고자는 확인된 로그인이고
+// 두 평가 중 하나의 작성자 (남의 평가를 마음대로 내리지 못하게). 받으면 옛 평가를 cron 이 다시 판정하도록 표시한다
+async function reportSupersede(request: Request, env: EvalEnv, origin: string): Promise<Response> {
+	const body = await readJson(request)
+	const requestId = parseRequestId(body.request_id)
+	const oldId = parseUuid(body.old, 'old')
+	const newId = parseUuid(body.new, 'new')
+	if (oldId === newId) throw new ValidationError('old and new must be different evaluations')
+
+	const head = (id: string) =>
+		env.DB.prepare(`SELECT "from", "cc", "to", "created_at" FROM evaluations WHERE "id" = ?1`).bind(id).first<EvalHead>()
+	const [older, newer] = [await head(oldId), await head(newId)]
+	if (!older || !newer) return json({ error: 'evaluation not found' }, 404, origin)
+	if (older.cc !== newer.cc || (older.to ?? null) !== (newer.to ?? null)) {
+		throw new ValidationError('old and new must share cc and to')
+	}
+	if (newer.created_at <= older.created_at) throw new ValidationError('new must be written after old')
+
+	const reporter = await verifiedAddress(request, env)
+	if (!reporter) return json({ error: 'a verified session is required' }, 401, origin)
+	if (reporter !== older.from && reporter !== newer.from) {
+		return json({ error: 'only an author of old or new can report it' }, 403, origin)
+	}
+	const record: SupersedeRecord = { old_id: oldId, new_id: newId, reporter }
+
+	const replay = await findSupersede(env, requestId, record)
+	if (replay) return replaySupersede(env, replay, origin)
+	const now = Date.now()
+	try {
+		await env.DB.prepare(
+			`INSERT INTO eval_supersedes ("old_id", "new_id", "reporter", "request_id", "created_at") VALUES (?1, ?2, ?3, ?4, ?5)
+			 ON CONFLICT ("old_id", "new_id") DO NOTHING`
+		)
+			.bind(oldId, newId, reporter, requestId, now)
+			.run()
+	} catch (err) {
+		const again = await findSupersede(env, requestId, record)
+		if (again) return replaySupersede(env, again, origin)
+		throw err
+	}
+	// 기록한 뒤에 표시한다 (투표와 같은 이유). 같은 쌍이 다른 request_id 로 다시 와도 표시만 다시 한다
+	await markDirty(env, oldId, now)
+	return json(supersedeBody(record), 202, origin)
+}
+
+// 같은 request_id 로 기록된 보고. 쌍이 다르면 409
+async function findSupersede(env: EvalEnv, requestId: string, record: SupersedeRecord): Promise<SupersedeRecord | null> {
+	const found = await env.DB.prepare(`SELECT "old_id", "new_id", "reporter" FROM eval_supersedes WHERE "request_id" = ?1`)
+		.bind(requestId)
+		.first<SupersedeRecord>()
+	if (!found) return null
+	if (found.old_id !== record.old_id || found.new_id !== record.new_id) {
+		throw new ConflictError('request_id was already used for a different report')
+	}
+	return found
+}
+
+async function replaySupersede(env: EvalEnv, record: SupersedeRecord, origin: string): Promise<Response> {
+	await markDirty(env, record.old_id, Date.now())
+	return json(supersedeBody(record), 200, origin)
+}
+
+function supersedeBody(r: SupersedeRecord) {
+	return { old: r.old_id, new: r.new_id, status: 'accepted' }
+}
+
 // counted: 이 표가 등급 계산에 들어가는지. 게스트와 작성자 자신의 표는 기록만 하고 세지 않는다 (cron이 가중치 0으로 센다)
 function voteBody(v: VoteRecord, author: string) {
 	return { id: v.eval_id, value: v.value, kind: v.kind, counted: v.voter_kind === 'session' && v.voter !== author, status: 'accepted' }
@@ -558,8 +640,9 @@ export async function handleEvaluations(request: Request, env: EvalEnv): Promise
 	const isPublicSearch = pathname === '/public/evaluations/search'
 	const isStatus = pathname === '/evaluations/status'
 	const isVotes = pathname === '/evaluations/votes'
+	const isSupersedes = pathname === '/evaluations/supersedes'
 	const isVerdicts = pathname === '/evaluations/verdicts'
-	if (pathname !== '/evaluations' && !isAppSearch && !isPublicSearch && !isStatus && !isVotes && !isVerdicts) return null
+	if (pathname !== '/evaluations' && !isAppSearch && !isPublicSearch && !isStatus && !isVotes && !isSupersedes && !isVerdicts) return null
 
 	const origin = request.headers.get('Origin') ?? ''
 
@@ -573,7 +656,7 @@ export async function handleEvaluations(request: Request, env: EvalEnv): Promise
 	// 요청 제한 (ratelimit.ts). 저장과 투표는 저장 제한기, 검색과 판정 조회는 읽기 제한기를 쓴다.
 	// status 조회는 제한하지 않는다: D1 한 건 조회뿐이고, 앱이 대기 중인 항목을 한꺼번에 확인한다
 	if (!isStatus) {
-		const limiter = pathname === '/evaluations' || isVotes ? env.EVAL_WRITE_LIMITER : env.EVAL_READ_LIMITER
+		const limiter = pathname === '/evaluations' || isVotes || isSupersedes ? env.EVAL_WRITE_LIMITER : env.EVAL_READ_LIMITER
 		if (await isRateLimited(request, limiter)) return rateLimited(origin)
 	}
 
@@ -581,6 +664,7 @@ export async function handleEvaluations(request: Request, env: EvalEnv): Promise
 		if (isStatus) return await readStatus(request, env, origin)
 		if (isVerdicts) return await readVerdicts(request, env, origin)
 		if (isVotes) return await castVote(request, env, origin)
+		if (isSupersedes) return await reportSupersede(request, env, origin)
 		if (pathname === '/evaluations') return await enqueueEvaluation(request, env, origin)
 		return await searchEvaluations(request, env, origin, isAppSearch ? 'app' : 'public')
 	} catch (err) {

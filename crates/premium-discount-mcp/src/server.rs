@@ -31,11 +31,12 @@ use crate::lines::CallError;
 
 pub const SERVER_NAME: &str = "premium-discount-mcp";
 
-pub const TOOLS: [&str; 9] = [
+pub const TOOLS: [&str; 10] = [
     "pd_enqueue_node",
     "pd_flush_and_sync",
     "pd_search_merged",
     "pd_vote",
+    "pd_supersede",
     "pd_verdicts",
     "pd_graph_inspect",
     "pd_auth_session",
@@ -225,6 +226,16 @@ impl<B: Backend> PdSyncServer<B> {
         call(&mut self.backend, "cmd_vote", json!({"id": id, "value": value, "kind": kind}))
     }
 
+    /// 신구 대체 보고: premium-discount-relay 가 `new` 가 `old` 를 대체한다고 판정했다 (Raon Zena 의 판정 보조)
+    fn supersede(&mut self, args: &Value) -> Result<Value> {
+        let old = req_str(args, "old")?;
+        let new = req_str(args, "new")?;
+        if old == new {
+            bail!("old and new must be different evaluations");
+        }
+        call(&mut self.backend, "cmd_supersede", json!({"old": old, "new": new}))
+    }
+
     fn verdicts(&mut self, args: &Value) -> Result<Value> {
         let ids: Vec<&str> = args
             .get("ids")
@@ -401,6 +412,14 @@ impl<B: Backend> ToolHandler for PdSyncServer<B> {
                 }, "required": ["id", "value"]},
             }),
             json!({
+                "name": "pd_supersede",
+                "description": "Report that a newer evaluation supersedes an older one in the same place and target (premium-discount-relay: the same claim with a changed number, unit or adjective, e.g. damage 20% -> 15%, shipping 3,000 won -> free). The server checks that both share cc and to, that new is later and that the signed-in user wrote one of them; once accepted the old evaluation's verdict is discount (grade -2, reason superseded), in the local cache at once. Offline: an offline error, send again later (the same report is stored once).",
+                "inputSchema": {"type": "object", "properties": {
+                    "old": s("UUID of the superseded (earlier) evaluation"),
+                    "new": s("UUID of the superseding (later) evaluation"),
+                }, "required": ["old", "new"]},
+            }),
+            json!({
                 "name": "pd_verdicts",
                 "description": "Global verdicts of evaluations (PD-Verdict: tier, grade -2..2, rank, value, evidence, reason codes). Served from the local cache when it is under 10 minutes old, else asked from the server; offline: the cache with stale=true and never-seen ids in missing.",
                 "inputSchema": {"type": "object", "properties": {
@@ -461,6 +480,7 @@ impl<B: Backend> ToolHandler for PdSyncServer<B> {
             "pd_flush_and_sync" => self.flush_and_sync(args),
             "pd_search_merged" => self.search(args),
             "pd_vote" => self.vote(args),
+            "pd_supersede" => self.supersede(args),
             "pd_verdicts" => self.verdicts(args),
             "pd_graph_inspect" => self.graph(args),
             "pd_auth_session" => self.auth(args),

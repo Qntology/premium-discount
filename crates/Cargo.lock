@@ -2313,6 +2313,7 @@ dependencies = [
  "premium-discount-nlp",
  "premium-discount-nms",
  "premium-discount-sds",
+ "premium-discount-verdict",
 ]
 
 [[package]]

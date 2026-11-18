@@ -122,6 +122,24 @@ pub struct VoteResponse {
     pub status: Option<String>,
 }
 
+/// POST /evaluations/supersedes 요청: 새 평가(`new`)가 옛 평가(`old`)를 대체한다 (www/migrations/0009).
+/// 같은 request_id 는 재시도이고, 서버는 처음 결과를 돌려준다
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SupersedeRequest {
+    pub request_id: String,
+    pub old: String,
+    pub new: String,
+}
+
+/// POST /evaluations/supersedes 응답 (202 접수, 200 같은 request_id 의 처음 결과)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SupersedeResponse {
+    pub old: String,
+    pub new: String,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 /// 평가 하나의 전역 판정 (GET /evaluations/verdicts). 규칙은 contracts/verdict_v1.json (PD-Verdict)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VerdictDto {
@@ -206,6 +224,10 @@ pub trait EvalBackend: Send + Sync {
     async fn verdicts(&self, _ids: &[String]) -> Result<VerdictsResponse, AppError> {
         Err(AppError::Rejected("verdicts are not supported by this backend".into()))
     }
+    /// 신구 대체 보고 (POST /evaluations/supersedes)
+    async fn supersede(&self, _req: &SupersedeRequest) -> Result<SupersedeResponse, AppError> {
+        Err(AppError::Rejected("supersede reports are not supported by this backend".into()))
+    }
 
     // ---- 로그인 (지원하지 않는 백엔드는 기본 구현을 쓴다) ----
 
@@ -252,6 +274,9 @@ impl<T: EvalBackend + ?Sized> EvalBackend for Arc<T> {
     }
     async fn verdicts(&self, ids: &[String]) -> Result<VerdictsResponse, AppError> {
         (**self).verdicts(ids).await
+    }
+    async fn supersede(&self, req: &SupersedeRequest) -> Result<SupersedeResponse, AppError> {
+        (**self).supersede(req).await
     }
     async fn session_start(&self) -> Result<SessionStart, AppError> {
         (**self).session_start().await
@@ -459,6 +484,10 @@ impl EvalBackend for HttpBackend {
 
     async fn verdicts(&self, ids: &[String]) -> Result<VerdictsResponse, AppError> {
         self.get("/evaluations/verdicts", &[("ids", &ids.join(","))]).await
+    }
+
+    async fn supersede(&self, req: &SupersedeRequest) -> Result<SupersedeResponse, AppError> {
+        self.post("/evaluations/supersedes", req).await
     }
 
     async fn session_start(&self) -> Result<SessionStart, AppError> {

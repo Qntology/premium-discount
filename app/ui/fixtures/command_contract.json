@@ -55,6 +55,12 @@
       "kind": "vote"
     }
   },
+  "cmd_supersede": {
+    "args": {
+      "old": "0190f0a0-0000-7000-8000-0000000000aa",
+      "new": "0190f0a0-0000-7000-8000-0000000000bb"
+    }
+  },
   "cmd_verdicts": {
     "args": {
       "ids": [

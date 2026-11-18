@@ -20,8 +20,9 @@ pub fn blank_to_none(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
-/// 앱이 여는 명령 이름. 코어(`AppCore::dispatch`) 17개(웹 행동 분석 4개 포함), 셸이 모델 없이도 답하는 모델 명령 3개, 셸의 초안 엔진 1개.
-pub const COMMANDS: [&str; 21] = [
+/// 앱이 여는 명령 이름. 코어(`AppCore::dispatch`) 18개(웹 행동 분석 4개 · 신구 대체 보고 포함), 셸이 모델 없이도 답하는 모델 명령 3개,
+/// 셸의 초안 엔진 1개.
+pub const COMMANDS: [&str; 22] = [
     "cmd_submit_evaluation",
     "cmd_sync_cache",
     "cmd_search_local",
@@ -29,6 +30,7 @@ pub const COMMANDS: [&str; 21] = [
     "cmd_search_merged",
     "cmd_flush_outbox",
     "cmd_vote",
+    "cmd_supersede",
     "cmd_verdicts",
     "cmd_app_status",
     "cmd_session",
@@ -129,6 +131,25 @@ pub struct VoteArgs {
     /// vote(기본) | vote_outcome
     #[serde(default)]
     pub kind: Option<String>,
+}
+
+/// `cmd_supersede`: 새 평가(`new`)가 옛 평가(`old`)를 대체한다는 보고 (premium-discount-relay `Relation::Supersedes` — 같은 장소 ·
+/// 대상에서 주장의 수치 · 단위 · 형용사만 바뀜). 서버는 둘의 cc · to 가 같고 new 가 더 늦은지, 보고자가 둘 중 하나의 작성자인지 본다.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupersedeArgs {
+    /// 대체된(더 이른) 평가의 서버 id
+    pub old: String,
+    /// 대체한(더 늦은) 평가의 서버 id
+    pub new: String,
+}
+
+/// `cmd_supersede` 결과: 서버가 받았고, 옛 평가의 판정 캐시는 discount(grade −2, 이유 superseded)로 바뀌었다
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SupersedeResult {
+    pub old: String,
+    pub new: String,
+    /// 쌍에서 정해지는 멱등 키 (같은 보고를 다시 보내도 서버에는 한 번)
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,6 +394,8 @@ mod tests {
         }
         let v: VoteArgs = serde_json::from_value(args("cmd_vote")).unwrap();
         assert_eq!((v.value, v.kind.as_deref()), (1, Some("vote")));
+        let s: SupersedeArgs = serde_json::from_value(args("cmd_supersede")).unwrap();
+        assert_ne!(s.old, s.new);
         let d: VerdictsArgs = serde_json::from_value(args("cmd_verdicts")).unwrap();
         assert_eq!(d.ids.len(), 1);
         let _: SessionArgs = serde_json::from_value(args("cmd_session")).unwrap();

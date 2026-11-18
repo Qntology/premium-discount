@@ -29,6 +29,7 @@ test('명령 이름과 인자 모양이 Rust와 맺은 계약(command_contract.j
 	await c.searchMerged(sample('cmd_search_merged'))
 	await c.flushOutbox()
 	await c.vote(sample('cmd_vote'))
+	await c.supersede(sample('cmd_supersede'))
 	await c.verdicts(sample('cmd_verdicts').ids, sample('cmd_verdicts').refresh)
 	await c.session(sample('cmd_session').verify)
 	await c.loginStart()

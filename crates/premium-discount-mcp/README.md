@@ -50,6 +50,7 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 | `pd_flush_and_sync` | `cmd_flush_outbox`(평가와 투표) + `cmd_sync_cache` | `next_since_ms`, 상태별 개수, `has_work`(못 보낸 투표 포함) |
 | `pd_search_merged` | `cmd_search_merged` | `cc` 변환, `to_key`, `tier` 필터 검사. 결과마다 서버 판정(`verdict`)과 내 표(`my_vote`) |
 | `pd_vote` | `cmd_vote` | 값(1 · −1 · 0)과 종류(`vote` · `vote_outcome`) 검사 |
+| `pd_supersede` | `cmd_supersede` | `old` · `new` 가 있고 다른지 검사. 신구 대체 보고(premium-discount-relay 의 판정): 서버가 받으면 옛 평가의 판정 캐시가 곧바로 discount(−2, `superseded`) |
 | `pd_verdicts` | `cmd_verdicts` | `ids` 검사 (캐시 10분, 오프라인이면 `stale`) |
 | `pd_graph_inspect` | (없음) 서버 `GET /graph?cc=`, `/graph/local?id=`, `/graph/similar?id=&topK=` | 노드 · 간선 종류별 개수, 작성자 수, 스레드(root) 크기, 서버 등급 분포 |
 | `pd_auth_session` | `cmd_session` · `cmd_login_start` · `cmd_login_status` · `cmd_logout` | — |

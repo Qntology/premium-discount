@@ -278,9 +278,12 @@ interface JudgeRow {
 	value: number
 	tier: Tier
 	tier_since: number
+	// 새 평가가 이 평가를 대체했다 (eval_supersedes, www/migrations/0009): 판정 입력 superseded. 1 | 0
+	superseded: number
 }
 
-const JUDGE_COLS = `"eval_id", "cc", "to", "evidence", "value", "tier", "tier_since"`
+const JUDGE_COLS = `"eval_id", "cc", "to", "evidence", "value", "tier", "tier_since",
+	EXISTS (SELECT 1 FROM eval_supersedes s WHERE s."old_id" = eval_verdicts."eval_id") AS "superseded"`
 
 interface Judgement {
 	id: string
@@ -348,7 +351,15 @@ export async function processVerdicts(env: Env, now: number = Date.now()): Promi
 			const b = baselines.get(s.key)
 			if (b) bs[s.level] = b
 		}
-		const v = judge({ evidence: r.evidence, value: r.value, baselines: bs, prev: { tier: r.tier, since_ms: r.tier_since }, nowMs: now, track: TRACK })
+		const v = judge({
+			evidence: r.evidence,
+			value: r.value,
+			baselines: bs,
+			prev: { tier: r.tier, since_ms: r.tier_since },
+			nowMs: now,
+			track: TRACK,
+			superseded: r.superseded === 1,
+		})
 		judged.push({ id: r.eval_id, tier: v.tier, grade: v.grade, rank: v.rank, level: v.level, reasons: v.reasons, since: v.since_ms })
 	}
 	await writeJudgements(env, judged, now)

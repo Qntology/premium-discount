@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! raon-zena ──McpClient (stdio JSON-RPC 2.0)──▶ premium-discount-mcp ──serve_lines (stdio JSON lines)──▶ premium-discount-app
-//!   SyncLoop (coalesced, 10 s while work)          9 pd_* tools, cc / hashId,         LanceDB outbox (original text, votes),
+//!   SyncLoop (coalesced, 10 s while work)         10 pd_* tools, cc / hashId,         LanceDB outbox (original text, votes),
 //!                                                  GET /graph                         verdict cache, embeddinggemma-2, QR login
 //!                                                         │                                    │
 //!                                                         └──────────── HTTPS ─────────────────┴──▶ premium.discount

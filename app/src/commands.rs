@@ -42,7 +42,8 @@ use premium_discount_schema::contract::blank_to_none;
 pub use premium_discount_schema::contract::{
     AnalyticForgetArgs, AnalyticReportArgs, AnalyticSiteArgs, AnalyticSyncArgs,
     AppInfo, CommandError, FlushSummary, LocalMatchDto, LoginStartResult, LoginStatus, RejectedDto, SearchArgs, SearchLocalArgs,
-    SessionArgs, SessionInfo, SubmitArgs, SubmitResult, SyncArgs, VerdictsArgs, VoteArgs, VoteRejectedDto, VoteResult, COMMANDS,
+    SessionArgs, SessionInfo, SubmitArgs, SubmitResult, SupersedeArgs, SupersedeResult, SyncArgs, VerdictsArgs, VoteArgs,
+    VoteRejectedDto, VoteResult, COMMANDS,
     DEFAULT_TOP_K, ERROR_KINDS,
 };
 
@@ -115,6 +116,14 @@ impl From<RejectedItem> for RejectedDto {
     }
 }
 
+
+/// 신구 대체 보고의 멱등 키: `sup-` + sha256(old | new) 앞 48자 (서버 규칙 16~64자 [A-Za-z0-9_-])
+fn supersede_request_id(old: &str, new: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{old}|{new}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sup-{}", &hex[..48])
+}
 
 /// `cmd_verdicts` 결과
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -494,6 +503,29 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
         Ok(VoteResult::Queued { request_id: rec.request_id })
     }
 
+    /// 신구 대체 보고 (premium-discount-relay 의 비교 결과, 보통 Raon Zena 의 판정 보조가 보낸다). 서버가 받으면(202 · 같은 보고 200)
+    /// 옛 평가의 판정 캐시를 곧바로 discount(−2, superseded)로 바꾼다. request_id 는 쌍에서 정해져 다시 보내도 서버에는 한 번이고,
+    /// 연결이 없으면 offline 오류라 부른 쪽이 다음 동기화 때 다시 보낸다. 서버의 거절(400 · 401 · 403 · 404)은 그대로 오류다.
+    pub async fn cmd_supersede(&self, args: SupersedeArgs) -> Result<SupersedeResult, CommandError> {
+        let old = crate::pipeline::validate_uuid("old", args.old.trim())?;
+        let new = crate::pipeline::validate_uuid("new", args.new.trim())?;
+        if old == new {
+            return Err(CommandError::new("invalid_input", "old and new must be different evaluations"));
+        }
+        let request_id = supersede_request_id(&old, &new);
+        let req = crate::api::SupersedeRequest { request_id: request_id.clone(), old: old.clone(), new: new.clone() };
+        match self.evaluator.backend().supersede(&req).await {
+            Ok(_) => {}
+            // 서버가 받지 않은 보고(형식 · 장소 · 대상 · 시각 · 보고자 · 없는 평가)는 다시 보내도 같다
+            Err(AppError::Server { status, message }) if (400..500).contains(&status) && status != 408 && status != 429 => {
+                return Err(CommandError::new("rejected", format!("server returned {status}: {message}")));
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.outbox.read().await.votes().mark_superseded(&old, crate::queue::now_ms()).await?;
+        Ok(SupersedeResult { old, new, request_id })
+    }
+
     /// 전역 판정. 캐시에 없거나 오래된(VERDICT_TTL_MS) 것이 있거나 refresh면 서버에 묻는다 (50개씩)
     pub async fn cmd_verdicts(&self, args: VerdictsArgs) -> Result<VerdictsResult, CommandError> {
         let mut ids: Vec<String> = Vec::new();
@@ -670,6 +702,7 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
             "cmd_search_merged" => out(self.cmd_search_merged(parse(args)?).await?),
             "cmd_flush_outbox" => out(self.cmd_flush_outbox().await?),
             "cmd_vote" => out(self.cmd_vote(parse(args)?).await?),
+            "cmd_supersede" => out(self.cmd_supersede(parse(args)?).await?),
             "cmd_verdicts" => out(self.cmd_verdicts(parse(args)?).await?),
             "cmd_app_status" => out(self.cmd_app_status()),
             "cmd_session" => out(self.cmd_session(parse(args)?).await?),
@@ -746,6 +779,8 @@ mod tests {
         starts: std::sync::atomic::AtomicUsize,
         /// 받은 투표와, 판정 조회에 돌려줄 값 (없는 id는 unrated)
         votes: Mutex<Vec<crate::api::VoteRequest>>,
+        /// 받은 신구 대체 보고
+        supersedes: Mutex<Vec<crate::api::SupersedeRequest>>,
         verdicts: Mutex<std::collections::HashMap<String, crate::api::VerdictDto>>,
         verdict_calls: std::sync::atomic::AtomicUsize,
         /// 웹 분석: 서버에 쌓인 원시 사건 (커서대로 돌려준다)
@@ -755,6 +790,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 votes: Mutex::new(Vec::new()),
+                supersedes: Mutex::new(Vec::new()),
                 verdicts: Mutex::new(std::collections::HashMap::new()),
                 verdict_calls: std::sync::atomic::AtomicUsize::new(0),
                 saved: Mutex::new(Vec::new()),
@@ -808,6 +844,16 @@ mod tests {
             // 로그인하지 않았으면 서버는 표를 저장만 하고 세지 않는다
             let counted = !self.session.lock().unwrap().is_anonymous();
             Ok(crate::api::VoteResponse { id: req.id.clone(), value: req.value, kind: req.kind.clone(), counted, status: Some("accepted".into()) })
+        }
+        async fn supersede(&self, req: &crate::api::SupersedeRequest) -> Result<crate::api::SupersedeResponse, AppError> {
+            if self.offline.load(Ordering::SeqCst) {
+                return Err(AppError::Offline("no network".into()));
+            }
+            if req.old == MISSING_ID || req.new == MISSING_ID {
+                return Err(AppError::Server { status: 404, message: r#"{"error":"evaluation not found"}"#.into() });
+            }
+            self.supersedes.lock().unwrap().push(req.clone());
+            Ok(crate::api::SupersedeResponse { old: req.old.clone(), new: req.new.clone(), status: Some("accepted".into()) })
         }
         async fn verdicts(&self, ids: &[String]) -> Result<crate::api::VerdictsResponse, AppError> {
             if self.offline.load(Ordering::SeqCst) {
@@ -1070,6 +1116,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supersede_reports_go_out_and_mark_the_old_verdict_discount_at_once() {
+        let (core, server) = core().await;
+        const NEWER: &str = "0190f0a0-0000-7000-8000-0000000000cc";
+        let args = |old: &str, new: &str| SupersedeArgs { old: old.into(), new: new.into() };
+        // 서버 판정은 premium 이었다
+        server.verdicts.lock().unwrap().insert(OTHER_ID.into(), verdict_of(OTHER_ID, "premium", Some(2)));
+        let before = core.cmd_verdicts(VerdictsArgs { ids: vec![OTHER_ID.into()], refresh: false }).await.unwrap();
+        assert_eq!(before.verdicts[0].verdict.tier, "premium");
+
+        // 오프라인: 오류이고 아무것도 바뀌지 않는다 (부른 쪽이 다시 보낸다)
+        server.offline.store(true, Ordering::SeqCst);
+        assert_eq!(core.cmd_supersede(args(OTHER_ID, NEWER)).await.unwrap_err().kind, "offline");
+        server.offline.store(false, Ordering::SeqCst);
+
+        let r = core.cmd_supersede(args(OTHER_ID, NEWER)).await.unwrap();
+        assert_eq!((r.old.as_str(), r.new.as_str()), (OTHER_ID, NEWER));
+        assert!(r.request_id.starts_with("sup-") && (16..=64).contains(&r.request_id.len()), "{}", r.request_id);
+        // 같은 보고는 같은 멱등 키
+        let again = core.cmd_supersede(args(OTHER_ID, NEWER)).await.unwrap();
+        assert_eq!(again.request_id, r.request_id);
+        let sent = server.supersedes.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!((sent[0].old.as_str(), sent[0].new.as_str()), (OTHER_ID, NEWER));
+        assert_eq!(sent[0].request_id, sent[1].request_id);
+
+        // 캐시의 판정은 곧바로 discount −2 (서버에 다시 묻지 않아도)
+        let calls = server.verdict_calls.load(Ordering::SeqCst);
+        let after = core.cmd_verdicts(VerdictsArgs { ids: vec![OTHER_ID.into()], refresh: false }).await.unwrap();
+        assert_eq!(server.verdict_calls.load(Ordering::SeqCst), calls, "served from the cache");
+        let v = &after.verdicts[0].verdict;
+        assert_eq!((v.tier.as_str(), v.grade, v.reasons.clone()), ("discount", Some(-2), vec!["superseded".to_string()]));
+        assert_eq!(v.evidence, 3.0, "the server's evidence stays");
+
+        // 캐시에 없던 평가도 표시된다. 잘못된 입력 · 서버에 없는 평가는 오류
+        let lone = core.cmd_supersede(args(SERVER_ID, NEWER)).await.unwrap();
+        assert_eq!(lone.old, SERVER_ID);
+        assert_eq!(core.cmd_supersede(args(OTHER_ID, OTHER_ID)).await.unwrap_err().kind, "invalid_input");
+        assert_eq!(core.cmd_supersede(args("nope", NEWER)).await.unwrap_err().kind, "invalid_input");
+        assert_eq!(core.cmd_supersede(args(MISSING_ID, NEWER)).await.unwrap_err().kind, "rejected");
+    }
+
+    #[tokio::test]
     async fn votes_go_out_at_once_or_wait_offline_and_show_up_in_search() {
         let (core, server) = core().await;
         let vote = |id: &str, value: i32| VoteArgs { id: id.into(), value, kind: None };
@@ -1295,7 +1383,7 @@ mod tests {
             assert!(res.is_ok(), "{cmd}: {res:?}");
             seen.push(cmd.clone());
         }
-        assert_eq!(seen.len(), 21, "계약에 있는 명령 수: {seen:?}");
+        assert_eq!(seen.len(), 22, "계약에 있는 명령 수: {seen:?}");
         assert!(model_command(&fetcher, "cmd_submit_evaluation", Value::Null).is_none(), "모델 명령이 아니면 코어로 간다");
         let bad = model_command(&fetcher, "cmd_model_download", json!({"variant": "huge"})).unwrap().unwrap_err();
         assert_eq!(bad.kind, "invalid_input");

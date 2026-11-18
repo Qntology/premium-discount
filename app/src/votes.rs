@@ -31,6 +31,8 @@ use crate::queue::{now_ms, MAX_SERVER_ATTEMPTS};
 
 pub const VOTES_TABLE: &str = "votes_local";
 pub const VERDICTS_TABLE: &str = "verdicts_cache";
+/// 캐시에 없던 평가를 대체로 표시할 때 적는 판정 규칙 (서버 cron 의 RECIPE 와 같음)
+const SUPERSEDED_RECIPE: &str = "pd-verdict/1";
 /// 판정 캐시를 서버에 다시 묻기까지의 시간 (밀리초)
 pub const VERDICT_TTL_MS: i64 = 10 * 60 * 1000;
 
@@ -523,6 +525,34 @@ impl VoteStore {
             .await
             .map_err(storage)?;
         Ok(read_verdicts(&batches)?.into_iter().map(|c| (c.verdict.id.clone(), c)).collect())
+    }
+
+    /// 대체된 평가(서버가 신구 대체 보고를 받음)를 곧바로 discount(grade −2, 이유 superseded)로 둔다. cron 이 다음 판정에서
+    /// 같은 등급을 매기므로(PD-Verdict: superseded 는 근거와 상관없이 discount), 서버 판정을 다시 받을 때까지의 표시다.
+    /// 캐시에 있던 근거량 · 값 · 표 수는 그대로 두고 등급 · 이유만 바꾼다.
+    pub async fn mark_superseded(&self, eval_id: &str, now: i64) -> Result<(), AppError> {
+        let cached = self.cached_verdicts(&[eval_id.to_string()]).await?;
+        let mut v = match cached.get(eval_id) {
+            Some(c) => c.verdict.clone(),
+            None => VerdictDto {
+                id: eval_id.to_string(),
+                tier: "unrated".into(),
+                grade: None,
+                rank: None,
+                value: 0.0,
+                evidence: 0.0,
+                up: 0,
+                down: 0,
+                level: None,
+                reasons: Vec::new(),
+                recipe: SUPERSEDED_RECIPE.into(),
+                updated_at: None,
+            },
+        };
+        v.tier = "discount".into();
+        v.grade = Some(-2);
+        v.reasons = vec!["superseded".into()];
+        self.store_verdicts(&[v], now).await
     }
 
     /// 서버에서 받은 판정을 캐시에 쓴다 (같은 평가는 덮어쓴다)

@@ -97,6 +97,19 @@ export type VoteResult =
 	/** 연결이 없어 보관함에 남았다. 다음 flushOutbox가 보낸다 */
 	| { status: 'queued'; request_id: string }
 
+/** 신구 대체 보고: 새 평가(new)가 옛 평가(old)를 대체한다 (같은 장소 · 대상에서 수치 · 단위 · 형용사만 바뀜) */
+export interface SupersedeArgs {
+	old: string
+	new: string
+}
+
+/** 서버가 받았고, 옛 평가의 판정 캐시는 discount(grade -2, 이유 superseded)로 바뀌었다 */
+export interface SupersedeResult {
+	old: string
+	new: string
+	request_id: string
+}
+
 export interface LocalMatch {
 	request_id: string
 	local_id: string
@@ -314,6 +327,8 @@ export interface Commands {
 	flushOutbox(): Promise<FlushSummary>
 	/** 남의 평가에 추천(1) / 비추천(-1) / 철회(0). 보관함에 먼저 쓰고 바로 보낸다 */
 	vote(args: VoteArgs): Promise<VoteResult>
+	/** 신구 대체 보고. 연결이 없으면 offline 오류 (같은 보고를 다시 보내도 서버에는 한 번) */
+	supersede(args: SupersedeArgs): Promise<SupersedeResult>
 	/** 평가들의 전역 판정. 캐시가 10분보다 오래됐거나 refresh면 서버에 묻는다 */
 	verdicts(ids: string[], refresh?: boolean): Promise<VerdictsResult>
 	/** 로그인 상태. verify가 true면 서버에 물어 아직 유효한지 확인한다 (연결이 없으면 그대로 둔다) */
@@ -357,6 +372,7 @@ export function makeCommands(invoke: Invoke): Commands {
 		searchMerged: (args) => call('cmd_search_merged', args),
 		flushOutbox: () => call('cmd_flush_outbox'),
 		vote: (args) => call('cmd_vote', args),
+		supersede: (args) => call('cmd_supersede', args),
 		verdicts: (ids, refresh = false) => call('cmd_verdicts', { ids, refresh }),
 		session: (verify) => call('cmd_session', { verify }),
 		loginStart: () => call('cmd_login_start'),
