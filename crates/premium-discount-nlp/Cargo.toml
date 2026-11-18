@@ -47,3 +47,7 @@ required-features = ["stanza"]
 [[test]]
 name = "stanza_runtime"
 required-features = ["stanza"]
+
+[[test]]
+name = "stanza_dir"
+required-features = ["stanza"]

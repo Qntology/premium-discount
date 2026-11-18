@@ -456,8 +456,20 @@ pub fn is_installed(dir: &Path) -> bool {
     v.get("format").and_then(|x| x.as_i64()) == Some(2) && manifest_files(&v).iter().all(|f| dir.join(f).exists())
 }
 
-/// 언어 하나의 변환본 폴더 (없으면 Raon Zena 모델 폴더 아래 자리).
+/// 앱이 자기 폴더 규칙을 쓸 때 언어 → 변환본 폴더를 정하는 함수 ([`set_dir_resolver`]).
+static DIR_RESOLVER: std::sync::OnceLock<fn(&str) -> PathBuf> = std::sync::OnceLock::new();
+
+/// 언어 → 변환본 폴더 규칙을 앱이 정합니다 (예: logis-center 는 `LOGIS_STANZA_DIR` 또는 앱 폴더 · 평가 폴더 아래 `models/stanza/<lang>`).
+/// 프로세스에서 한 번만 정할 수 있고, 이미 정해져 있으면 false. 정하지 않으면 [`lang_dir`] 의 기본 규칙(모델 폴더들을 차례로 찾음)입니다.
+pub fn set_dir_resolver(resolve: fn(&str) -> PathBuf) -> bool {
+    DIR_RESOLVER.set(resolve).is_ok()
+}
+
+/// 언어 하나의 변환본 폴더: 앱이 정한 규칙([`set_dir_resolver`]), 없으면 모델 폴더들에서 찾고, 그래도 없으면 Raon Zena 모델 폴더 아래 자리.
 pub fn lang_dir(lang: &str) -> PathBuf {
+    if let Some(resolve) = DIR_RESOLVER.get() {
+        return resolve(lang);
+    }
     crate::models::stanza_dir(lang).unwrap_or_else(|| {
         crate::models::raon_models_dir()
             .unwrap_or_else(|| PathBuf::from("models"))

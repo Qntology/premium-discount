@@ -211,3 +211,30 @@ fn semantic_sanity() {
     assert!(paraphrase > 0.85, "paraphrase cosine {paraphrase}");
     assert!(paraphrase > unrelated + 0.02, "paraphrase {paraphrase} vs unrelated {unrelated}");
 }
+
+/// 벡터 덤프 (모델 필요): `PD_DUMP_TEXTS`(JSON 문자열 배열)의 문장마다 `embed` 와 `embed_batch` 벡터를 f32 little-endian 으로
+/// `PD_DUMP_OUT` · `PD_DUMP_OUT_BATCH` 에 씁니다 (줄마다 384개, 실패한 문장은 0 벡터). logis-center 의 `synthetic_eval::embed_dump`
+/// 와 같은 형식이라 두 구현의 코사인을 바로 견줄 수 있습니다. 토큰 수는 `PD_DUMP_OUT.tokens.json` 에.
+#[test]
+#[ignore = "PD_DUMP_TEXTS · PD_DUMP_OUT · PD_DUMP_OUT_BATCH 필요"]
+fn dump_vectors() {
+    let texts: Vec<String> = serde_json::from_str(&std::fs::read_to_string(std::env::var("PD_DUMP_TEXTS").expect("PD_DUMP_TEXTS")).unwrap()).unwrap();
+    let Some(g) = model() else { panic!("granite 모델 없음") };
+    let write = |path: &str, rows: &[Vec<f32>]| {
+        let mut flat = Vec::with_capacity(rows.len() * DIM * 4);
+        for r in rows {
+            for x in r {
+                flat.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        std::fs::write(path, flat).unwrap();
+    };
+    let single: Vec<Vec<f32>> = texts.iter().map(|t| g.embed(t).unwrap_or_else(|_| vec![0.0; DIM])).collect();
+    let refs: Vec<&str> = texts.iter().map(|t| t.as_str()).collect();
+    let batch = g.embed_batch(&refs).expect("embed_batch");
+    let tokens: Vec<usize> = texts.iter().map(|t| g.token_count(t).unwrap_or(0)).collect();
+    let out = std::env::var("PD_DUMP_OUT").expect("PD_DUMP_OUT");
+    write(&out, &single);
+    write(&std::env::var("PD_DUMP_OUT_BATCH").expect("PD_DUMP_OUT_BATCH"), &batch);
+    std::fs::write(format!("{out}.tokens.json"), serde_json::to_string(&tokens).unwrap()).unwrap();
+}

@@ -41,7 +41,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{Embedding, Linear, VarBuilder};
 use serde::Deserialize;
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
@@ -133,116 +133,180 @@ impl Config {
         Activation::parse(&self.hidden_activation)?;
         Ok(())
     }
+
+    fn encoder_config(&self) -> Result<EncoderConfig> {
+        Ok(EncoderConfig {
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            norm_eps: self.norm_eps,
+            activation: Activation::parse(&self.hidden_activation)?,
+            global_rope_theta: self.global_rope_theta,
+            local_rope_theta: self.local_rope_theta,
+            global_attn_every_n_layers: self.global_attn_every_n_layers,
+            local_window_half: self.local_attention / 2,
+            max_positions: MAX_TOKENS,
+        })
+    }
 }
 
 /// The MLP gate activation (`hidden_activation`; granite uses `silu`).
-#[derive(Debug, Clone, Copy)]
-enum Activation {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
     Silu,
     /// transformers' `gelu`, the exact erf form.
     Gelu,
 }
 
 impl Activation {
-    fn parse(name: &str) -> Result<Self> {
+    pub fn parse(name: &str) -> Result<Self> {
         match name {
             "silu" | "swish" => Ok(Self::Silu),
             "gelu" => Ok(Self::Gelu),
             other => bail!("granite: unsupported hidden_activation {other:?}"),
         }
     }
+}
 
-    fn apply(self, x: &Tensor) -> candle_core::Result<Tensor> {
-        match self {
-            Self::Silu => x.silu(),
-            Self::Gelu => x.gelu_erf(),
-        }
+/// The encoder's shape and attention layout, every value explicit. [`Granite::load`] fills it from `config.json` with
+/// transformers' `ModernBertConfig` defaults; an app that reads `config.json` with defaults of its own (logis-center's
+/// seeded mock model has no RoPE / window fields) builds it itself.
+#[derive(Debug, Clone)]
+pub struct EncoderConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub norm_eps: f64,
+    pub activation: Activation,
+    /// RoPE θ of the global layers (`layer % global_attn_every_n_layers == 0`).
+    pub global_rope_theta: f64,
+    /// RoPE θ of the local (sliding-window) layers.
+    pub local_rope_theta: f64,
+    pub global_attn_every_n_layers: usize,
+    /// How far a local layer sees: `local_attention / 2`; `usize::MAX / 2` for no window.
+    pub local_window_half: usize,
+    /// Positions in the RoPE tables (longest forward pass).
+    pub max_positions: usize,
+}
+
+/// Replacement for the MLP's `silu(x[.., :I]) * x[.., I:]` on whole `Wi` outputs ([`set_glu_kernel`]).
+pub type GluKernel = fn(&Tensor) -> candle_core::Result<Tensor>;
+
+static GLU_KERNEL: std::sync::OnceLock<GluKernel> = std::sync::OnceLock::new();
+
+/// Installs a faster implementation of the SiLU GLU (`silu(x[.., :I]) * x[.., I:]`). It must give the same bits as
+/// candle's `silu(gate) * up` — logis-center installs its multi-core CPU kernel (`embed-cpu-kernels`, which falls back
+/// to the candle ops off the CPU). Once per process; false when one is already installed.
+pub fn set_glu_kernel(kernel: GluKernel) -> bool {
+    GLU_KERNEL.set(kernel).is_ok()
+}
+
+/// `silu(x[.., :I]) * x[.., I:]` with candle ops (gate and up copied out first).
+pub fn silu_glu(x: &Tensor) -> candle_core::Result<Tensor> {
+    let i = x.dim(D::Minus1)? / 2;
+    let gate = x.narrow(D::Minus1, 0, i)?.contiguous()?;
+    let up = x.narrow(D::Minus1, i, i)?.contiguous()?;
+    (candle_nn::ops::silu(&gate)? * up)?.contiguous()
+}
+
+/// Softmax over the last axis. CPU F32 uses candle's fused `softmax_last_dim` (the same max · exp · sum · divide order
+/// as the composed ops, so the same bits, and much faster on long inputs); other devices keep the composed ops.
+fn softmax_last(x: &Tensor) -> candle_core::Result<Tensor> {
+    if x.device().is_cpu() && x.dtype() == DType::F32 && x.is_contiguous() {
+        candle_nn::ops::softmax_last_dim(x)
+    } else {
+        candle_nn::ops::softmax(x, D::Minus1)
     }
 }
 
-/// LayerNorm without bias. Two-pass mean / variance, like PyTorch (not the fused E[x²] − E[x]² kernel).
+/// LayerNorm without bias. Mean and variance in F32 whatever the weights' dtype (two-pass, like PyTorch — not the
+/// fused E[x²] − E[x]² kernel); the result goes back to the input dtype.
 struct LayerNorm {
-    weight: Tensor,
+    weight_f32: Tensor,
     eps: f64,
 }
 
 impl LayerNorm {
     fn load(dim: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<Self> {
         Ok(Self {
-            weight: vb.get(dim, "weight")?,
+            weight_f32: vb.get(dim, "weight")?.to_dtype(DType::F32)?,
             eps,
         })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
         let mean = x.mean_keepdim(D::Minus1)?;
         let centred = x.broadcast_sub(&mean)?;
         let var = centred.sqr()?.mean_keepdim(D::Minus1)?;
-        centred.broadcast_div(&(var + self.eps)?.sqrt()?)?.broadcast_mul(&self.weight)
+        let y = centred.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        y.broadcast_mul(&self.weight_f32)?.to_dtype(dtype)
     }
 }
 
-/// RoPE tables for positions `0..MAX_TOKENS`, `[MAX_TOKENS, head_dim / 2]` each (rotate-half layout).
+/// F32 RoPE tables `[max_positions, head_dim / 2]` (rotate-half layout): the angle is one F32 product
+/// `position × inv_freq`, `inv_freq = 1 / θ^(2i / head_dim)`. F32 also on GPUs whose weights are BF16 — BF16 cannot hold
+/// positions above 256 exactly.
 struct Rope {
     cos: Tensor,
     sin: Tensor,
-    /// candle-nn's fused kernel exists on CPU, CUDA, Metal and ROCm; elsewhere the same formula runs as tensor ops.
-    fused: bool,
 }
 
 impl Rope {
-    fn new(head_dim: usize, theta: f64, device: &Device) -> candle_core::Result<Self> {
-        let (cos, sin) = rope_tables(head_dim, theta, MAX_TOKENS);
-        let half = head_dim / 2;
+    fn new(head_dim: usize, max_positions: usize, theta: f64, device: &Device) -> candle_core::Result<Self> {
+        let inv_freq: Vec<f32> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1f32 / (theta.powf(i as f64 / head_dim as f64) as f32))
+            .collect();
+        let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
+        let t = Tensor::arange(0u32, max_positions as u32, device)?.to_dtype(DType::F32)?.unsqueeze(1)?;
+        let freqs = t.matmul(&inv_freq.unsqueeze(0)?)?;
         Ok(Self {
-            cos: Tensor::from_vec(cos, (MAX_TOKENS, half), device)?,
-            sin: Tensor::from_vec(sin, (MAX_TOKENS, half), device)?,
-            fused: device.is_cpu() || device.is_cuda() || device.is_metal() || device.is_rocm(),
+            cos: freqs.cos()?,
+            sin: freqs.sin()?,
         })
     }
 
-    /// `x` is `[batch, heads, len, head_dim]` and contiguous.
-    fn apply(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let len = x.dim(2)?;
+    /// `[1, 1, len, head_dim]` (cos, sin), built once per forward pass and shared by its layers.
+    fn cos_sin(&self, len: usize) -> candle_core::Result<(Tensor, Tensor)> {
         let cos = self.cos.narrow(0, 0, len)?;
         let sin = self.sin.narrow(0, 0, len)?;
-        if self.fused {
-            candle_nn::rotary_emb::rope(x, &cos, &sin)
-        } else {
-            candle_nn::rotary_emb::rope_slow(x, &cos, &sin)
+        let cos = Tensor::cat(&[&cos, &cos], D::Minus1)?;
+        let sin = Tensor::cat(&[&sin, &sin], D::Minus1)?;
+        Ok((
+            cos.unsqueeze(0)?.unsqueeze(0)?.contiguous()?,
+            sin.unsqueeze(0)?.unsqueeze(0)?.contiguous()?,
+        ))
+    }
+
+    /// `x · cos + rotate_half(x) · sin`, in the tables' dtype (F32), back to `x`'s dtype.
+    fn apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+        if x.dtype() != cos.dtype() {
+            return Self::apply(&x.to_dtype(cos.dtype())?, cos, sin)?.to_dtype(x.dtype());
         }
+        let half = x.dim(D::Minus1)? / 2;
+        let x1 = x.narrow(D::Minus1, 0, half)?.contiguous()?;
+        let x2 = x.narrow(D::Minus1, half, half)?.contiguous()?;
+        let rotated = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
+        x.contiguous()?.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?
     }
 }
 
-/// cos / sin of `position × inv_freq`, row-major `[len, head_dim / 2]`. Like transformers, `inv_freq` and the angle
-/// are F32 (`1 / θ^(2i / head_dim)`, then one F32 product); cos / sin of that F32 angle are rounded from F64.
-fn rope_tables(head_dim: usize, theta: f64, len: usize) -> (Vec<f32>, Vec<f32>) {
-    let inv_freq: Vec<f32> = (0..head_dim)
-        .step_by(2)
-        .map(|i| 1.0 / (theta as f32).powf(i as f32 / head_dim as f32))
-        .collect();
-    let mut cos = Vec::with_capacity(len * inv_freq.len());
-    let mut sin = Vec::with_capacity(len * inv_freq.len());
-    for pos in 0..len {
-        for f in &inv_freq {
-            let angle = f64::from(pos as f32 * f);
-            cos.push(angle.cos() as f32);
-            sin.push(angle.sin() as f32);
-        }
-    }
-    (cos, sin)
-}
-
-/// Additive sliding-window mask `[1, 1, len, len]`: 0 where `|i − j| ≤ half`, [`MASKED`] elsewhere.
+/// Additive sliding-window mask `[1, 1, len, len]` in `dtype`: 0 where `|i − j| ≤ half`, [`MASKED`] elsewhere.
 /// `None` when the window covers the whole sequence.
-fn window_mask(len: usize, half: usize, device: &Device) -> candle_core::Result<Option<Tensor>> {
-    if len <= half + 1 {
+fn window_mask(len: usize, half: usize, device: &Device, dtype: DType) -> candle_core::Result<Option<Tensor>> {
+    if len <= half.saturating_add(1) {
         return Ok(None);
     }
     let mask: Vec<f32> = (0..len)
         .flat_map(|i| (0..len).map(move |j| if i.abs_diff(j) > half { MASKED } else { 0.0 }))
         .collect();
-    Tensor::from_vec(mask, (1, 1, len, len), device).map(Some)
+    Tensor::from_vec(mask, (1, 1, len, len), device)?.to_dtype(dtype).map(Some)
 }
 
 struct Attention {
@@ -253,7 +317,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(cfg: &Config, vb: VarBuilder) -> candle_core::Result<Self> {
+    fn load(cfg: &EncoderConfig, vb: VarBuilder) -> candle_core::Result<Self> {
         let h = cfg.hidden_size;
         Ok(Self {
             wqkv: candle_nn::linear_no_bias(h, 3 * h, vb.pp("Wqkv"))?,
@@ -264,21 +328,26 @@ impl Attention {
     }
 
     /// `x` is `[batch, len, hidden]`; `mask` is additive and broadcasts to `[batch, heads, len, len]`.
-    fn forward(&self, x: &Tensor, rope: &Rope, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
-        let (b, len, hidden) = x.dims3()?;
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        let (b, len, _) = x.dims3()?;
+        // [b, len, 3H] seen as [b, len, 3, heads, hd] (no copy); q / k / v each copied once to [b, heads, len, hd]
         let qkv = self.wqkv.forward(x)?.reshape((b, len, 3, self.heads, self.head_dim))?;
-        // [batch, len, heads, head_dim] → [batch, heads, len, head_dim]
-        let part = |i: usize| qkv.i((.., .., i))?.transpose(1, 2)?.contiguous();
-        let q = rope.apply(&part(0)?)?;
-        let k = rope.apply(&part(1)?)?;
-        let v = part(2)?;
-        let scores = (q.matmul(&k.t()?)? * (self.head_dim as f64).powf(-0.5))?;
+        let part = |i: usize| -> candle_core::Result<Tensor> { qkv.narrow(2, i, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous() };
+        let (q, k, v) = (part(0)?, part(1)?, part(2)?);
+        let q = Rope::apply(&q, cos, sin)?.contiguous()?;
+        let k = Rope::apply(&k, cos, sin)?.transpose(2, 3)?.contiguous()?;
+        let scores = (q.matmul(&k)? / (self.head_dim as f64).sqrt())?;
         let scores = match mask {
             Some(m) => scores.broadcast_add(m)?,
             None => scores,
         };
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let y = probs.matmul(&v)?.transpose(1, 2)?.reshape((b, len, hidden))?;
+        let probs = softmax_last(&scores)?;
+        let y = probs
+            .contiguous()?
+            .matmul(&v.contiguous()?)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, len, self.heads * self.head_dim))?;
         self.wo.forward(&y)
     }
 }
@@ -287,26 +356,34 @@ struct Mlp {
     wi: Linear,
     wo: Linear,
     act: Activation,
-    inner: usize,
 }
 
 impl Mlp {
-    fn load(cfg: &Config, act: Activation, vb: VarBuilder) -> candle_core::Result<Self> {
+    fn load(cfg: &EncoderConfig, vb: VarBuilder) -> candle_core::Result<Self> {
         let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
         Ok(Self {
             wi: candle_nn::linear_no_bias(h, 2 * i, vb.pp("Wi"))?,
             wo: candle_nn::linear_no_bias(i, h, vb.pp("Wo"))?,
-            act,
-            inner: i,
+            act: cfg.activation,
         })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let wi = self.wi.forward(x)?;
         // transformers: `input, gate = Wi(x).chunk(2)`; `Wo(act(input) * gate)`
-        let input = wi.narrow(D::Minus1, 0, self.inner)?;
-        let gate = wi.narrow(D::Minus1, self.inner, self.inner)?;
-        self.wo.forward(&(self.act.apply(&input)? * gate)?)
+        let glu = match self.act {
+            Activation::Silu => match GLU_KERNEL.get() {
+                Some(kernel) => kernel(&wi)?,
+                None => silu_glu(&wi)?,
+            },
+            Activation::Gelu => {
+                let i = wi.dim(D::Minus1)? / 2;
+                let input = wi.narrow(D::Minus1, 0, i)?.contiguous()?;
+                let gate = wi.narrow(D::Minus1, i, i)?.contiguous()?;
+                (input.gelu_erf()? * gate)?.contiguous()?
+            }
+        };
+        self.wo.forward(&glu)
     }
 }
 
@@ -319,7 +396,13 @@ struct Layer {
     global: bool,
 }
 
-struct Encoder {
+/// The ModernBERT encoder of granite-embedding-97m-multilingual-r2 — the one forward pass premium-discount, Raon Zena
+/// and logis-center share (logis-center's `ForwardMode::Exact`, op for op, so its vectors, text caches and per-text /
+/// batch bit identity stay as they were).
+///
+/// Weights come in the [`VarBuilder`]'s dtype (F32 on CPU; logis-center uses BF16 on CUDA / ROCm); LayerNorm and RoPE run
+/// in F32 either way.
+pub struct Encoder {
     tok_embeddings: Embedding,
     embeddings_norm: LayerNorm,
     layers: Vec<Layer>,
@@ -327,12 +410,14 @@ struct Encoder {
     global_rope: Rope,
     local_rope: Rope,
     window_half: usize,
+    hidden_size: usize,
 }
 
 impl Encoder {
-    fn load(cfg: &Config, act: Activation, vb: VarBuilder, device: &Device) -> candle_core::Result<Self> {
+    pub fn load(cfg: &EncoderConfig, vb: VarBuilder, device: &Device) -> candle_core::Result<Self> {
         let (h, eps) = (cfg.hidden_size, cfg.norm_eps);
         let head_dim = h / cfg.num_attention_heads;
+        let every_n = cfg.global_attn_every_n_layers.max(1);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let vb = vb.pp(format!("layers.{i}"));
@@ -344,8 +429,8 @@ impl Encoder {
                 },
                 attn: Attention::load(cfg, vb.pp("attn"))?,
                 mlp_norm: LayerNorm::load(h, eps, vb.pp("mlp_norm"))?,
-                mlp: Mlp::load(cfg, act, vb.pp("mlp"))?,
-                global: i % cfg.global_attn_every_n_layers == 0,
+                mlp: Mlp::load(cfg, vb.pp("mlp"))?,
+                global: i % every_n == 0,
             });
         }
         Ok(Self {
@@ -353,37 +438,44 @@ impl Encoder {
             embeddings_norm: LayerNorm::load(h, eps, vb.pp("embeddings.norm"))?,
             layers,
             final_norm: LayerNorm::load(h, eps, vb.pp("final_norm"))?,
-            global_rope: Rope::new(head_dim, cfg.global_rope_theta, device)?,
-            local_rope: Rope::new(head_dim, cfg.local_rope_theta, device)?,
-            window_half: cfg.local_attention / 2,
+            global_rope: Rope::new(head_dim, cfg.max_positions, cfg.global_rope_theta, device)?,
+            local_rope: Rope::new(head_dim, cfg.max_positions, cfg.local_rope_theta, device)?,
+            window_half: cfg.local_window_half,
+            hidden_size: h,
         })
     }
 
-    /// `ids` is `[batch, len]`; `pad_mask` (additive, `[batch, 1, 1, len]`) hides padded keys.
-    /// Returns the final-normed [CLS] rows, `[batch, hidden]`.
-    fn forward_cls(&self, ids: &Tensor, pad_mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
-        let (_, len) = ids.dims2()?;
-        let mut x = self.embeddings_norm.forward(&self.tok_embeddings.forward(ids)?)?;
-        let local_mask = match (pad_mask, window_mask(len, self.window_half, ids.device())?) {
-            (Some(p), Some(w)) => Some(p.broadcast_add(&w)?),
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Final-normed hidden states `[batch, len, hidden]` for `ids` = `[batch · len]` (row-major) or `[batch, len]`.
+    /// `mask` is additive (`[batch, 1, 1, len]`: 0 for real keys, [`MASKED`] or −∞ for padding); `None` = no padding.
+    /// One row without a mask is exactly the single-text pass.
+    pub fn forward_batch(&self, ids: &Tensor, batch: usize, len: usize, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        let x = self.tok_embeddings.forward(ids)?.reshape((batch, len, ()))?;
+        let mut x = self.embeddings_norm.forward(&x)?;
+        let (cg, sg) = self.global_rope.cos_sin(len)?;
+        let (cl, sl) = self.local_rope.cos_sin(len)?;
+        let local_mask = match (mask, window_mask(len, self.window_half, x.device(), x.dtype())?) {
+            (Some(m), Some(w)) => Some(m.broadcast_add(&w)?),
             (None, w) => w,
-            (p, None) => p.cloned(),
+            (m, None) => m.cloned(),
         };
         for layer in &self.layers {
-            let (rope, mask) = if layer.global {
-                (&self.global_rope, pad_mask)
+            let (c, s, m) = if layer.global {
+                (&cg, &sg, mask)
             } else {
-                (&self.local_rope, local_mask.as_ref())
+                (&cl, &sl, local_mask.as_ref())
             };
             let h = match &layer.attn_norm {
                 Some(norm) => norm.forward(&x)?,
                 None => x.clone(),
             };
-            x = (&x + layer.attn.forward(&h, rope, mask)?)?;
+            x = (&x + layer.attn.forward(&h, c, s, m)?)?;
             x = (&x + layer.mlp.forward(&layer.mlp_norm.forward(&x)?)?)?;
         }
-        // LayerNorm works per token, so normalising only the pooled row is exact.
-        self.final_norm.forward(&x.i((.., 0, ..))?)
+        self.final_norm.forward(&x)
     }
 }
 
@@ -419,7 +511,7 @@ impl Granite {
         )
         .with_context(|| format!("granite: parsing {}", config_path.display()))?;
         cfg.validate()?;
-        let act = Activation::parse(&cfg.hidden_activation)?;
+        let enc_cfg = cfg.encoder_config()?;
 
         let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("granite: loading {}: {e}", tokenizer_path.display()))?;
@@ -443,7 +535,7 @@ impl Granite {
         // tensors below; nothing writes to the model folder meanwhile.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights_path], DType::F32, device) }
             .with_context(|| format!("granite: mapping {}", weights_path.display()))?;
-        let encoder = Encoder::load(&cfg, act, vb, device).with_context(|| format!("granite: loading weights from {}", dir.display()))?;
+        let encoder = Encoder::load(&enc_cfg, vb, device).with_context(|| format!("granite: loading weights from {}", dir.display()))?;
         Ok(Granite {
             tokenizer,
             encoder,
@@ -523,23 +615,57 @@ impl Granite {
             mask.resize(mask.len() + r.len(), 0f32);
             mask.resize(mask.len() + len - r.len(), MASKED);
         }
-        let ids = Tensor::from_vec(ids, (b, len), &self.device)?;
+        let ids = Tensor::from_vec(ids, b * len, &self.device)?;
         let pad_mask = if rows.iter().any(|r| r.len() < len) {
             Some(Tensor::from_vec(mask, (b, 1, 1, len), &self.device)?)
         } else {
             None
         };
-        let cls = self.encoder.forward_cls(&ids, pad_mask.as_ref())?;
-        let cls = cls.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-        Ok(cls.into_iter().map(l2_normalize).collect())
+        let hidden = self.encoder.forward_batch(&ids, b, len, pad_mask.as_ref())?;
+        (0..b).map(|r| cls_vector(&hidden, r)).collect()
     }
 }
 
-/// `v / max(‖v‖, 1e-12)` (sentence-transformers' `Normalize`), so a zero vector stays zero instead of NaN.
-fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
-    let norm = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt().max(1e-12) as f32;
-    v.iter_mut().for_each(|x| *x /= norm);
-    v
+/// The normalised [CLS] vector of row `row` of `hidden` (`[batch, len, hidden]`), with logis-center's arithmetic so
+/// both apps give the same bits for a text: on the device `v / ‖v‖` (‖v‖ = `sqrt(sum(v²))`), then on the host the
+/// F32 vector is normalised once more (a vector shorter than 1e-6 is left as it is).
+pub fn cls_vector(hidden: &Tensor, row: usize) -> Result<Vec<f32>> {
+    let cls = hidden.narrow(0, row, 1)?.narrow(1, 0, 1)?;
+    let mean = (cls.sum(1)? / 1.0)?;
+    let norm = mean.sqr()?.sum_all()?.sqrt()?;
+    let v: Vec<f32> = mean
+        .broadcast_div(&norm)?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1()?;
+    Ok(renormalize(&[v.as_slice()]))
+}
+
+/// Mean of `parts`, L2-normalised in F32 (logis-center's way of joining the pieces of a long text; one part is just
+/// renormalised). A result shorter than 1e-6 is left unnormalised.
+pub fn renormalize(parts: &[&[f32]]) -> Vec<f32> {
+    let dim = parts.first().map_or(0, |p| p.len());
+    let mut acc = vec![0.0f32; dim];
+    let mut count = 0.0f32;
+    for p in parts {
+        for (a, x) in acc.iter_mut().zip(p.iter()) {
+            *a += x;
+        }
+        count += 1.0;
+    }
+    if count > 0.0 {
+        for a in acc.iter_mut() {
+            *a /= count;
+        }
+        let norm = acc.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 1e-6 {
+            for a in acc.iter_mut() {
+                *a /= norm;
+            }
+        }
+    }
+    acc
 }
 
 /// Splits row indices into forward passes: rows sorted by length (stable), neighbours packed while
@@ -591,8 +717,9 @@ mod tests {
 
     #[test]
     fn window_mask_hides_tokens_beyond_half_the_window() {
-        assert!(window_mask(65, 64, &Device::Cpu).unwrap().is_none(), "distance ≤ 64 everywhere");
-        let m = window_mask(70, 64, &Device::Cpu).unwrap().unwrap();
+        assert!(window_mask(65, 64, &Device::Cpu, DType::F32).unwrap().is_none(), "distance ≤ 64 everywhere");
+        assert!(window_mask(8192, usize::MAX / 2, &Device::Cpu, DType::F32).unwrap().is_none(), "no window");
+        let m = window_mask(70, 64, &Device::Cpu, DType::F32).unwrap().unwrap();
         assert_eq!(m.dims(), &[1, 1, 70, 70]);
         let m = m.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let at = |i: usize, j: usize| m[i * 70 + j];
@@ -605,7 +732,9 @@ mod tests {
 
     #[test]
     fn rope_tables_start_at_identity_and_follow_the_formula() {
-        let (cos, sin) = rope_tables(32, 160_000.0, 4);
+        let rope = Rope::new(32, 4, 160_000.0, &Device::Cpu).unwrap();
+        let cos = rope.cos.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let sin = rope.sin.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(cos.len(), 4 * 16);
         assert!(cos[..16].iter().all(|&c| c == 1.0) && sin[..16].iter().all(|&s| s == 0.0));
         // position 3, frequency index 1: θ^(−2/32)
@@ -615,21 +744,32 @@ mod tests {
     }
 
     #[test]
-    fn rope_tensor_op_fallback_matches_the_fused_kernel() {
-        let rope = Rope::new(32, 160_000.0, &Device::Cpu).unwrap();
-        assert!(rope.fused);
+    fn rope_rotation_matches_candles_rotate_half_formula() {
+        let rope = Rope::new(32, 70, 160_000.0, &Device::Cpu).unwrap();
         let x = Tensor::randn(0f32, 1.0, (2, 3, 70, 32), &Device::Cpu).unwrap();
-        let fused = rope.apply(&x).unwrap();
-        let slow = Rope { fused: false, ..rope }.apply(&x).unwrap();
-        let diff = (fused - slow).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap();
+        let (cos, sin) = rope.cos_sin(70).unwrap();
+        let ours = Rope::apply(&x, &cos, &sin).unwrap();
+        let reference = candle_nn::rotary_emb::rope_slow(&x, &rope.cos, &rope.sin).unwrap();
+        let diff = (ours - reference).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap();
         assert!(diff.to_scalar::<f32>().unwrap() < 1e-6);
     }
 
     #[test]
-    fn l2_normalize_gives_unit_vectors_and_keeps_zero() {
-        let v = l2_normalize(vec![3.0, 4.0]);
+    fn renormalize_gives_unit_vectors_averages_parts_and_keeps_zero() {
+        let v = renormalize(&[&[3.0, 4.0]]);
         assert!((v[0] - 0.6).abs() < 1e-7 && (v[1] - 0.8).abs() < 1e-7);
-        assert_eq!(l2_normalize(vec![0.0; 4]), vec![0.0; 4]);
+        let m = renormalize(&[&[1.0, 0.0], &[0.0, 1.0]]);
+        assert!((m[0] - m[1]).abs() < 1e-7 && (m[0] * m[0] + m[1] * m[1] - 1.0).abs() < 1e-6);
+        assert_eq!(renormalize(&[&[0.0; 4]]), vec![0.0; 4]);
+        assert!(renormalize(&[]).is_empty());
+    }
+
+    #[test]
+    fn silu_glu_is_silu_of_the_first_half_times_the_second() {
+        let x = Tensor::new(&[[1f32, -2.0, 3.0, 0.5]], &Device::Cpu).unwrap();
+        let y = silu_glu(&x).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        assert!((y[0] - silu(1.0) * 3.0).abs() < 1e-6 && (y[1] - silu(-2.0) * 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -649,5 +789,8 @@ mod tests {
         assert!(biased.validate().is_err());
         let wide: Config = serde_json::from_str(&json.replace(r#""hidden_size": 384"#, r#""hidden_size": 768"#)).unwrap();
         assert!(wide.validate().is_err());
+        let enc = cfg.encoder_config().unwrap();
+        assert_eq!((enc.activation, enc.global_attn_every_n_layers, enc.local_window_half), (Activation::Silu, 3, 64));
+        assert_eq!((enc.global_rope_theta, enc.local_rope_theta, enc.max_positions), (150_000.0, 160_000.0, MAX_TOKENS));
     }
 }
