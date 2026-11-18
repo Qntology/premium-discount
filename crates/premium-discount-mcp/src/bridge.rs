@@ -33,7 +33,7 @@ pub fn timeout_for(cmd: &str) -> Duration {
     }
 }
 
-/// premium-discount-app's settings (`app/src/main.rs`), passed as `PD_*` environment variables.
+/// premium-discount-app's settings (`apps/core/src/main.rs`), passed as `PD_*` environment variables.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub program: PathBuf,

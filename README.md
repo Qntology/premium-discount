@@ -9,11 +9,31 @@
 
 ## 1. 폴더 구성
 
+> **2026-11-19 갱신 (26절)**: logis-center 와 같은 배치로 옮겼습니다. 이 아래 2 ~ 25절은 그때의 경로(`app/` · `app/ui` · `app/src-tauri` ·
+> `www/` · `cron/` · `crates/` 따로 빌드)로 적은 기록이라 그대로 두었습니다. 옛 경로 → 새 경로는 26-1 의 표를 보세요.
+
+| 폴더 | 역할 | 기술 |
+|---|---|---|
+| `Cargo.toml` · `Cargo.lock` · `.cargo/config.toml` | 루트 작업 공간 하나 (`crates/*` + `apps/core` + `apps/desktop`), 산출물은 루트 `target/` | Rust |
+| `apps/core` | 헤드리스 코어 `premium-discount-app` (LanceDB 저장소 · 모델 · 동기화 · `serve_lines`, Tauri 없음) | Rust |
+| `apps/desktop` | 데스크톱 · 모바일 셸 `premium-discount-desktop` (Tauri v2, Android `gen/android`, 사이드카) | Rust + Tauri |
+| `crates/` | 공용 라이브러리 `premium-discount-*` 17개 + `onnxruntime` · `onnxruntime-sys` (raon-zena · logis-center 가 git 리비전으로 씀) | Rust |
+| `web/desktop` | 앱 웹뷰 화면 (esbuild, `npm test`) | TypeScript |
+| `web/www` | www Worker 가 싣는 정적 파일 (`assets`) | JS · CSS |
+| `workers/www` | 평가 확인 서비스 Worker (`wrangler.json` · `wrangler.test.json`) | Cloudflare Workers (TypeScript) |
+| `workers/cron` | 대기열 · 판정 · 지갑 기록 정리 cron Worker | Cloudflare Workers (TypeScript) |
+| `workers/migrations` | D1 마이그레이션 (www 의 `DB` 바인딩 `migrations_dir`, Node 시험의 가짜 D1 도 이것을 적용) | SQL |
+| `contracts/` · `test-support/` | 언어 사이 계약 사례 · Node 시험 도우미 | JSON · Python · JS |
+
+<details><summary>처음(2026-10) 폴더 구성</summary>
+
 | 폴더 | 역할 | 기술 | 상태 |
 |---|---|---|---|
 | `app/` | 평가 생성 클라이언트 (욕설 필터, 질문 입력) | Rust + Tauri | **비어 있음** (신규 개발 대상) |
 | `www/` | 평가 확인 서비스 (Worker, 웹 UI) | Cloudflare Workers (TypeScript) | 기존 items/pages/tasks 로직 존재, 평가 기능 미구현 |
 | `cron/` | 임시 스케줄러 Worker (1분마다 `tasks` 처리) | Cloudflare Workers (cron) | 임시 코드, **수정 대상 아님** |
+
+</details>
 
 ---
 
@@ -1603,3 +1623,87 @@ BLOB 코덱의 세 결함(50 바이트 이하 base64 gzip · `subarray` 오프�
 | 앱 `cargo test --lib` · 통합 | 241 통과 (`cmd_supersede` 1, UI 계약 22개 명령) |
 | 화면 `app/ui` 계약 · 사이드카 `node --test app/src-tauri/sidecars.test.mjs` | 4 · 4 통과 |
 | src-tauri `cargo check` | 기본 설정 · 사이드카 설정 통과 |
+
+## 26. 폴더 재배치: logis-center 와 같은 배치 (2026-11-19)
+
+자리와 연결만 바꿨습니다. 동작 · 계약 값 · 의존성 판(아래 26-3 의 통일 26개 빼고)은 그대로이고, TypeScript Worker 를 Rust 로 옮기는 일은 다음 단계입니다.
+파일은 `git mv` 로 옮겼고(첫 커밋은 옮기기만, 내용 그대로), 연결은 둘째 커밋에서 고쳤습니다.
+
+### 26-1. 옛 경로 → 새 경로
+
+| 옛 경로 | 새 경로 | 비고 |
+| --- | --- | --- |
+| `crates/Cargo.toml` · `app/Cargo.toml` · `app/src-tauri/Cargo.toml` (작업 공간 셋, `Cargo.lock` 셋) | 루트 `Cargo.toml` · `Cargo.lock` 하나 | 멤버: `crates/*` 19개 + `apps/core` + `apps/desktop` |
+| `app/src-tauri/.cargo/config.toml` (`target-dir = "../target"`) | 루트 `.cargo/config.toml` (`target-dir = "target"`) | 산출물은 루트 `target/` 하나 |
+| `app/` (`src` · `tests` · `examples` · `README.md`) | `apps/core` | `premium-discount-app` |
+| `app/src-tauri` | `apps/desktop` | `premium-discount-desktop`, `gen/android` 포함 |
+| `app/ui` | `web/desktop` | |
+| `www/public` | `web/www` | www Worker 의 `assets.directory` |
+| `www` | `workers/www` | `src` · `tests` · `package.json` · `wrangler*.json` · `tsconfig.json` · `worker-configuration.d.ts` |
+| `cron` | `workers/cron` | |
+| `www/migrations` | `workers/migrations` | www 의 `DB` 바인딩 `migrations_dir: "../migrations"`. cron 의 wrangler 는 마이그레이션을 쓰지 않아 그대로 |
+| `crates/` · `contracts/` · `test-support/` | 그대로 | |
+
+옛 빌드 폴더 `app/target`(14 GB) · `crates/target`(12 GB)은 지우지 않았습니다(무시되는 폴더). 새 빌드는 루트 `target/` 에 처음부터 생깁니다.
+
+### 26-2. 연결을 고친 곳
+
+- **Cargo**: `[workspace.dependencies]` 의 내부 crate 경로에 `crates/` 를 붙이고 `premium-discount-app = { path = "apps/core" }` 를 더했습니다. 코어의 내부 crate
+  의존 5개와 셸의 코어 의존은 `workspace = true` 로 바꿨고(같은 경로), 바깥 의존성의 판 · 기능은 각 매니페스트에 그대로 둡니다. 멤버는 글롭(`crates/*`) 대신
+  하나씩 적습니다: `crates/target` 처럼 `Cargo.toml` 없는 폴더가 있으면 글롭이 작업 공간을 깨뜨립니다.
+- **`[patch.crates-io]`**: 세 매니페스트의 candle 포크 줄(`ebaf93d`, candle-core · candle-nn)이 같은 값이라 루트 하나로 합쳤습니다.
+- **프로필**: 키가 겹치지 않아 합집합입니다. `[profile.dev] debug = 0` 과 `gemm-common` · `gemm-f16` opt 3(옛 app · src-tauri)이 이제 crates 의 디버그 빌드에도,
+  `candle-core` · `candle-nn` · `gemm` · `k256` · `elliptic-curve` · `crypto-bigint` · `tiny-keccak` opt 3(옛 crates)이 이제 앱의 디버그 빌드에도 걸립니다.
+- **Tauri**: `frontendDist` = `../../web/desktop/dist`. Tauri CLI 는 앞 명령(`beforeBuildCommand`)을 화면 폴더에서 돌리고, `apps/desktop` 아래에 `package.json` 이
+  없으면 그 폴더는 `tauri.conf.json` 폴더의 부모(`apps/`)라서 명령을 `npm --prefix ../web/desktop …` · `node desktop/sidecars.mjs` 로 적었습니다(전에는 `app/` 기준
+  `npm --prefix ui …` · `node src-tauri/sidecars.mjs`). `cargo tauri …` 는 전처럼 셸 폴더(`apps/desktop`)에서 부릅니다.
+- **사이드카(`sidecars.mjs`)**: 두 사이드카를 루트 `Cargo.toml` 로 빌드하고 루트 `target/[삼중항/]release` 에서 찾습니다(전에는 `app/target` · `crates/target`).
+  `sidecars.test.mjs` 는 가짜 빌드 자리를 작업 공간 하나로 바꾸고, 넘긴 매니페스트가 루트 `Cargo.toml` 인지도 봅니다.
+- **wrangler**: `assets.directory` = `../../web/www/`, `DB` 의 `migrations_dir` = `../migrations` (`wrangler.json` · `wrangler.test.json`).
+- **컴파일 시점 경로**: 코어의 `include_str!`(명령 계약 · 캐시 행 픽스처 → `../../../web/desktop/fixtures/…`), `premium-discount-schema` 계약 시험
+  (`../../../web/desktop/fixtures/command_contract.json`).
+- **Node 시험 · 스크립트**: `workers/{www,cron}` 시험의 `test-support` · `contracts` 경로(한 단계 더 위), `tracker.test.ts` 의 수집 스크립트(`web/www`),
+  `test-support/fakes.ts` 의 마이그레이션(`workers/migrations`), `gen_stage_cases.mjs` 의 `stage.ts`, 계약 생성기의 `workers/www/node_modules`,
+  화면 개발 브리지의 기본 실행 파일(`../../target/release`), E2E 스크립트의 `dev-server.mjs` · `jsQR` · `mock_server.py` 의 `contracts` 경로.
+- **문서 · 주석**: 저장소 루트 기준 경로(`app/…` · `www/…` · `cron/…`)를 새 경로로 바꿨습니다. 이 README 의 2 ~ 25절과 `apps/core/tests/SCENARIOS.md` 의 옛 기록은 두었습니다.
+- **바꾸지 않은 것**: `contracts/*.json`(raon-zena 가 `verdict_v1.json` 의 해시를 봅니다. `analytic_pug_v1.json` 의 note 는 옛 경로 `www/public/…` 그대로),
+  이미 적용된 `workers/migrations/*.sql` 의 주석, `web/desktop/fixtures/*.json`(Rust · 화면 시험이 함께 읽는 픽스처).
+
+### 26-3. Cargo.lock 합치기
+
+옛 세 잠금 파일의 항목을 합쳐 씨앗으로 두고 `cargo metadata` 로 정리했습니다. 새로 고른 판은 없고(모든 항목이 옛 잠금 셋 중 하나에 있음), 한 작업 공간에는
+semver 호환 판이 하나뿐이라 26개 이름이 한 판으로 모였습니다. 대부분 높은 쪽(옛 crates 쪽)이고, `crypto-common 0.1.7` 이 `generic-array =0.14.7` 을 고정해
+`generic-array` 만 낮은 쪽입니다.
+
+| 이름 | 옛 crates | 옛 app · src-tauri | 지금 |
+| --- | --- | --- | --- |
+| candle-kernels | 0.11.0 | 0.11.1 | 0.11.1 |
+| libloading (0.9) | 0.9.0 | app 0.9.0 · src-tauri 0.9.1 | 0.9.1 |
+| crypto-common | 0.1.6 | 0.1.7 | 0.1.7 |
+| generic-array | 0.14.9 | 0.14.7 | 0.14.7 |
+| cc · crc32fast · equivalent · errno · find-msvc-tools · flate2 · itoa · libc · log · memmap2 · rustls · rustls-pki-types · rustls-webpki · smallvec · syn(3) · typed-path · unicode-ident · unicode-width(0.2) · utf8_iter · webpki-roots(1) · zerocopy · zerocopy-derive | 높은 판 | 낮은 판 (예: cc 1.8.0, syn 3.0.7) | 옛 crates 의 판 (cc 1.11.2, syn 3.0.10 …) |
+
+그대로인 것: candle-core · candle-nn(포크 `ebaf93d`), candle-metal-kernels 0.11.1, lancedb 0.41.0, lance 14.0.2, arrow 58.4.1, datafusion 54.1.0, tauri 2.12.5,
+wry 0.57.2, tokenizers 0.22.2, safetensors 0.8.0 · 0.4.5, half 2.7.1, tokio 1.53.2, reqwest 0.12.28 · 0.13.5, onnxruntime · onnxruntime-sys 0.0.14(경로).
+
+### 26-4. 검증
+
+모두 옮기기 전(옛 배치)과 뒤(새 배치)에 같은 PC 에서 돌려 견줬습니다.
+
+| 묶음 | 옮기기 전 | 옮긴 뒤 |
+| --- | --- | --- |
+| www (`node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts`) | 98 통과 | 98 통과 (시험 이름 같음) |
+| cron (같은 명령, `workers/cron/test/*.test.ts`) | 41 통과 | 41 통과 |
+| 화면 (`cd web/desktop && npm test`) | 71 통과 | 71 통과 |
+| 사이드카 (`node --test apps/desktop/sidecars.test.mjs`) | 4 통과 | 4 통과 |
+| 라이브러리 crate (`cargo test --workspace --exclude premium-discount-app --exclude premium-discount-desktop -j 2`, 전에는 `cd crates && cargo test --workspace -j 2`) | 279 통과 · 3 무시 (시험 실행 파일 49) | 279 통과 · 3 무시, 시험마다 결과 같음 |
+| `cargo metadata` | — | 성공, 멤버 21 |
+| `cargo check --workspace --all-targets --keep-going -j 2` | — | 실패 2건, 둘 다 옮기기와 무관한 기존 결함: `onnxruntime-sys` 의 lib test(`[lib] test = false` 인데 `--all-targets` 가 강제로 묶음, bindgen 레이아웃 시험의 `deref_nullptr`) · `apps/core/examples/quant_probe.rs`(`LoadOptions` 에 `tower_bits` 가 빠짐, 파일은 내용 그대로 옮김). 나머지 대상은 모두 통과 |
+| `cargo check -p premium-discount-desktop --all-targets -j 2` | — | 통과 (`frontendDist` 확인). `TAURI_CONFIG` 로 사이드카 설정을 넣어도 통과하고, tauri-build 가 `apps/desktop/binaries/*` 를 루트 `target/debug` 로 복사 |
+| `tsc` (workers/www · workers/cron) | www 96 오류(레거시 `index.ts` 등) · cron 0 | 같음 (경로만 다름) |
+| `wrangler deploy --dry-run` (www · www 시험 설정 · cron) | 정적 파일 15개, 묶음 1043.27 KiB | 정적 파일 15개(`web/www`), 묶인 `index.js` 세 개 모두 바이트 같음 |
+| `wrangler d1 migrations list DB --local` | 0001 ~ 0009 | 0001 ~ 0009 (`workers/migrations`) |
+| 생성기 (`gen_wallet_v1.mjs` · `gen_analytic_blob_v1.mjs` · `gen_stage_cases.mjs`) | — | 계약 파일 그대로, `stage_cases.json` 은 note 의 경로 한 줄만 다름 |
+
+앱 코어 단위 시험(`cargo test -p premium-discount-app --lib`)은 이번에 돌리지 않았습니다. 디스크 여유가 5 GB 이고 앱 디버그 시험 빌드는 7 GB 남짓이라서입니다
+(옛 `app/target` 14 GB · `crates/target` 12 GB 는 지우지 않음). 코어의 lib · 시험 · 예제(quant_probe 빼고)는 위 `cargo check` 로 컴파일을 확인했습니다.

@@ -138,7 +138,7 @@ async function save(env: Env, row: QueueRow): Promise<void> {
 		.bind(row.id, row.from, row.to, row.cc, row.bcc ?? null, row.ref, row.root, row.created_at, row.request_id)
 		.run()
 
-	// 메타데이터 규칙은 www/src/evaluations.ts의 vectorMetadata와 같아야 한다 (cc·root 항상, to·ref는 값이 있을 때만)
+	// 메타데이터 규칙은 workers/www/src/evaluations.ts의 vectorMetadata와 같아야 한다 (cc·root 항상, to·ref는 값이 있을 때만)
 	const metadata: Record<string, string> = { cc: row.cc, root: row.root }
 	if (row.to) metadata.to = row.to
 	if (row.ref) metadata.ref = row.ref
@@ -278,7 +278,7 @@ interface JudgeRow {
 	value: number
 	tier: Tier
 	tier_since: number
-	// 새 평가가 이 평가를 대체했다 (eval_supersedes, www/migrations/0009): 판정 입력 superseded. 1 | 0
+	// 새 평가가 이 평가를 대체했다 (eval_supersedes, workers/migrations/0009): 판정 입력 superseded. 1 | 0
 	superseded: number
 }
 

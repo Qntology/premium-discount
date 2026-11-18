@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
 // S3는 globalThis.fetch를 바꿔서 흉내 낸다. 서명(aws4fetch)은 실제로 계산된다.
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'

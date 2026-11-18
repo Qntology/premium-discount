@@ -1,7 +1,7 @@
 //! 사건 BLOB 코덱: D1 의 `data` 칸(gzip 한 JSON)을 어떤 모양으로 받아도 같은 객체로 푼다
 //!
 //! logis-center `commerce/src/modes/runtime.ts` 의 `decodeAnalyticBlob` 을 옮기면서, 그 시험(`runtime.test.ts`)이 `it.fails`
-//! 로 남겨 둔 세 결함을 고쳤다. 같은 규칙의 TypeScript 판은 `www/src/blob.ts` 이고, 두 쪽은 `contracts/analytic_blob_v1.json`
+//! 로 남겨 둔 세 결함을 고쳤다. 같은 규칙의 TypeScript 판은 `workers/www/src/blob.ts` 이고, 두 쪽은 `contracts/analytic_blob_v1.json`
 //! 의 사례를 함께 통과한다.
 //!
 //! - **BUG-RT-2**: base64 로 온 gzip 이 50 바이트 이하면 풀지 않고 `{}` 를 냈다(`rawBytes.length > 50 &&`). 이제 길이와

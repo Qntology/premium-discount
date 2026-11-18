@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
 // 앱 로그인: 발급(POST /session/start), 상태(GET /session), 검증된 주소가 평가 저장의 from이 되는 것까지.
 // S3는 globalThis.fetch를 바꿔서 흉내 낸다 (서명은 실제로 계산된다).
 import { test, beforeEach, afterEach } from 'node:test'
@@ -7,7 +7,7 @@ import { createHmac } from 'node:crypto'
 import { handleSession } from '../src/session.ts'
 import { handleEvaluations } from '../src/evaluations.ts'
 import { addressFromEmail } from '../src/auth.ts'
-import { FakeD1, FakeVectorize, FakeLimiter, unitVector } from '../../test-support/fakes.ts'
+import { FakeD1, FakeVectorize, FakeLimiter, unitVector } from '../../../test-support/fakes.ts'
 
 const SECRET = 'test-session-secret'
 const IP = '203.0.113.7'

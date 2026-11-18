@@ -1,9 +1,9 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import { handleGraph } from '../src/graph.ts'
-import { FakeD1, FakeVectorize, FakeLimiter, unitVector, seedEvaluation, seedVerdict } from '../../test-support/fakes.ts'
+import { FakeD1, FakeVectorize, FakeLimiter, unitVector, seedEvaluation, seedVerdict } from '../../../test-support/fakes.ts'
 
 function setup() {
 	const read = new FakeLimiter()

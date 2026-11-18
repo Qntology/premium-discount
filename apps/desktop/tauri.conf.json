@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "discount.premium.app",
   "build": {
-    "frontendDist": "../ui/dist",
-    "beforeBuildCommand": "npm --prefix ui install && npm --prefix ui run build"
+    "frontendDist": "../../web/desktop/dist",
+    "beforeBuildCommand": "npm --prefix ../web/desktop install && npm --prefix ../web/desktop run build"
   },
   "app": {
     "withGlobalTauri": true,

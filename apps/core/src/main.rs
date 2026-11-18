@@ -4,7 +4,7 @@
 //! 로그와 오류는 표준 오류로만 쓴다. 표준 출력은 응답 전용이다.
 //!
 //! 모델이 없어도 시작한다: `cmd_app_status`는 ready=false와 이유를 돌려주고, 모델 명령(`cmd_model_*`)으로 내려받을 수 있다.
-//! 내려받기가 끝나면 다음 명령에서 코어(모델)를 다시 만든다. Tauri 셸(src-tauri/src/lib.rs)과 같은 동작이다.
+//! 내려받기가 끝나면 다음 명령에서 코어(모델)를 다시 만든다. Tauri 셸(apps/desktop/src/lib.rs)과 같은 동작이다.
 //!
 //! 설정 (환경 변수)
 //!   PD_MODEL_DIR       embeddinggemma-2 모델 폴더 (model.safetensors 또는 model-text.safetensors, tokenizer.json). 필수.

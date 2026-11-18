@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test cron/test/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/cron/test/*.test.ts  (premium-discount 폴더에서)
 // contracts/verdict_v2.json(참조 구현 contracts/gen_verdict_v2.py가 만든 계약)을 TypeScript 구현이 계약의 매개변수로 통과하는지 본다.
 // 서버는 아직 v1(PARAMS)로 판정한다. v2(접근성 내비게이션의 implicit 관측 · nav 트랙)로 바꾸는 것은 서버 단계(M5)에서 한다.
 import { test } from 'node:test'
@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { PARAMS, verdict, type Params, type VerdictCase, type Verdict } from '../src/verdict.ts'
 
 const contract = JSON.parse(
-	readFileSync(fileURLToPath(new URL('../../contracts/verdict_v2.json', import.meta.url)), 'utf8')
+	readFileSync(fileURLToPath(new URL('../../../contracts/verdict_v2.json', import.meta.url)), 'utf8')
 ) as { recipe: string; tolerance: number; params: Params; cases: (VerdictCase & { name: string; expect: Verdict })[] }
 
 test('v2는 v1 매개변수에 nav 트랙과 implicit 가중치만 더한 것이다', () => {

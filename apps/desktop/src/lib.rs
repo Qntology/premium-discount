@@ -1,6 +1,6 @@
-//! premium.discount 데스크톱 앱: Tauri 창 하나가 화면(../ui/dist)을 보여 주고, 화면의 명령(`cmd_*`)을 앱 코어(상위 크레이트)에 연결한다.
+//! premium.discount 데스크톱 앱: Tauri 창 하나가 화면(web/desktop/dist)을 보여 주고, 화면의 명령(`cmd_*`)을 앱 코어(상위 크레이트)에 연결한다.
 //! 명령 계층(AppCore)은 프레임워크와 무관하므로 여기서는 감싸기만 한다. 설정은 settings.rs.
-//! 데스크톱 창은 테두리 없는 투명 오버레이(tauri.conf.json)이고, 단계마다 크기 · 위치는 화면(ui/stage.ts)이 바꾼다.
+//! 데스크톱 창은 테두리 없는 투명 오버레이(tauri.conf.json)이고, 단계마다 크기 · 위치는 화면(web/desktop/stage.ts)이 바꾼다.
 //!
 //! 코어(모델 로드 약 2초)는 첫 명령이 올 때 만든다. 창은 바로 뜨고, 만들지 못하면(모델 폴더 없음 등)
 //! 모델 명령(`cmd_model_*`) 말고는 not_ready 오류를 돌려주며, 화면이 원인과 "모델 내려받기"를 보여 준다.
@@ -140,7 +140,7 @@ async fn build_core(settings: &Settings, filter: Arc<SwitchFilter>) -> Result<Co
     let outbox = Outbox::open(&settings.data_dir).await?;
     let store = SessionStore::new(settings.data_dir.join("session.json"));
     let info = AppInfo { model_dir: settings.model_dir.display().to_string(), data_dir: settings.data_dir.display().to_string(), server_url: settings.server_url.clone() };
-    // 웹 행동 분석 저장소 (사이트 주인이 받아 온 사건). 헤드리스 코어(app/src/main.rs)와 같은 자리
+    // 웹 행동 분석 저장소 (사이트 주인이 받아 온 사건). 헤드리스 코어(apps/core/src/main.rs)와 같은 자리
     let analytic = premium_discount_app::analytic::AnalyticStore::open(settings.data_dir.join("analytic")).await?;
     Ok(AppCore::new(Evaluator::new(backend, embedder, filter), outbox)
         .with_session_store(store)
@@ -172,7 +172,7 @@ async fn cmd_analytic_forget(shell: State<'_, Shell>, args: premium_discount_app
     shell.core().await?.cmd_analytic_forget(args).await
 }
 
-// ---- 명령: AppCore를 한 줄씩 감싼다. 이름과 인자(`args` 하나)는 화면의 ui/commands.ts와 같다 ----
+// ---- 명령: AppCore를 한 줄씩 감싼다. 이름과 인자(`args` 하나)는 화면의 web/desktop/commands.ts와 같다 ----
 
 #[tauri::command]
 async fn cmd_app_status(shell: State<'_, Shell>) -> Result<AppStatus, CommandError> {
@@ -269,7 +269,7 @@ async fn cmd_flush_outbox(shell: State<'_, Shell>) -> Result<FlushSummary, Comma
     shell.core().await?.cmd_flush_outbox().await
 }
 
-// 추천 / 비추천과 전역 판정. 코어(app/src/commands.rs)와 화면(ui/commands.ts)에는 있었지만 여기에 등록되지 않아
+// 추천 / 비추천과 전역 판정. 코어(apps/core/src/commands.rs)와 화면(web/desktop/commands.ts)에는 있었지만 여기에 등록되지 않아
 // Tauri 창에서는 투표가 unknown command 로 실패했다. 인자 형식은 상위 크레이트의 VoteArgs · VerdictsArgs 그대로다.
 #[tauri::command]
 async fn cmd_vote(shell: State<'_, Shell>, args: VoteArgs) -> Result<VoteResult, CommandError> {

@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test cron/test/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/cron/test/*.test.ts  (premium-discount 폴더에서)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { moderate, parseModeration, QUESTIONS, THRESHOLD } from '../src/moderation.ts'

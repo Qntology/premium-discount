@@ -1,4 +1,4 @@
-//! premium.discount's public graph (`www/src/graph.ts`), read directly: premium-discount-app has no graph
+//! premium.discount's public graph (`workers/www/src/graph.ts`), read directly: premium-discount-app has no graph
 //! command.
 //!
 //! * `GET /graph?cc=` — a domain's evaluations, their authors and reply edges

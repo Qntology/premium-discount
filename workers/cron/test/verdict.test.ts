@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test cron/test/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/cron/test/*.test.ts  (premium-discount 폴더에서)
 // contracts/verdict_v1.json(참조 구현 contracts/gen_verdict_v1.py가 만든 계약)을 TypeScript 구현이 그대로 통과하는지 본다.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { PARAMS, RECIPE, baselineOf, verdict, type VerdictCase, type Verdict } from '../src/verdict.ts'
 
 const contract = JSON.parse(
-	readFileSync(fileURLToPath(new URL('../../contracts/verdict_v1.json', import.meta.url)), 'utf8')
+	readFileSync(fileURLToPath(new URL('../../../contracts/verdict_v1.json', import.meta.url)), 'utf8')
 ) as { recipe: string; tolerance: number; params: unknown; cases: (VerdictCase & { name: string; expect: Verdict })[] }
 
 test('recipe와 매개변수가 계약과 같다', () => {

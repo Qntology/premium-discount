@@ -1,4 +1,4 @@
-# 실모델 E2E 검증용 가짜 서버 (app/tests/e2e/e2e_main.py가 쓴다). 사용: python3 mock_server.py <포트> <요청 기록 파일>
+# 실모델 E2E 검증용 가짜 서버 (apps/core/tests/e2e/e2e_main.py가 쓴다). 사용: python3 mock_server.py <포트> <요청 기록 파일>
 # www의 /evaluations 계약(검증 규칙, 멱등 request_id, 202 pending)을 흉내 내는 로컬 가짜 서버. 받은 요청을 파일에 남긴다.
 import json, hashlib, math, sys, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,7 +8,7 @@ STATE = sys.argv[3] if len(sys.argv) > 3 else None  # 있으면 저장된 글을
 store = {}  # request_id -> record
 import secrets, urllib.parse, time, os
 # 판정은 계약의 참조 구현(contracts/gen_verdict_v1.py)으로 계산한다. 서버 cron과 같은 규칙이다
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'contracts'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', 'contracts'))
 import gen_verdict_v1 as verdict_ref
 votes = []  # 추가만 하는 투표 기록 (www의 eval_votes와 같다). (평가, 투표자, 종류)마다 마지막 행이 유효하다
 sessions = {}  # hash -> token (POST /session/start가 발급한 것)

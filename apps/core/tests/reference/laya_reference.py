@@ -1,6 +1,6 @@
 """laya-multilingual 참조 픽스처를 만든다 (진짜 laya 패키지 + torch로 실행).
 
-Rust 이식(app/src/laya.rs)이 같은 입력에 같은 로짓·확률을 내는지 확인하는 데 쓴다.
+Rust 이식(apps/core/src/laya.rs)이 같은 입력에 같은 로짓·확률을 내는지 확인하는 데 쓴다.
 판: laya 0.4.31, transformers 5.23.0, torch 2.15.0+cpu, 모델 리비전 1720e3e.
 
     HF_HOME=<캐시> HF_HUB_OFFLINE=1 python laya_reference.py <모델 폴더> <출력 json>

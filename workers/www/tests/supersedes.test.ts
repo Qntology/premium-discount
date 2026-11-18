@@ -1,12 +1,12 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
-// 신구 대체 보고 (POST /evaluations/supersedes, migrations/0009) → cron 이 옛 평가를 discount(−2, superseded)로 판정.
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
+// 신구 대체 보고 (POST /evaluations/supersedes, workers/migrations/0009) → cron 이 옛 평가를 discount(−2, superseded)로 판정.
 // 비교(premium-discount-relay)는 보고한 쪽이 한다: 여기서는 서버가 검증하는 조건과 판정까지의 연결만 본다.
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { handleEvaluations } from '../src/evaluations.ts'
 import { addressFromEmail } from '../src/auth.ts'
 import { processVerdicts } from '../../cron/src/index.ts'
-import { FakeD1, FakeVectorize, FakeLimiter, seedEvaluation, seedVote } from '../../test-support/fakes.ts'
+import { FakeD1, FakeVectorize, FakeLimiter, seedEvaluation, seedVote } from '../../../test-support/fakes.ts'
 
 const ORIGIN = 'tauri://localhost'
 const IP = '203.0.113.7'

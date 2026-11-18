@@ -1,8 +1,8 @@
 // 웹 행동 분석 수집 (tracker-logis-center 의 Worker 를 옮김, 2026-11-18)
 //
-// 사이트 주인이 자기 사이트에 수집 스크립트(public/static/js/tracker.js)를 심으면, 방문자의 사건(web-event/1)이
+// 사이트 주인이 자기 사이트에 수집 스크립트(web/www/static/js/tracker.js)를 심으면, 방문자의 사건(web-event/1)이
 // POST /analytic/events 로 들어와 사이트(cc = hashId(host))마다 쌓인다. 구조화(속성 없는 PUG → 요약 → embeddinggemma 임베딩)와
-// 퍼널 · 마찰 판정은 서버가 아니라 사이트 주인의 앱이 기기에서 한다(crates/premium-discount-analytic, app/src/analytic.rs).
+// 퍼널 · 마찰 판정은 서버가 아니라 사이트 주인의 앱이 기기에서 한다(crates/premium-discount-analytic, apps/core/src/analytic.rs).
 // 서버는 받은 그대로를 gzip 해 두고(updated_at = 0: 원시), 사이트 주인에게만 돌려준다.
 //
 // tracker-logis-center 와 다른 점:

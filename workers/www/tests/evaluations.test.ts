@@ -1,10 +1,10 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
 // D1은 실제 SQLite(node:sqlite)에 migrations 0002~0005를 적용한 가짜다.
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { handleEvaluations } from '../src/evaluations.ts'
 import { addressFromEmail } from '../src/auth.ts'
-import { FakeD1, FakeVectorize, FakeLimiter, unitVector } from '../../test-support/fakes.ts'
+import { FakeD1, FakeVectorize, FakeLimiter, unitVector } from '../../../test-support/fakes.ts'
 
 const ORIGIN = 'tauri://localhost'
 const IP = '203.0.113.7'

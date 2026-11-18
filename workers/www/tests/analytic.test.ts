@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
 // 웹 행동 분석 수집 (/analytic/events, /analytic/sites): tracker-logis-center 의 Worker 를 옮긴 것
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -9,7 +9,7 @@ import { gzip } from 'pako'
 import { cleanHref, handleAnalytic, hashId, hostOf, sanitizeEvent, scrubText, siteMetaOwners, type AnalyticEnv, type Fetcher } from '../src/analytic.ts'
 import { decodeBlob, decodeBytes, encodeBlob, bytesToBase64 } from '../src/blob.ts'
 import { walletRequestMessage } from '../src/auth.ts'
-import { FakeD1, FakeLimiter } from '../../test-support/fakes.ts'
+import { FakeD1, FakeLimiter } from '../../../test-support/fakes.ts'
 
 const NOW = Date.UTC(2026, 10, 18, 3, 0, 0)
 const SHOP = 'https://shop.example.com'
@@ -225,7 +225,7 @@ test('사이트 주인 확인: QR 로그인 세션이면 이메일의 hashId 가
 })
 
 // contracts/analytic_blob_v1.json: Rust(crates/premium-discount-analytic) 와 함께 통과하는 사례
-const blobCases = JSON.parse(readFileSync(fileURLToPath(new URL('../../contracts/analytic_blob_v1.json', import.meta.url)), 'utf8'))
+const blobCases = JSON.parse(readFileSync(fileURLToPath(new URL('../../../contracts/analytic_blob_v1.json', import.meta.url)), 'utf8'))
 
 test('BLOB 코덱: 계약의 사례 (Rust 와 같다)', () => {
 	assert.ok(blobCases.cases.length >= 10)

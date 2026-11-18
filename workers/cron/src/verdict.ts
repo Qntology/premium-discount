@@ -1,7 +1,7 @@
 // PD-Verdict v1: 추천(premium) / 비추천(discount) 판정. 순수 함수만 있다 (D1·네트워크 없음).
 //
 // 계약은 contracts/verdict_v1.json이고, 그 파일은 contracts/gen_verdict_v1.py(참조 구현)가 만든다.
-// cron/test/verdict.test.ts가 이 파일의 PARAMS와 사례를 모두 대조한다. raon-zena의 zena-verdict(Rust)도 같은 파일을 통과한다.
+// workers/cron/test/verdict.test.ts가 이 파일의 PARAMS와 사례를 모두 대조한다. raon-zena의 zena-verdict(Rust)도 같은 파일을 통과한다.
 //
 // 1. 관측마다 u = weight × credit × 2^(−age/H). age는 now − at_ms (미래 시각은 0). sign 0(철회)은 세지 않는다
 // 2. E = Σu, v = Σ(u × sign) / (E + k)

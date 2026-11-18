@@ -1,8 +1,8 @@
 # www(Worker) 테스트 시나리오 (소스 로직 기준)
 
 > 이 문서의 대부분은 **실제로 실행하지 않았습니다.** 소스를 읽고 각 시나리오의 기대 결과를 코드 기준으로 적었습니다.
-> `자동:`으로 표시한 행(2026-11-14 추가)은 `www/tests/*.test.ts`가 실행합니다. Node 내장 러너를 쓰고, D1은 실제 SQLite(`node:sqlite`)에 `migrations/0002~0005`를 적용한 가짜입니다.
-> `premium-discount` 폴더에서: `node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts`
+> `자동:`으로 표시한 행(2026-11-14 추가)은 `workers/www/tests/*.test.ts`가 실행합니다. Node 내장 러너를 쓰고, D1은 실제 SQLite(`node:sqlite`)에 `workers/migrations/0002~0005`를 적용한 가짜입니다.
+> `premium-discount` 폴더에서: `node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts`
 
 ## 읽는 법
 
@@ -11,7 +11,7 @@
   - `실측`: 이전 세션에서 로컬 또는 원격으로 실제 확인한 결과입니다. 이번 문서에서는 다시 실행하지 않았습니다.
   - `갭`: 현재 구현이 없거나 알려진 문제입니다.
 - **근거**: `evaluations.ts:186` 같은 파일과 줄 번호입니다.
-- 대상 파일: `src/index.ts`(진입점·레거시), `src/evaluations.ts`(저장·검색), `src/graph.ts`(그래프), `src/auth.ts`(세션), `src/projection.ts`(작성자 키), `migrations/*.sql`(D1), `wrangler.json`·`wrangler.test.json`
+- 대상 파일: `src/index.ts`(진입점·레거시), `src/evaluations.ts`(저장·검색), `src/graph.ts`(그래프), `src/auth.ts`(세션), `src/projection.ts`(작성자 키), `workers/migrations/*.sql`(D1), `wrangler.json`·`wrangler.test.json`
 
 ---
 
@@ -172,10 +172,10 @@
 | LG-02 | cf 정보가 없는 요청 | `request.cf` 없음 | 384-407행 구조분해에서 실패 | index.ts:384-407 | 갭 (확인 필요) |
 | LG-03 | try 블록 안 에러 | 레거시 POST·GET 내부 예외 | catch 후 418 "I'm a teapot!" | index.ts:1098-1104 | 신규 |
 | LG-04 | 레거시 바인딩 이름 | `premium_dicount_${zoneRegion}_items` | zoneRegion이 '' 이므로 바인딩이 없음 → 내부 TypeError → 418 | index.ts:436, :607, :972, :1016 | 갭 |
-| LG-05 | 쿼리스트링에 credential | 웹 로그인 스크립트가 `https://premium.discount?hash=…&token=…` 호출 | token이 URL에 노출됨. 로그·기록에 남을 수 있음 | auth.js:645, :678, :890 (public/static/js) | 갭 (보안) |
+| LG-05 | 쿼리스트링에 credential | 웹 로그인 스크립트가 `https://premium.discount?hash=…&token=…` 호출 | token이 URL에 노출됨. 로그·기록에 남을 수 있음 | auth.js:645, :678, :890 (web/www/static/js) | 갭 (보안) |
 | LG-06 | SQL 문자열 보간 | `'${cookies.team}'` | 인젝션 가능성. 바인드 파라미터로 바꿔야 함 | index.ts:607, :620, :643 | 갭 (보안) |
 
-## DB. D1 스키마와 마이그레이션 (`migrations/`)
+## DB. D1 스키마와 마이그레이션 (`workers/migrations/`)
 
 | ID | 상황 | 기대 결과 | 근거 | 상태 |
 |---|---|---|---|---|

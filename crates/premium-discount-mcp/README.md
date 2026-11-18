@@ -93,7 +93,7 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 로컬 판정은 같은 규칙을 기기 안의 관측(결과 · 대화 피드백 · 수동 보정)에 돌린 값이고, 서버로 올리지 않습니다.
 
 판정 규칙(PD-Verdict v1)은 premium-discount 의 `contracts/verdict_v1.json` 이 기준입니다. 이 파일은 그 저장소의 `contracts/gen_verdict_v1.py`(참조 구현)가 만든 매개변수와 사례 19개입니다. 세 구현이 같은 사례를 통과합니다.
-- 서버 cron 의 TypeScript(`cron/src/verdict.ts`)
+- 서버 cron 의 TypeScript(`workers/cron/src/verdict.ts`)
 - 이 저장소의 `zena-verdict`(Rust)
 - 앱 E2E 가짜 서버의 파이썬(참조 구현을 그대로 import)
 
@@ -105,7 +105,7 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 
 ## 앱 쪽: `PdSyncClient` · `SyncLoop`
 
-`SyncLoop` 은 premium-discount `app/ui/coalesce.ts` + `main.ts` 를 옮긴 것입니다.
+`SyncLoop` 은 premium-discount `web/desktop/coalesce.ts` + `main.ts` 를 옮긴 것입니다.
 
 - 쉬고 있을 때 들어온 요청은 바로 실행합니다.
 - 실행 중에 들어온 요청은 버리지 않고, 끝난 뒤 **딱 한 번** 다시 실행합니다. 그중 하나라도 flush 를 원했으면 다시 실행할 때 flush 합니다.
@@ -146,7 +146,7 @@ UI 의 `hasWork()` 는 최신 50행만 보지만, 이쪽은 모아 둔 행 전�
 ## 시험
 
 ```bash
-cd crates && cargo test -p premium-discount-mcp
+cargo test -p premium-discount-mcp   # premium-discount 폴더(루트 작업 공간)에서
 ```
 
 시험은 세 묶음입니다.
@@ -161,9 +161,9 @@ cd crates && cargo test -p premium-discount-mcp
 실제 premium-discount-app 과의 왕복은 직접 켜야 돌아갑니다.
 
 ```bash
-python -X utf8 app/tests/e2e/mock_server.py 8787 requests.jsonl &
+python -X utf8 apps/core/tests/e2e/mock_server.py 8787 requests.jsonl &
 PD_E2E_APP=…/premium-discount-app.exe PD_E2E_MODEL_DIR=…/model PD_E2E_SERVER=http://127.0.0.1:8787 \
-PD_E2E_LOG=requests.jsonl cargo test --manifest-path crates/Cargo.toml -p premium-discount-mcp --test e2e_pd_app -- --nocapture
+PD_E2E_LOG=requests.jsonl cargo test -p premium-discount-mcp --test e2e_pd_app -- --nocapture
 ```
 
 시나리오는 다음 순서입니다.

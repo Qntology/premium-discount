@@ -11,7 +11,7 @@
 //! | [`time`] | 결정론적 시간 해석 (모델이 낸 날짜는 믿지 않는다) | logis-center `utils/time_guide.rs` |
 //! | [`blob`] | 사건 BLOB 코덱 (BUG-RT-2/3/4 고침) | logis-center `runtime.ts` `decodeAnalyticBlob` |
 //!
-//! 모델 · 저장소 · HTTP 에 의존하지 않는다. 임베딩(embeddinggemma 768차원) · 로컬 저장(LanceDB)은 앱(`app/src/analytic.rs`)이 한다.
+//! 모델 · 저장소 · HTTP 에 의존하지 않는다. 임베딩(embeddinggemma 768차원) · 로컬 저장(LanceDB)은 앱(`apps/core/src/analytic.rs`)이 한다.
 
 pub mod blob;
 pub mod event;

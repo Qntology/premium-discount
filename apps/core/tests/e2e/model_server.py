@@ -1,6 +1,6 @@
 """가짜 Hugging Face: /<owner>/<repo>/resolve/<rev>/<file>을 실제 모델 폴더의 파일로 답한다 (Range 지원).
 
-앱의 모델 내려받기(app/src/model_fetch.rs)를 진짜 바이트로 시험하려고 쓴다. 해시가 고정이라 진짜 파일이어야 한다.
+앱의 모델 내려받기(apps/core/src/model_fetch.rs)를 진짜 바이트로 시험하려고 쓴다. 해시가 고정이라 진짜 파일이어야 한다.
 요청마다 한 줄씩 로그(JSON)를 남긴다: path, range, status, sent.
 속도를 제한할 수 있다 (POST /__control {"rate": 초당 바이트}). 화면에서 진행률과 멈추기를 볼 수 있게.
 

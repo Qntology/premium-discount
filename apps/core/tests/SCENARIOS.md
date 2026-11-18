@@ -142,11 +142,11 @@
 |---|---|---|---|---|---|
 | J-01 | EmbeddingGemma + HttpBackend + 필터로 조립 | `LocalFilter` | 조립된다 (`src/main.rs`의 `build_core`) | filter.rs, main.rs | 해결 (모델 파일이 있는 실행은 확인하지 못함) |
 | J-02 | 실행 진입점 (바이너리·Tauri 커맨드) | — | `src/main.rs`가 UI 명령 6개(`cmd_*`)를 표준 입출력 JSON으로 연다. `src/commands.rs`는 Tauri 커맨드가 그대로 부르는 계층이다. Tauri 셸(창·설정 파일)은 추가하지 않았다 | commands.rs, main.rs, ui/commands.ts | 부분 해결 (Tauri 셸 제외) |
-| J-03 | 루트의 옛 `app/embedding.rs` | 크레이트에 포함되지 않음 | 이 브랜치에는 파일이 없다 (이미 삭제됨) | `git ls-files app` | 해결 |
+| J-03 | 루트의 옛 `apps/core/embedding.rs` | 크레이트에 포함되지 않음 | 이 브랜치에는 파일이 없다 (이미 삭제됨) | `git ls-files app` | 해결 |
 
 ---
 
 ## 자동화 메모
 
-- 위 시나리오 중 `기존`은 이미 `cargo test --lib`에서 돌아갑니다. `신규`는 `app/tests/*.rs`로 옮기면 됩니다. 네트워크가 필요한 G-07, E-13은 fake 백엔드나 로컬 리스너로 재현합니다.
+- 위 시나리오 중 `기존`은 이미 `cargo test --lib`에서 돌아갑니다. `신규`는 `apps/core/tests/*.rs`로 옮기면 됩니다. 네트워크가 필요한 G-07, E-13은 fake 백엔드나 로컬 리스너로 재현합니다.
 - `갭`은 테스트가 실패하도록 두지 말고, 구현 전까지 `#[ignore = "갭: ..."]`로 표시하는 방식을 추천합니다.

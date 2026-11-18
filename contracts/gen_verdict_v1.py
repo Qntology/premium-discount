@@ -3,7 +3,7 @@
 #
 # 실행: python contracts/gen_verdict_v1.py   (premium-discount 폴더에서. 파일을 다시 쓴다)
 #
-# 이 파일이 계약의 기준이다. 서버(cron/src/verdict.ts)와 raon-zena(crates/zena-verdict)는 이 파일이 만든
+# 이 파일이 계약의 기준이다. 서버(workers/cron/src/verdict.ts)와 raon-zena(crates/zena-verdict)는 이 파일이 만든
 # verdict_v1.json의 사례를 그대로 통과해야 한다 (실수는 1e-9 안, 나머지는 정확히 같게).
 # 매개변수를 하나라도 바꾸면 RECIPE 이름을 올리고(pd-verdict/2 …) 새 파일로 낸다. 판정 행은 recipe를 남기므로
 # recipe가 다른 판정끼리는 비교하지 않는다.

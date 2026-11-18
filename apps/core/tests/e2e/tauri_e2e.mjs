@@ -2,9 +2,9 @@
 // 화면 쪽 로직은 ui_e2e.mjs / ui_login_e2e.mjs가 Chromium으로 자세히 확인하므로, 여기서는 "진짜 창에서 Tauri 연결이 되는가"에 집중한다:
 // window.__TAURI__, 명령(IPC) 왕복, 실제 모델 임베딩, 로그인 세션 저장과 복원, 시작 실패 안내.
 //
-//   cd app/ui && npm install && npm run build && cd ../src-tauri && cargo build        # 화면 묶기와 Tauri 빌드
+//   cd web/desktop && npm install && npm run build && cd ../../apps/desktop && cargo build        # 화면 묶기와 Tauri 빌드
 //   Xvfb :99 -screen 0 1280x900x24 &
-//   DISPLAY=:99 node tests/e2e/tauri_e2e.mjs target/debug/premium-discount-desktop <EMBEDDINGGEMMA_DIR> <스크린샷 폴더> [A|B]
+//   DISPLAY=:99 node tests/e2e/tauri_e2e.mjs ../../target/debug/premium-discount-desktop <EMBEDDINGGEMMA_DIR> <스크린샷 폴더> [A|B]
 //   (A: 모델이 없을 때 안내와 창 안에서 내려받기·설치, B: 전체 흐름. 생략하면 둘 다)
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'

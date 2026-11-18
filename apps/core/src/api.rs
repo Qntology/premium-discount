@@ -122,7 +122,7 @@ pub struct VoteResponse {
     pub status: Option<String>,
 }
 
-/// POST /evaluations/supersedes 요청: 새 평가(`new`)가 옛 평가(`old`)를 대체한다 (www/migrations/0009).
+/// POST /evaluations/supersedes 요청: 새 평가(`new`)가 옛 평가(`old`)를 대체한다 (workers/migrations/0009).
 /// 같은 request_id 는 재시도이고, 서버는 처음 결과를 돌려준다
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SupersedeRequest {

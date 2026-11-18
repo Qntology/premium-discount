@@ -1,5 +1,5 @@
-//! `stage_cases.json`(app/ui/stage.ts 를 돌려 만든 표)을 읽어 Rust 쪽이 같은 답을 내는지 본다.
-//! 같은 표를 app/ui/stage.test.ts 도 읽는다. 표를 다시 만들려면 `tests/gen_stage_cases.mjs`.
+//! `stage_cases.json`(web/desktop/stage.ts 를 돌려 만든 표)을 읽어 Rust 쪽이 같은 답을 내는지 본다.
+//! 같은 표를 web/desktop/stage.test.ts 도 읽는다. 표를 다시 만들려면 `tests/gen_stage_cases.mjs`.
 
 use premium_discount_window::{
     classify_pointer, grows_to, next_stage, place_window, Anchor, Position, Size, Stage,

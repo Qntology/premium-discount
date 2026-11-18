@@ -1,7 +1,7 @@
 // 화면에 보여 줄 문구와 값을 만드는 순수 함수. DOM을 건드리지 않아서 Node에서 테스트한다 (view.test.ts).
 import type { CommandFailure, MatchVerdict, MergedMatch, SessionInfo, SubmitResult, VoteResult } from './commands.ts'
 
-/** 서버·Rust와 같은 값 (app/src/pipeline.rs MAX_TEXT_BYTES) */
+/** 서버·Rust와 같은 값 (apps/core/src/pipeline.rs MAX_TEXT_BYTES) */
 export const MAX_TEXT_BYTES = 8192
 
 /** 로컬 상태 → 사용자에게 보이는 말과 색 계열 (localdb.ts STATES와 같은 목록) */
@@ -18,7 +18,7 @@ export function stateView(state: string) {
 	return STATE_VIEW[state] ?? { label: state || '알 수 없음', tone: 'muted' as const }
 }
 
-/** 거부 사유를 사람이 읽는 말로. Rust가 로컬 행에 남기는 형식 (app/src/queue.rs)
+/** 거부 사유를 사람이 읽는 말로. Rust가 로컬 행에 남기는 형식 (apps/core/src/queue.rs)
  *  - `server status rejected: nsfw,illegal`   서버가 사유와 함께 거부 (사유는 cron의 질문 이름, 쉼표로 이어짐)
  *  - `server status rejected` / `server status failed`   사유 없이 거부, 또는 재시도 한도를 넘겨 실패
  *  - `parent local-1 was rejected`   답글을 단 글이 거부되어 함께 버려짐

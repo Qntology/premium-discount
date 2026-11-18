@@ -1,5 +1,5 @@
 // 사이드카 준비(sidecars.mjs)와 설정 · 찾는 쪽의 약속.
-// 실행: node --test app/src-tauri/sidecars.test.mjs  (premium-discount 폴더에서)
+// 실행: node --test apps/desktop/sidecars.test.mjs  (premium-discount 폴더에서)
 //
 // - 빌드한 실행 파일을 Tauri 가 찾는 이름(`binaries/<이름>-<삼중항>[.exe]`)으로 옮긴다 (교차 빌드 자리 포함), 없으면 실패
 // - tauri.sidecar.conf.json 의 externalBin 이 그 두 이름이고, 빌드 전에 sidecars.mjs 를 부른다. 기본 설정에는 사이드카가 없다
@@ -16,19 +16,16 @@ const here = dirname(fileURLToPath(import.meta.url))
 const readJson = (name) => JSON.parse(readFileSync(join(here, name), 'utf8'))
 const quiet = () => {}
 
+// 루트 작업 공간 하나: 두 사이드카 모두 <작업 공간>/target/[삼중항/]release 에 생긴다
 function fakeBuilds(target, cross) {
   const root = mkdtempSync(join(tmpdir(), 'pd-sidecars-'))
-  const appDir = join(root, 'app')
-  const cratesDir = join(root, 'crates')
-  for (const [dir, name] of [
-    [appDir, 'premium-discount-app'],
-    [cratesDir, 'premium-discount-mcp'],
-  ]) {
-    const release = join(dir, 'target', ...(cross ? [target] : []), 'release')
-    mkdirSync(release, { recursive: true })
+  const workspaceDir = join(root, 'premium-discount')
+  const release = join(workspaceDir, 'target', ...(cross ? [target] : []), 'release')
+  mkdirSync(release, { recursive: true })
+  for (const name of SIDECARS) {
     writeFileSync(join(release, name + exeSuffix(target)), `${name} for ${target}`)
   }
-  return { root, appDir, cratesDir, out: join(root, 'binaries') }
+  return { root, workspaceDir, out: join(root, 'binaries') }
 }
 
 test('빌드한 두 실행 파일을 <이름>-<삼중항>[.exe] 로 옮긴다 (Windows · 리눅스 · 교차 빌드)', () => {
@@ -49,10 +46,10 @@ test('빌드한 두 실행 파일을 <이름>-<삼중항>[.exe] 로 옮긴다 (W
     for (const name of SIDECARS) {
       assert.equal(readFileSync(join(dirs.out, stagedName(name, target)), 'utf8'), `${name} for ${target}`)
     }
-    // cargo build --release -p <이름> --bin <이름> (교차면 --target)
+    // cargo build --release --manifest-path <작업 공간>/Cargo.toml -p <이름> --bin <이름> (교차면 --target)
     assert.deepEqual(
-      built.map(([, pkg, bin, extra]) => [pkg, bin, extra]),
-      SIDECARS.map((n) => [n, n, cross ? ['--target', target] : []])
+      built.map(([manifest, pkg, bin, extra]) => [manifest, pkg, bin, extra]),
+      SIDECARS.map((n) => [join(dirs.workspaceDir, 'Cargo.toml'), n, n, cross ? ['--target', target] : []])
     )
   }
   assert.equal(stagedName('premium-discount-app', 'x86_64-pc-windows-msvc'), 'premium-discount-app-x86_64-pc-windows-msvc.exe')
@@ -70,7 +67,7 @@ test('--no-build 인데 실행 파일이 없으면 그 경로를 알리고 멈�
 test('설정: 사이드카 설정의 externalBin 은 두 사이드카, 빌드 전에 sidecars.mjs 를 부르고, 기본 설정에는 없다', () => {
   const side = readJson('tauri.sidecar.conf.json')
   assert.deepEqual(side.bundle.externalBin, SIDECARS.map((n) => `binaries/${n}`))
-  assert.match(side.build.beforeBuildCommand, /node src-tauri\/sidecars\.mjs/)
+  assert.match(side.build.beforeBuildCommand, /node desktop\/sidecars\.mjs/)
   const base = readJson('tauri.conf.json')
   assert.equal(base.bundle.externalBin, undefined, 'a window-only build must not need the sidecars')
 })

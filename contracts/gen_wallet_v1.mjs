@@ -1,8 +1,8 @@
 // 지갑 갈래(사용자가 시드 구문을 보관하는 익명 계정) 참조 구현. contracts/wallet_v1.json 을 만든다.
 //
-// 실행: node contracts/gen_wallet_v1.mjs   (premium-discount 폴더에서. www/node_modules 의 ethers 를 쓴다. 파일을 다시 쓴다)
+// 실행: node contracts/gen_wallet_v1.mjs   (premium-discount 폴더에서. workers/www/node_modules 의 ethers 를 쓴다. 파일을 다시 쓴다)
 //
-// 이 파일이 지갑 갈래의 기준이다. 서버(www/src/auth.ts)와 Rust 라이브러리(crates/premium-discount-identity)는 이 파일이 만든
+// 이 파일이 지갑 갈래의 기준이다. 서버(workers/www/src/auth.ts)와 Rust 라이브러리(crates/premium-discount-identity)는 이 파일이 만든
 // wallet_v1.json 의 값을 그대로 내야 한다.
 //
 // 규칙
@@ -23,7 +23,7 @@ import { writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const require = createRequire(import.meta.url)
-const { ethers } = require('../www/node_modules/ethers')
+const { ethers } = require('../workers/www/node_modules/ethers')
 
 const SCHEME = 'pd-wallet/1'
 const PATH = "m/44'/60'/0'/0/0"

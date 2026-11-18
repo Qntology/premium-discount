@@ -1,8 +1,8 @@
-//! 오버레이 창 계산. premium-discount 앱의 3단계 오버레이(`app/ui/stage.ts`)와 raon-zena 의 마이크로 뷰포트 오버레이
+//! 오버레이 창 계산. premium-discount 앱의 3단계 오버레이(`web/desktop/stage.ts`)와 raon-zena 의 마이크로 뷰포트 오버레이
 //! (`zena-core/src/window.rs`)가 함께 쓰는 순수 함수, 그리고 점 아래 창 · 앞 창을 알아내는 작은 Win32 모듈이다.
 //!
 //! * [`stage`] – 단계(0 알약 · 1 미니 피드 · 2 서랍)의 크기와 옮기기, 누르기와 끌기 구분, 창 자리(오른쪽 아래 모서리 고정).
-//!   `app/ui/stage.ts` 를 같은 수로 옮겼다. 두 쪽이 `tests/stage_cases.json` 한 표를 읽어 같은 답을 내는지 본다
+//!   `web/desktop/stage.ts` 를 같은 수로 옮겼다. 두 쪽이 `tests/stage_cases.json` 한 표를 읽어 같은 답을 내는지 본다
 //!   (`tests/gen_stage_cases.mjs` 가 stage.ts 를 돌려 만든 표).
 //! * [`layer`] – 확장 창 스타일(`WS_EX_*`) 비트, 불투명도(알파), 프레임 간격. raon-zena `zena-core::window` 에서 가져왔고,
 //!   그쪽 타입(`WindowLayerMode` · `ReactionLevel`) 대신 [`LayerFlags`] · [`Activity`] 를 받는다.

@@ -1,8 +1,8 @@
 // QR 로그인 E2E: 실제 모델이 연결된 실행 파일 + Chromium. 서버만 가짜(mock_server.py)이고, "이메일 도착"은 /__control로 흉내 낸다.
 // QR은 브라우저에서 실제로 그린 SVG를 래스터로 바꿔 jsQR로 읽어서, 스캐너가 읽는 내용이 올바른지 확인한다.
 //
-//   cd app/ui && npm install && npm run build
-//   node tests/e2e/ui_login_e2e.mjs target/release/premium-discount-app <EMBEDDINGGEMMA_DIR> <스크린샷 폴더>
+//   cd web/desktop && npm install && npm run build
+//   node tests/e2e/ui_login_e2e.mjs ../../target/release/premium-discount-app <EMBEDDINGGEMMA_DIR> <스크린샷 폴더>
 import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs'
@@ -14,7 +14,7 @@ const { chromium } = require('playwright')
 const [BIN_ARG, MODEL, OUT] = process.argv.slice(2)
 const here = (p) => fileURLToPath(new URL(p, import.meta.url))
 const BIN = fileURLToPath(new URL(BIN_ARG, `file://${process.cwd()}/`))
-const JSQR = here('../../ui/node_modules/jsqr/dist/jsQR.js')
+const JSQR = here('../../../../web/desktop/node_modules/jsqr/dist/jsQR.js')
 const SERVER_PORT = 18792, UI_PORT = 18793
 const LOG = '/tmp/pd-login-e2e-server.log', DATA = '/tmp/pd-login-e2e-me'
 const SESSION_FILE = `${DATA}/session.json`
@@ -28,7 +28,7 @@ const serverLog = () => (existsSync(LOG) ? readFileSync(LOG, 'utf8').trim().spli
 const mock = spawn('python3', [here('mock_server.py'), String(SERVER_PORT), LOG], { stdio: 'inherit' })
 let ui = null
 const startUi = async () => {
-	ui = spawn('node', [here('../../ui/dev-server.mjs')], { env: { ...process.env, PD_MODEL_DIR: MODEL, PD_DATA_DIR: DATA, PD_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`, PD_BIN: BIN, PORT: String(UI_PORT) }, stdio: ['ignore', 'pipe', 'inherit'] })
+	ui = spawn('node', [here('../../../../web/desktop/dev-server.mjs')], { env: { ...process.env, PD_MODEL_DIR: MODEL, PD_DATA_DIR: DATA, PD_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`, PD_BIN: BIN, PORT: String(UI_PORT) }, stdio: ['ignore', 'pipe', 'inherit'] })
 	await new Promise((r) => ui.stdout.on('data', (d) => String(d).includes('http://') && r()))
 }
 const stopUi = async () => { ui.kill(); await new Promise((r) => ui.once('exit', r)); ui = null }

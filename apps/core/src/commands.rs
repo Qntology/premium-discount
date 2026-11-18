@@ -1,10 +1,10 @@
 //! UI가 부르는 명령 계층.
 //!
 //! 프레임워크에 묶이지 않는다. 명령마다 직렬화 가능한 인자(`args`) 하나를 받아 직렬화 가능한 결과를 돌려준다.
-//! Tauri 셸은 명령마다 `#[tauri::command]` 함수 한 줄로 이 계층을 부르면 되고(`app/README.md`의 "Tauri 셸 연결"),
+//! Tauri 셸은 명령마다 `#[tauri::command]` 함수 한 줄로 이 계층을 부르면 되고(`apps/core/README.md`의 "Tauri 셸 연결"),
 //! 지금 실행 파일(`src/main.rs`)은 같은 명령을 표준 입출력 JSON 한 줄씩으로 열어 둔다.
 //!
-//! 명령 (이름은 UI의 `app/ui/commands.ts`와 같다)
+//! 명령 (이름은 UI의 `web/desktop/commands.ts`와 같다)
 //! - `cmd_submit_evaluation`: 욕설 필터 → 임베딩 → 로컬 저장소 기록 → 서버 전송 (`Evaluator::submit_outbox`)
 //! - `cmd_sync_cache`: `since` 이후 바뀐 로컬 행을 화면 캐시(Dexie) 형태로 (`Outbox::cache_rows_since`)
 //! - `cmd_search_local`: 내 글 검색 (로컬 벡터 검색, 원문 포함)
@@ -453,7 +453,7 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
         Ok(outcome.into())
     }
 
-    /// `since` 이후 바뀐 행을 화면 캐시 형태로 돌려준다. 화면은 이 행을 그대로 `bulkPut`한다 (`app/ui/localdb.ts`의 `syncFromRust`)
+    /// `since` 이후 바뀐 행을 화면 캐시 형태로 돌려준다. 화면은 이 행을 그대로 `bulkPut`한다 (`web/desktop/localdb.ts`의 `syncFromRust`)
     pub async fn cmd_sync_cache(&self, args: SyncArgs) -> Result<Vec<Value>, CommandError> {
         Ok(self.outbox.read().await.cache_rows_since(args.since).await?)
     }
@@ -1343,10 +1343,10 @@ mod tests {
         assert_eq!(invalid_cc.kind, "invalid_input");
     }
 
-    /// 화면(ui/commands.ts)과 공유하는 명령 계약 파일의 모든 명령·인자를 그대로 받아들인다
+    /// 화면(web/desktop/commands.ts)과 공유하는 명령 계약 파일의 모든 명령·인자를 그대로 받아들인다
     #[tokio::test]
     async fn every_command_in_the_ui_contract_accepts_the_agreed_arguments() {
-        let contract: Value = serde_json::from_str(include_str!("../ui/fixtures/command_contract.json")).unwrap();
+        let contract: Value = serde_json::from_str(include_str!("../../../web/desktop/fixtures/command_contract.json")).unwrap();
         let (core, _server) = core().await;
         // 모델 명령은 코어가 아니라 셸이 받는다 (모델이 없어도 답해야 하므로). 받는 주소는 아무것도 없는 곳
         let fetcher = crate::model_fetch::ModelFetcher::new(temp_dir("contract-model"), "http://127.0.0.1:9").unwrap();

@@ -379,7 +379,7 @@ async function markDirty(env: EvalEnv, evalId: string, at: number): Promise<void
 	await env.DB.prepare(`INSERT OR REPLACE INTO verdict_dirty ("eval_id", "at") VALUES (?1, ?2)`).bind(evalId, at).run()
 }
 
-// ---- 신구 대체 (premium-discount-relay Relation::Supersedes, migrations/0009) ----
+// ---- 신구 대체 (premium-discount-relay Relation::Supersedes, workers/migrations/0009) ----
 
 interface SupersedeRecord {
 	old_id: string

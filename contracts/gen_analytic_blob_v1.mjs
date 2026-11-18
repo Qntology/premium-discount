@@ -1,9 +1,9 @@
 // 웹 분석 사건 BLOB 코덱의 계약 사례. contracts/analytic_blob_v1.json 을 만든다.
 //
-// 실행: node contracts/gen_analytic_blob_v1.mjs   (premium-discount 폴더에서. www/node_modules 의 pako 를 쓴다. 파일을 다시 쓴다)
+// 실행: node contracts/gen_analytic_blob_v1.mjs   (premium-discount 폴더에서. workers/www/node_modules 의 pako 를 쓴다. 파일을 다시 쓴다)
 //
 // D1 의 data 칸은 gzip 한 JSON 이고, 꺼내는 쪽에 따라 모양이 다르다: 바이트 숫자 배열(D1), {type: 'Buffer', data}(Node),
-// {"0":…}(JSON.stringify(Uint8Array)), base64 글(Worker 응답), JSON 글. 서버(www/src/blob.ts)와 Rust(crates/premium-discount-analytic
+// {"0":…}(JSON.stringify(Uint8Array)), base64 글(Worker 응답), JSON 글. 서버(workers/www/src/blob.ts)와 Rust(crates/premium-discount-analytic
 // 의 blob)는 모든 사례에서 expect 를 내야 한다. logis-center runtime.ts 의 decodeAnalyticBlob 은 BUG-RT-2(작은 base64 gzip)와
 // BUG-RT-4(원시값) 사례에서 틀린다.
 import { createRequire } from 'node:module'
@@ -11,7 +11,7 @@ import { writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const require = createRequire(import.meta.url)
-const pako = require('../www/node_modules/pako')
+const pako = require('../workers/www/node_modules/pako')
 
 const enc = new TextEncoder()
 const event = { schema: 'web-event/1', type: 'click', href: 'https://shop.example.com/checkout', target: { pug: 'button | 간편결제' } }

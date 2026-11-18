@@ -1,5 +1,5 @@
 //! The app side: a typed [`PdSyncClient`] over `zena_avatar_mcp::protocol::McpClient`, and [`SyncLoop`], the
-//! coalesced background sync of premium-discount's `app/ui/coalesce.ts` + `main.ts`:
+//! coalesced background sync of premium-discount's `web/desktop/coalesce.ts` + `main.ts`:
 //!
 //! * a request while idle runs at once;
 //! * requests while a run is in progress are not dropped: they share exactly one rerun after it, and the rerun

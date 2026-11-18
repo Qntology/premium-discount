@@ -189,4 +189,4 @@ build/
 .turbo/
 
 # Tauri가 빌드할 때 만드는 권한 스키마 (gen/android 등 모바일 프로젝트는 커밋한다)
-app/src-tauri/gen/schemas/
+apps/desktop/gen/schemas/

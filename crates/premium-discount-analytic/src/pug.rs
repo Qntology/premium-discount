@@ -4,7 +4,7 @@
 //! `sanitize_llm_input` 을 그대로 옮겼다. 모델이 사이트의 이름표(class 이름)를 보고 지어내지 못하게 하고, 사용자가 고른
 //! 요소(TARGET)와 고르지 않은 형제(RELATED)를 글로만 견주게 하려는 것이다.
 //!
-//! PD 에서는 수집 스크립트(`www/public/static/js/tracker.js`)가 브라우저의 DOM 에서 바로 이 모양을 만든다. 서버는 HTML 을
+//! PD 에서는 수집 스크립트(`web/www/static/js/tracker.js`)가 브라우저의 DOM 에서 바로 이 모양을 만든다. 서버는 HTML 을
 //! 받지 않는다. [`html_to_pug`] 는 HTML 배열로 쌓인 예전 사건(tracker-logis-center 의 `action` · `relate`)을 읽을 때만 쓴다.
 //! 두 쪽 규칙은 `contracts/analytic_pug_v1.json` 의 사례로 맞춘다. logis-center 의 `ListMode` 규칙을 따르되 다음이 다르다:
 //! - 입력 칸 · 글 상자의 값(`input[value]`, `textarea`)은 내지 않는다. 결제 화면에 미리 채운 이름 · 주소가 값으로 들어 있다.

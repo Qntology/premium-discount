@@ -1,9 +1,9 @@
 // cron 대기열 처리 테스트. D1은 실제 SQLite(node:sqlite)이고 마이그레이션 0002~0005를 그대로 적용한다.
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test cron/test/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/cron/test/*.test.ts  (premium-discount 폴더에서)
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { processQueue, MASKED_HASH } from '../src/index.ts'
-import { FakeD1, FakeVectorize, seedQueue, PARENT_ID, REPLY_ID } from '../../test-support/fakes.ts'
+import { FakeD1, FakeVectorize, seedQueue, PARENT_ID, REPLY_ID } from '../../../test-support/fakes.ts'
 
 const T0 = 1_000_000
 const MIN = 60_000

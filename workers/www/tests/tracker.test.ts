@@ -1,5 +1,5 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
-// 수집 스크립트(public/static/js/tracker.js)의 순수 함수: 속성 없는 PUG(계약 사례 = Rust html_to_pug), 조상 모양, 목록 형제, 크기 어림.
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
+// 수집 스크립트(web/www/static/js/tracker.js)의 순수 함수: 속성 없는 PUG(계약 사례 = Rust html_to_pug), 조상 모양, 목록 형제, 크기 어림.
 // DOM 은 linkedom 이다(배치 · 계산 스타일이 없으므로 보이는지 판정은 시험에서 바꿔 끼운다).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -7,8 +7,8 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { parseHTML } from 'linkedom'
 
-const source = readFileSync(fileURLToPath(new URL('../public/static/js/tracker.js', import.meta.url)), 'utf8')
-const pugCases = JSON.parse(readFileSync(fileURLToPath(new URL('../../contracts/analytic_pug_v1.json', import.meta.url)), 'utf8'))
+const source = readFileSync(fileURLToPath(new URL('../../../web/www/static/js/tracker.js', import.meta.url)), 'utf8')
+const pugCases = JSON.parse(readFileSync(fileURLToPath(new URL('../../../contracts/analytic_pug_v1.json', import.meta.url)), 'utf8'))
 
 // 시험 모드로 불러온다: 함수만 내놓고 수집은 시작하지 않는다
 function load(): any {

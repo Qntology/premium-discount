@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
 // 접근성 내비게이션 타임트라이얼(POST · GET · DELETE /nav/trials): 플로우는 체크포인트 10개까지, 앱 · 웹마다 코스 10개까지
 // (받는 수 제한 없음), 같은 코스는 횟수(중복 카운트)로, 다른 사용자의 기록은 11번 넘게 달린 코스만 고스트로,
 // 지갑(익명 계정) 코스는 30일, 세션 코스는 기한 없음, 계정 없는 합계는 줄지 않음.
@@ -11,7 +11,7 @@ import { walletRequestMessage, addressFromEmail } from '../src/auth.ts'
 import { authorKey } from '../src/projection.ts'
 import type { EvalEnv } from '../src/evaluations.ts'
 import { DAY_MS, TRIAL_POLICY, dayOf, expireWalletTrials, tier } from '../../cron/src/navtrials.ts'
-import { FakeD1 } from '../../test-support/fakes.ts'
+import { FakeD1 } from '../../../test-support/fakes.ts'
 
 const ORIGIN = 'tauri://localhost'
 const IP = '203.0.113.7'

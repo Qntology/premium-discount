@@ -1,4 +1,4 @@
-//! 수집 사건 (`web-event/1`): 사이트에 심은 수집 스크립트(`www/public/static/js/tracker.js`)가 보내고, Worker 가
+//! 수집 사건 (`web-event/1`): 사이트에 심은 수집 스크립트(`web/www/static/js/tracker.js`)가 보내고, Worker 가
 //! `/analytic/events` 로 받아 사이트(`cc`)마다 쌓는 모양이다. tracker-logis-center 의 `pushEvent` 를 옮기면서 값을 줄였다.
 //!
 //! | tracker-logis-center | 여기 |

@@ -1,4 +1,4 @@
-﻿// 실행: node --experimental-strip-types --test cron/test/vector.test.ts  (premium-discount 폴더에서)
+﻿// 실행: node --experimental-strip-types --test workers/cron/test/vector.test.ts  (premium-discount 폴더에서)
 // 외부 의존성 없이 Node 내장 test runner만 쓴다.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

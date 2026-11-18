@@ -9,16 +9,16 @@
 | `gen_verdict_v2.py` | PD-Verdict v2 참조 구현. v1 의 함수를 그대로 쓰고 매개변수만 넓힙니다. 실행하면 `verdict_v2.json` 을 다시 씁니다 |
 | `verdict_v2.json` | v2 매개변수와 사례 25개(v1 사례 19개 + 접근성 내비게이션 사례 6개) |
 | `gen_wallet_v1.mjs` | 인증의 지갑 갈래(사용자가 시드 구문을 보관하는 익명 계정) 참조 구현. ethers 로 `wallet_v1.json` 을 다시 씁니다 |
-| `wallet_v1.json` | 시드 구문 → 주소 · 개인 키 2건, EIP-191 서명 3건, 요청 서명 2건, 거절할 시드 구문 3건. 서버(`www/src/auth.ts`)와 `crates/premium-discount-identity` 가 같은 값을 냅니다 |
+| `wallet_v1.json` | 시드 구문 → 주소 · 개인 키 2건, EIP-191 서명 3건, 요청 서명 2건, 거절할 시드 구문 3건. 서버(`workers/www/src/auth.ts`)와 `crates/premium-discount-identity` 가 같은 값을 냅니다 |
 | `gen_analytic_blob_v1.mjs` | 웹 분석 사건 BLOB 코덱의 사례를 pako 로 만듭니다(`analytic_blob_v1.json` 을 다시 씀) |
-| `analytic_blob_v1.json` | D1 `data` 칸의 여러 모양(바이트 배열 · Buffer · `{"0":…}` · base64 · JSON · 원시값) 19 사례. 서버 `www/src/blob.ts` 와 `crates/premium-discount-analytic` 의 `blob` 이 같은 객체를 냅니다(logis-center BUG-RT-2/3/4 사례 포함) |
-| `analytic_pug_v1.json` | 요소 → 속성 없는 PUG 13 사례. 수집 스크립트(`www/public/static/js/tracker.js` 의 `toPug`, 브라우저 DOM)와 `premium-discount-analytic` 의 `html_to_pug` 가 같은 결과를 냅니다 |
+| `analytic_blob_v1.json` | D1 `data` 칸의 여러 모양(바이트 배열 · Buffer · `{"0":…}` · base64 · JSON · 원시값) 19 사례. 서버 `workers/www/src/blob.ts` 와 `crates/premium-discount-analytic` 의 `blob` 이 같은 객체를 냅니다(logis-center BUG-RT-2/3/4 사례 포함) |
+| `analytic_pug_v1.json` | 요소 → 속성 없는 PUG 13 사례. 수집 스크립트(`web/www/static/js/tracker.js` 의 `toPug`, 브라우저 DOM)와 `premium-discount-analytic` 의 `html_to_pug` 가 같은 결과를 냅니다 |
 
 ```bash
 python contracts/gen_verdict_v1.py   # premium-discount 폴더에서
 python contracts/gen_verdict_v2.py
-node contracts/gen_wallet_v1.mjs     # www/node_modules 의 ethers 를 씁니다
-node contracts/gen_analytic_blob_v1.mjs   # www/node_modules 의 pako 를 씁니다
+node contracts/gen_wallet_v1.mjs     # workers/www/node_modules 의 ethers 를 씁니다
+node contracts/gen_analytic_blob_v1.mjs   # workers/www/node_modules 의 pako 를 씁니다
 ```
 
 ## 지갑 갈래: 요청 서명 (`pd-wallet/1`)
@@ -74,9 +74,9 @@ v2(`pd-verdict/2`)는 규칙(위 1 ~ 7)이 v1 과 같고, 매개변수 두 가�
 | 구현 | 위치 | 시험 |
 | --- | --- | --- |
 | 참조 (Python) | `contracts/gen_verdict_v1.py`, `gen_verdict_v2.py` | 이 파일이 기대값을 만듭니다 |
-| 서버 cron (TypeScript) | `cron/src/verdict.ts` | `cron/test/verdict.test.ts`(v1), `cron/test/verdict_v2.test.ts`(v2, 계약의 `params` 를 넘겨서) |
-| 앱 E2E 가짜 서버 | `app/tests/e2e/mock_server.py` | 참조 구현을 그대로 import |
-| Rust 라이브러리 | `crates/premium-discount-verdict` (`Params::v1()`, `Params::v2()`) | `cd crates && cargo test`: 두 계약의 매개변수와 사례 전부, v2 가 v1 사례를 그대로 담는지 |
+| 서버 cron (TypeScript) | `workers/cron/src/verdict.ts` | `workers/cron/test/verdict.test.ts`(v1), `workers/cron/test/verdict_v2.test.ts`(v2, 계약의 `params` 를 넘겨서) |
+| 앱 E2E 가짜 서버 | `apps/core/tests/e2e/mock_server.py` | 참조 구현을 그대로 import |
+| Rust 라이브러리 | `crates/premium-discount-verdict` (`Params::v1()`, `Params::v2()`) | `cargo test -p premium-discount-verdict` (premium-discount 폴더에서): 두 계약의 매개변수와 사례 전부, v2 가 v1 사례를 그대로 담는지 |
 | raon-zena (Rust) | `crates/zena-verdict` | 사본(`contracts/verdict_v1.json`)의 해시, 옆 저장소 원본과의 대조, 사례 전부. `premium-discount-verdict` 로 옮길 예정 |
 
 ## 관측 종류별 기본 가중치

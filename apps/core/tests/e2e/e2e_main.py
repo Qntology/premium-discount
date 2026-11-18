@@ -1,8 +1,8 @@
 # 실제 EmbeddingGemma 모델로 실행 파일(main)을 끝까지 돌리는 검증. 모델 파일(약 1.5GB)이 필요해서 cargo test에는 넣지 않았다.
 #
-#   cargo build --release --bin premium-discount-app          # app 폴더에서
+#   cargo build --release --bin premium-discount-app          # apps/core 폴더에서 (산출물은 루트 target/)
 #   python3 tests/e2e/mock_server.py 18787 /tmp/server.log &   # 가짜 서버 (www의 검증 규칙과 멱등 request_id를 흉내)
-#   python3 tests/e2e/e2e_main.py target/release/premium-discount-app <EMBEDDINGGEMMA_DIR> /tmp/pd-data 18787 /tmp/server.log
+#   python3 tests/e2e/e2e_main.py ../../target/release/premium-discount-app <EMBEDDINGGEMMA_DIR> /tmp/pd-data 18787 /tmp/server.log
 #
 # 실제 EmbeddingGemma로 main(표준 입출력)을 끝까지 돌린다: 저장 → 로컬 검색 → 병합 검색 → 캐시 동기화 → flush
 import json, subprocess, sys, time, os, math

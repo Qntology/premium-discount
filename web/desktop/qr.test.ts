@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --test app/ui/qr.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --test web/desktop/qr.test.ts  (premium-discount 폴더에서)
 // jsQR(스캐너 라이브러리)로 매트릭스를 실제로 읽어서, QR이 담고 있는 문자열을 확인한다.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

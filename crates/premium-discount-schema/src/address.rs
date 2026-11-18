@@ -1,6 +1,6 @@
 //! premium.discount addresses: `0x` + 40 lowercase hex.
 //!
-//! [`hash_id`] is the server project's `hashId(text)` (legacy `www/src/index.ts`, `www/public/static/js`):
+//! [`hash_id`] is the server project's `hashId(text)` (legacy `workers/www/src/index.ts`, `web/www/static/js`):
 //! `ethers.computeAddress(ethers.hashMessage(text)).toLowerCase()`, i.e. the EIP-191 message hash used as a
 //! secp256k1 private key, and the address of its public key. The server only checks `ethers.isAddress`, so any
 //! 20 bytes would pass; using the same recipe keeps `to` / `bcc` comparable with the other clients. The hashing
@@ -54,7 +54,7 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    // Generated with the ethers 6.9.0 bundle the server project ships (www/public/static/js/ethers.umd.min.js):
+    // Generated with the ethers 6.9.0 bundle the server project ships (web/www/static/js/ethers.umd.min.js):
     // { hashMessage(s), computeAddress(hashMessage(s)).toLowerCase() }.
     const REFERENCE: [(&str, &str, &str); 8] = [
         (

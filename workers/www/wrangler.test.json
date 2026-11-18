@@ -12,7 +12,8 @@
 		{
 			"binding": "DB",
 			"database_id": "f7ec6d8c-4274-44e7-94e9-d25410026f4b",
-			"database_name": "premium_discount"
+			"database_name": "premium_discount",
+			"migrations_dir": "../migrations"
 		}
 	],
 	"vectorize": [
@@ -37,7 +38,7 @@
 		"enabled": true
 	},
 	"assets": {
-		"directory": "./public/",
+		"directory": "../../web/www/",
 		"binding": "ASSETS"
 	},
 	"rules": [

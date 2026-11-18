@@ -2,7 +2,7 @@
 // Tauri 웹뷰에서는 필요 없다 (Tauri의 invoke가 같은 명령을 부른다). 개발과 검증 전용이다: 127.0.0.1에서만 받는다.
 //
 //   PD_MODEL_DIR=… PD_DATA_DIR=… PD_SERVER_URL=… node dev-server.mjs        (환경 변수는 실행 파일의 --help 참고)
-//   PD_BIN       실행 파일 경로 (기본 ../target/release/premium-discount-app)
+//   PD_BIN       실행 파일 경로 (기본 ../../target/release/premium-discount-app, 루트 target/)
 //   PORT         기본 5173
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 import { extname, join, normalize } from 'node:path'
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url))
-const BIN = process.env.PD_BIN ?? here('../target/release/premium-discount-app')
+const BIN = process.env.PD_BIN ?? here('../../target/release/premium-discount-app')
 const PORT = Number(process.env.PORT ?? 5173)
 const DIST = here('dist')
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.map': 'application/json' }

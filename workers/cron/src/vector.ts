@@ -7,7 +7,7 @@
 //
 // 오류 메시지에는 길이와 형태만 넣는다 (벡터 값은 넣지 않는다).
 
-// www/src/evaluations.ts의 EVAL_DIMENSIONS와 같아야 한다 (google/embeddinggemma-2 출력 차원)
+// workers/www/src/evaluations.ts의 EVAL_DIMENSIONS와 같아야 한다 (google/embeddinggemma-2 출력 차원)
 export const VECTOR_DIMENSIONS = 768
 const BYTES_PER_FLOAT = 4
 

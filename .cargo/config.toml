@@ -1,0 +1,4 @@
+# 작업 공간 어디에서 cargo 를 불러도 같은 설정을 쓴다 (예전 app/src-tauri/.cargo/config.toml 의 target-dir = "../target" 을 옮김).
+# 산출물은 루트 target/ 하나 (crates/ · apps/core · apps/desktop 이 같은 의존성 빌드를 나눠 쓴다. apps/desktop/sidecars.mjs 가 이 경로를 본다).
+[build]
+target-dir = "target"

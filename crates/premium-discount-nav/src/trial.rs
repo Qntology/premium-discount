@@ -194,7 +194,7 @@ fn round_split(ms: i64) -> u32 {
 
 /// 코스 id 체인: 체크포인트마다 그 지점까지의 코스 id. 첫 값은 `hashId(<앱 id> + <체크포인트 id>)`, 다음부터는
 /// `hashId(<이전 코스 id> + <체크포인트 id>)` 다. 앞부분이 같은 코스는 그 지점까지 같은 id 를 갖고, 체크포인트 하나 · 순서 하나만
-/// 달라도 그 뒤로는 다른 id 가 된다. 서버(`www/src/navtrials.ts`)도 같은 글로 다시 계산한다
+/// 달라도 그 뒤로는 다른 id 가 된다. 서버(`workers/www/src/navtrials.ts`)도 같은 글로 다시 계산한다
 pub fn course_chain(app: &str, steps: &[StepRef]) -> Option<Vec<String>> {
     let mut previous = app.trim().to_ascii_lowercase();
     let mut out = Vec::with_capacity(steps.len());
@@ -330,7 +330,7 @@ pub fn tier(premium: u32, discount: u32) -> Tier {
 /// 다른 사용자의 코스(고스트)를 따라 달린 런의 체크포인트 판정. 시작과 결승이 고스트와 같을 때만 판정한다(같은 목적지로 가는
 /// 길의 비교). 고스트의 중간 체크포인트(시작 · 결승을 뺀 것)마다, 런이 그 체크포인트를 지났으면 premium, 지나지 않았으면
 /// (다른 길로 갔으면) discount 다. 런에만 있는 체크포인트는 판정하지 않는다. 시작이나 결승이 다르면 None.
-/// 서버(`www/src/navtrials.ts` 의 routeMarks)도 같은 규칙이다
+/// 서버(`workers/www/src/navtrials.ts` 의 routeMarks)도 같은 규칙이다
 pub fn route_marks(run: &[StepRef], ghost: &[StepRef]) -> Option<Vec<(StepRef, MarkType)>> {
     if run.first()? != ghost.first()? || run.last()? != ghost.last()? {
         return None;

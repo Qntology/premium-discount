@@ -327,7 +327,7 @@ fn in_list(column: &str, values: &[String]) -> String {
     format!("{column} IN ({})", quoted.join(", "))
 }
 
-/// 404 본문이 "평가 없음"인지 (서버 www/src/evaluations.ts의 메시지)
+/// 404 본문이 "평가 없음"인지 (서버 workers/www/src/evaluations.ts의 메시지)
 fn is_missing_evaluation(status: u16, message: &str) -> bool {
     status == 404 && message.contains("evaluation not found")
 }

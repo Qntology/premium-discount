@@ -1,4 +1,4 @@
-// Rust 명령(app/src/commands.rs)을 부르는 화면 쪽 래퍼.
+// Rust 명령(apps/core/src/commands.rs)을 부르는 화면 쪽 래퍼.
 //
 // `invoke`는 화면 셸이 넘겨 준다. Tauri 웹뷰에서는 `window.__TAURI__.core.invoke`다. 이 파일은 Tauri를 직접 import하지 않으므로
 // Node에서도 테스트할 수 있다 (localdb.ts가 Dexie를 직접 import하지 않는 것과 같다).

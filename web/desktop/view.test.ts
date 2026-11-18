@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --test app/ui/view.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --test web/desktop/view.test.ts  (premium-discount 폴더에서)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { STATES } from './localdb.ts'
@@ -75,7 +75,7 @@ test('저장 결과 안내: 차단은 글을 남기고, 접수·대기는 글을
 })
 
 test('오류 안내: Rust가 돌려주는 실제 문구를 한국어로 바꾼다', () => {
-	// 실제 main 실행에서 받은 문구 (app/tests/e2e)
+	// 실제 main 실행에서 받은 문구 (apps/core/tests/e2e)
 	assert.equal(describeError({ kind: 'invalid_input', message: 'invalid input: cc must be a registrable domain: localhost' }).title, '도메인 형식이 올바르지 않습니다')
 	assert.match(describeError({ kind: 'invalid_input', message: 'invalid input: text must be at most 8192 bytes' }).title, /너무 깁니다 \(최대 8,192바이트\)/)
 	assert.equal(describeError({ kind: 'invalid_input', message: 'invalid input: input uses 9000 tokens, limit is 8192' }).title, '글이 너무 길어 처리할 수 없습니다')

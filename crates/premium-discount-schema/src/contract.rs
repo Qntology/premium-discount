@@ -1,6 +1,6 @@
-//! premium-discount-app 의 명령 계약: `serve_lines` · Tauri 셸 · 화면(`app/ui/commands.ts`)이 주고받는 인자와 결과,
-//! 오류 종류. 앱(`app/src/commands.rs`)은 이 타입을 다시 내보내고 그대로 쓰며, premium-discount-mcp 는 같은 이름과
-//! 오류 종류로 도구를 만든다. 명령 이름과 인자 모양의 기준은 `app/ui/fixtures/command_contract.json` 이고, 이 crate 의
+//! premium-discount-app 의 명령 계약: `serve_lines` · Tauri 셸 · 화면(`web/desktop/commands.ts`)이 주고받는 인자와 결과,
+//! 오류 종류. 앱(`apps/core/src/commands.rs`)은 이 타입을 다시 내보내고 그대로 쓰며, premium-discount-mcp 는 같은 이름과
+//! 오류 종류로 도구를 만든다. 명령 이름과 인자 모양의 기준은 `web/desktop/fixtures/command_contract.json` 이고, 이 crate 의
 //! 시험과 앱 · 화면의 시험이 같은 파일을 읽는다.
 //!
 //! 앱 안의 타입에 기대는 것(판정 캐시 행 `VerdictsResult`, 모델 상주 상태가 붙는 `AppStatus`, 모델 내려받기 · 초안
@@ -15,7 +15,7 @@ fn default_top_k() -> u32 {
     DEFAULT_TOP_K
 }
 
-/// UI는 "없음"을 빈 문자열로 들고 있다 (`app/ui/localdb.ts`). 빈 문자열과 공백은 "없음"으로 읽는다.
+/// UI는 "없음"을 빈 문자열로 들고 있다 (`web/desktop/localdb.ts`). 빈 문자열과 공백은 "없음"으로 읽는다.
 pub fn blank_to_none(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
@@ -68,7 +68,7 @@ pub const ERROR_KINDS: [&str; 15] = [
     "unknown",
 ];
 
-// ---- 인자 · 결과 (app/src/commands.rs 에서 옮김) ----
+// ---- 인자 · 결과 (apps/core/src/commands.rs 에서 옮김) ----
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubmitArgs {
@@ -353,7 +353,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const CONTRACT: &str = include_str!("../../../app/ui/fixtures/command_contract.json");
+    const CONTRACT: &str = include_str!("../../../web/desktop/fixtures/command_contract.json");
 
     fn contract() -> serde_json::Map<String, Value> {
         let v: Value = serde_json::from_str(CONTRACT).unwrap();

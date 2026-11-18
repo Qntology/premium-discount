@@ -2,8 +2,8 @@
 // Hugging Face 자리는 model_server.py(가짜, 실제 모델 파일을 Range로 답함, 속도 제한), 평가 서버는 mock_server.py.
 // 받은 바이트는 고정 해시로 확인하므로 실제 모델 파일이 필요하다.
 //
-//   cd app/ui && npm install && npm run build
-//   node tests/e2e/ui_model_e2e.mjs target/release/premium-discount-app <EMBEDDINGGEMMA_DIR(원본 파일)> <스크린샷 폴더> [<LAYA_DIR>]
+//   cd web/desktop && npm install && npm run build
+//   node tests/e2e/ui_model_e2e.mjs ../../target/release/premium-discount-app <EMBEDDINGGEMMA_DIR(원본 파일)> <스크린샷 폴더> [<LAYA_DIR>]
 //   LAYA_DIR을 주면 욕설 필터 모델(laya-multilingual) 내려받기와 판정도 본다. QWEN_DIR(환경 변수)을 주면 items 초안 모델도 본다
 import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
@@ -33,7 +33,7 @@ for (let i = 0; i < 50; i++) { try { await hf({}); break } catch { await sleep(1
 // 진행률과 멈추기를 화면에서 볼 수 있도록 초당 40MB로 늦춘다 (텍스트 전용 574MB ≈ 15초)
 await hf({ rate: 40e6 })
 
-const ui = spawn('node', [here('../../ui/dev-server.mjs')], {
+const ui = spawn('node', [here('../../../../web/desktop/dev-server.mjs')], {
 	env: { ...process.env, PD_MODEL_DIR: MODEL, PD_FILTER_MODEL_DIR: FILTER, PD_DRAFT_MODEL_DIR: DRAFT, PD_DATA_DIR: DATA, PD_SERVER_URL: `http://127.0.0.1:${SERVER_PORT}`, PD_MODEL_BASE_URL: `http://127.0.0.1:${MODEL_PORT}`, PD_BIN: BIN, PORT: String(UI_PORT) },
 	stdio: ['ignore', 'pipe', 'inherit'],
 })

@@ -1,4 +1,4 @@
-// 접근성 내비게이션 타임트라이얼(trial/1)의 서버 보관 규칙. www(받기 · 보여 주기: www/src/navtrials.ts)와 cron(지갑 기록 지우기)이 함께 쓴다.
+// 접근성 내비게이션 타임트라이얼(trial/1)의 서버 보관 규칙. www(받기 · 보여 주기: workers/www/src/navtrials.ts)와 cron(지갑 기록 지우기)이 함께 쓴다.
 // 기기 쪽 같은 규칙은 crates/premium-discount-nav trial.rs 다(MAX_STEPS · MAX_COURSES · tier).
 //
 // - 플로우(코스) 하나는 체크포인트 maxSteps 개까지, 계정 · 앱(웹)마다 코스 maxCourses 개까지. 받는 수 제한(10분에 100개)은 없앴다.

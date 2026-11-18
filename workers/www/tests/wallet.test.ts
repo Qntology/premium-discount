@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test www/tests/*.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts  (premium-discount 폴더에서)
 // 인증의 지갑 갈래(익명 계정): 요청 서명 확인. 기준은 contracts/wallet_v1.json(ethers 로 뽑은 값)이고,
 // 기기 쪽 Rust(crates/premium-discount-identity)도 같은 계약을 시험한다.
 import { test } from 'node:test'
@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { ethers } from 'ethers'
 import { verifyWalletRequest, walletRequestMessage, WALLET_MAX_SKEW_MS } from '../src/auth.ts'
 
-const contract = JSON.parse(readFileSync(fileURLToPath(new URL('../../contracts/wallet_v1.json', import.meta.url)), 'utf8'))
+const contract = JSON.parse(readFileSync(fileURLToPath(new URL('../../../contracts/wallet_v1.json', import.meta.url)), 'utf8'))
 const enc = new TextEncoder()
 
 // 계약의 요청 r 을 Request 로. overrides 로 본문 · 경로 · 헤더를 바꿔 위조를 만든다

@@ -1,4 +1,4 @@
-// 접근성 내비게이션 타임트라이얼(trial/1). 보관 규칙은 cron/src/navtrials.ts(TRIAL_POLICY), 표는 migrations/0007_nav_trials.sql,
+// 접근성 내비게이션 타임트라이얼(trial/1). 보관 규칙은 workers/cron/src/navtrials.ts(TRIAL_POLICY), 표는 workers/migrations/0007_nav_trials.sql,
 // 기기 쪽은 crates/premium-discount-nav trial.rs 다.
 //
 // POST   /nav/trials              본문 { "runs": [trial/1, ...] } (최대 10개). 런마다 결과를 보낸 순서대로 돌려준다

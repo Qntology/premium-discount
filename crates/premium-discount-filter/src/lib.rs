@@ -1,6 +1,6 @@
 //! 사전 기반 로컬 욕설 필터 (모델 파일 · 네트워크 · 비동기 런타임 없음).
 //!
-//! premium-discount-app 은 평가를 임베딩 · 저장 · 전송하기 전에 이 필터로 먼저 거른다(`app/src/filter.rs` 의
+//! premium-discount-app 은 평가를 임베딩 · 저장 · 전송하기 전에 이 필터로 먼저 거른다(`apps/core/src/filter.rs` 의
 //! `ProfanityFilter` 가 이 타입을 감싸고, 모델 필터 laya 와 바꿔 끼운다). Raon Zena 는 앱 프로세스를 띄우기 전이나
 //! 대화 입력 단계에서 같은 사전으로 바로(프로세스 안에서) 거를 수 있다.
 

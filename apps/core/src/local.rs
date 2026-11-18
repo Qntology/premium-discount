@@ -143,7 +143,7 @@ pub fn empty_to_none(v: &str) -> Option<String> {
 
 impl LocalRecord {
     /// 화면 캐시(Dexie) 행. 벡터는 넣지 않는다 (검색은 Rust에서 하므로 IPC로 보낼 이유가 없다).
-    /// 형태는 `app/ui/localdb.ts`의 `LocalRow`와 같아야 한다.
+    /// 형태는 `web/desktop/localdb.ts`의 `LocalRow`와 같아야 한다.
     pub fn to_cache_row(&self) -> Value {
         json!({
             "request_id": self.request_id,
@@ -939,8 +939,8 @@ mod tests {
         assert_eq!(empty_to_none(" 0xab "), Some("0xab".to_string()));
     }
 
-    /// Rust(`to_cache_row`)와 JS(`app/ui/localdb.ts`)가 같은 행 모양을 쓰는지 확인하는 계약 테스트.
-    /// 같은 픽스처를 JS 테스트(`app/ui/localdb.test.ts`)도 읽는다. 한쪽 모양을 바꾸면 이 테스트나 JS 테스트가 깨진다.
+    /// Rust(`to_cache_row`)와 JS(`web/desktop/localdb.ts`)가 같은 행 모양을 쓰는지 확인하는 계약 테스트.
+    /// 같은 픽스처를 JS 테스트(`web/desktop/localdb.test.ts`)도 읽는다. 한쪽 모양을 바꾸면 이 테스트나 JS 테스트가 깨진다.
     #[test]
     fn cache_rows_match_the_contract_fixture_shared_with_the_js_side() {
         let full = LocalRecord {
@@ -983,7 +983,7 @@ mod tests {
             created_at: 1_700_000_001_000,
             updated_at: 1_700_000_001_000,
         };
-        let fixture: Value = serde_json::from_str(include_str!("../ui/fixtures/cache_rows.json")).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!("../../../web/desktop/fixtures/cache_rows.json")).unwrap();
         let actual = Value::Array(vec![full.to_cache_row(), bare.to_cache_row()]);
         assert_eq!(actual, fixture, "Rust가 내보내는 행이 계약 픽스처와 다르다: {actual:#}");
     }

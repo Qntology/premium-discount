@@ -2,9 +2,9 @@
 // 실제 모델(EmbeddingGemma)이 연결된 실행 파일을 dev-server.mjs 브리지로 붙이고, 서버만 가짜(mock_server.py)다.
 // 다른 사용자의 글은 두 번째 앱 인스턴스(다른 데이터 폴더)로 같은 가짜 서버에 올려서 만든다.
 //
-//   cd app/ui && npm install && npm run build                       # 화면 묶기
-//   cd app && cargo build --release --bin premium-discount-app      # 실행 파일
-//   node tests/e2e/ui_e2e.mjs target/release/premium-discount-app <EMBEDDINGGEMMA_DIR> <스크린샷 폴더>
+//   cd web/desktop && npm install && npm run build                       # 화면 묶기
+//   cargo build --release -p premium-discount-app --bin premium-discount-app      # 실행 파일 (premium-discount 폴더에서, 루트 target/)
+//   node tests/e2e/ui_e2e.mjs ../../target/release/premium-discount-app <EMBEDDINGGEMMA_DIR> <스크린샷 폴더>
 //   (playwright가 전역으로 설치되어 있어야 한다: require('playwright'))
 import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
@@ -51,7 +51,7 @@ async function seedOtherUser(texts) {
 }
 
 // ---- 화면 앱 (브리지) ----
-const ui = spawn('node', [fileURLToPath(new URL('../../ui/dev-server.mjs', import.meta.url))], { env: { ...appEnv(DATA_ME), PD_BIN: BIN, PORT: String(UI_PORT) }, stdio: ['ignore', 'pipe', 'inherit'] })
+const ui = spawn('node', [fileURLToPath(new URL('../../../../web/desktop/dev-server.mjs', import.meta.url))], { env: { ...appEnv(DATA_ME), PD_BIN: BIN, PORT: String(UI_PORT) }, stdio: ['ignore', 'pipe', 'inherit'] })
 // 어떤 이유로 끝나든(검증 실패 포함) 자식 프로세스를 남기지 않는다
 process.on('exit', () => { ui.kill(); mock?.kill() })
 await new Promise((r) => ui.stdout.on('data', (d) => String(d).includes('http://') && r()))

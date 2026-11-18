@@ -1,4 +1,4 @@
-﻿// 실행: node --experimental-strip-types --test app/ui/localdb.test.ts  (premium-discount 폴더에서)
+﻿// 실행: node --experimental-strip-types --test web/desktop/localdb.test.ts  (premium-discount 폴더에서)
 // Dexie는 설치하지 않고 같은 인터페이스의 메모리 가짜를 쓴다. 실제 IndexedDB 동작은 확인하지 못한다 (README 참고).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

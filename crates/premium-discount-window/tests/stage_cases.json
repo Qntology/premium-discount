@@ -1,5 +1,5 @@
 {
-  "note": "app/ui/stage.ts 의 동작을 tests/gen_stage_cases.mjs 로 적은 표. 손으로 고치지 말고 다시 만든다",
+  "note": "web/desktop/stage.ts 의 동작을 tests/gen_stage_cases.mjs 로 적은 표. 손으로 고치지 말고 다시 만든다",
   "constants": {"stage_size":[{"width":360,"height":56},{"width":360,"height":260},{"width":400,"height":580}],"dock_margin":16,"drag_threshold":5},
   "place_window": [
     {"name":"1080p 처음 알약","size":{"width":360,"height":56},"area":{"x":0,"y":0,"width":1920,"height":1040},"scale":1,"anchor":null,"margin":16,"expected":{"x":1544,"y":968}},

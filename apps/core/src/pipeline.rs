@@ -489,7 +489,7 @@ fn normalize_cc(raw: &str) -> Result<String, AppError> {
     let valid_chars = cc
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-');
-        // 서버(www/src/evaluations.ts의 DOMAIN_RE)보다 느슨하면 서버가 400으로 거부해 큐에서 영구 거부로 버려진다.
+        // 서버(workers/www/src/evaluations.ts의 DOMAIN_RE)보다 느슨하면 서버가 400으로 거부해 큐에서 영구 거부로 버려진다.
     // 라벨은 1~63자, 최상위 도메인(TLD)은 영문 소문자 2~63자만 허용한다. 이 쪽이 더 엄격해도(라벨의 앞뒤 '-' 금지) 괄찮다.
     let labels_ok = cc
         .split('.')
@@ -1093,7 +1093,7 @@ mod prompt_tests {
 
 #[cfg(test)]
 mod column_rule_tests {
-    //! 서버(www/src/evaluations.ts)의 검증 규칙과 앱이 어긋나지 않는지 확인한다.
+    //! 서버(workers/www/src/evaluations.ts)의 검증 규칙과 앱이 어긋나지 않는지 확인한다.
     //! 앱이 더 느슨하면 서버가 400으로 거부하고, 큐는 그 항목을 영구 거부로 버린다.
     use super::*;
 

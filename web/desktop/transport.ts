@@ -1,5 +1,5 @@
 // 명령을 부르는 길. Tauri 웹뷰 안이면 Tauri의 invoke를, 브라우저(개발 중)에서는 dev-server.mjs 브리지를 쓴다.
-// Tauri에서 window.__TAURI__를 쓰려면 tauri.conf.json의 app.withGlobalTauri를 true로 둔다 (app/README.md).
+// Tauri에서 window.__TAURI__를 쓰려면 tauri.conf.json의 app.withGlobalTauri를 true로 둔다 (apps/core/README.md).
 import type { Invoke } from './commands.ts'
 
 type TauriGlobal = { core?: { invoke?: Invoke } }
@@ -25,7 +25,7 @@ export function pickInvoke(): Invoke {
 type OpenerGlobal = { openUrl?: (url: string) => Promise<void> }
 
 /** 이 기기의 다른 앱(메일 앱)을 연다. Tauri에서는 opener 플러그인이 Android의 Intent와 데스크톱의 기본 앱 열기를 맡는다.
- *  Tauri 밖(개발용 브라우저)에서는 브라우저의 링크 열기로 대신한다. mailto: 만 열 수 있다 (src-tauri/capabilities). */
+ *  Tauri 밖(개발용 브라우저)에서는 브라우저의 링크 열기로 대신한다. mailto: 만 열 수 있다 (apps/desktop/capabilities). */
 export async function openExternal(url: string): Promise<void> {
 	const opener = (globalThis as { __TAURI__?: { opener?: OpenerGlobal } }).__TAURI__?.opener
 	if (opener?.openUrl) return opener.openUrl(url)

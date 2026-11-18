@@ -1,32 +1,41 @@
-# premium-discount 가 소유하는 라이브러리 crate. 앱(app/)과 raon-zena 가 path · git 의존으로 가져다 쓴다.
-# 앱은 따로 빌드한다 (자체 Cargo.lock · 모바일 빌드 설정 · LanceDB). 그래서 이 작업 공간은 crates/ 아래만 묶는다.
+# premium-discount 루트 작업 공간 (logis-center 와 같은 배치).
 #
-# 원칙: 라이브러리는 LanceDB · Tauri · 비동기 런타임(tokio)에 의존하지 않는다. 저장은 앱이 맡는다.
+#   crates/        premium-discount-* 라이브러리 crate 와 onnxruntime 벤더 사본. raon-zena · logis-center 가 git 리비전으로 가져다 쓴다
+#   apps/core      헤드리스 코어 premium-discount-app (LanceDB 저장소 · 모델 · 동기화 · serve_lines, Tauri 없음)
+#   apps/desktop   데스크톱 · 모바일 Tauri 셸 premium-discount-desktop. 화면은 web/desktop
+#   web/           화면: web/desktop(앱 웹뷰) · web/www(www Worker 가 싣는 정적 파일)
+#   workers/       Cloudflare Workers(TypeScript): www · cron · 둘이 함께 쓰는 D1 migrations
+#
+# 원칙: 라이브러리(crates/)는 LanceDB · Tauri · 비동기 런타임(tokio)에 의존하지 않는다. 저장은 앱이 맡는다.
 # 모델 런타임은 AI 엔진 crate(nlp · vision · onnxruntime)에만 있고, 나머지(판정 · 내비게이션 · 계약 · 통계 · 센서 · 양자화 형식)는
-# 모델 없이 돈다. candle 은 raon-zena · premium-discount-app 과 같은 candle-rocm-vulkan 포크 커밋으로 고정한다(아래 [patch]).
-# 네트워크는 premium-discount-mcp 의 블로킹 HTTP(ureq, GET /graph*) 하나뿐이다. 이름은 약어(pd-*) 없이 premium-discount-* 로 쓴다.
+# 모델 없이 돈다. 네트워크는 premium-discount-mcp 의 블로킹 HTTP(ureq, GET /graph*) 하나뿐이다. 이름은 약어(pd-*) 없이 premium-discount-* 로 쓴다.
+# 예전에는 crates/ · app/ · app/src-tauri 가 각자 Cargo.lock 을 가진 세 작업 공간이었다. 지금은 Cargo.lock 하나, 산출물은 루트 target/
+# (.cargo/config.toml 의 target-dir).
 [workspace]
 resolver = "2"
+# crates/* 글롭 대신 하나씩 적는다: 예전 빌드 폴더(crates/target)처럼 Cargo.toml 없는 폴더가 crates/ 아래에 남아 있어도 작업 공간이 깨지지 않게
 members = [
-    "premium-discount-identity",
-    "premium-discount-verdict",
-    "premium-discount-nav",
-    "premium-discount-schema",
-    "premium-discount-filter",
-    "premium-discount-mcp-protocol",
-    "premium-discount-mcp",
-    "premium-discount-sds",
-    "premium-discount-manifest",
-    "premium-discount-sensor",
-    "premium-discount-nlp",
-    "premium-discount-window",
-    "premium-discount-nms",
-    "premium-discount-quant",
-    "premium-discount-vision",
-    "premium-discount-relay",
-    "premium-discount-analytic",
-    "onnxruntime-sys",
-    "onnxruntime",
+    "crates/premium-discount-identity",
+    "crates/premium-discount-verdict",
+    "crates/premium-discount-nav",
+    "crates/premium-discount-schema",
+    "crates/premium-discount-filter",
+    "crates/premium-discount-mcp-protocol",
+    "crates/premium-discount-mcp",
+    "crates/premium-discount-sds",
+    "crates/premium-discount-manifest",
+    "crates/premium-discount-sensor",
+    "crates/premium-discount-nlp",
+    "crates/premium-discount-window",
+    "crates/premium-discount-nms",
+    "crates/premium-discount-quant",
+    "crates/premium-discount-vision",
+    "crates/premium-discount-relay",
+    "crates/premium-discount-analytic",
+    "crates/onnxruntime-sys",
+    "crates/onnxruntime",
+    "apps/core",
+    "apps/desktop",
 ]
 
 [workspace.package]
@@ -50,28 +59,37 @@ candle-core = "0.11.0"
 candle-nn = "0.11.0"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
-premium-discount-identity = { path = "premium-discount-identity" }
-premium-discount-verdict = { path = "premium-discount-verdict" }
-premium-discount-nav = { path = "premium-discount-nav" }
-premium-discount-schema = { path = "premium-discount-schema" }
-premium-discount-filter = { path = "premium-discount-filter" }
-premium-discount-mcp-protocol = { path = "premium-discount-mcp-protocol" }
-premium-discount-sds = { path = "premium-discount-sds" }
-premium-discount-manifest = { path = "premium-discount-manifest" }
-premium-discount-sensor = { path = "premium-discount-sensor" }
-premium-discount-nlp = { path = "premium-discount-nlp", default-features = false }
-premium-discount-window = { path = "premium-discount-window" }
-premium-discount-nms = { path = "premium-discount-nms" }
-premium-discount-quant = { path = "premium-discount-quant" }
-premium-discount-vision = { path = "premium-discount-vision" }
-premium-discount-relay = { path = "premium-discount-relay" }
-premium-discount-analytic = { path = "premium-discount-analytic" }
+# 내부 crate (crates/)
+premium-discount-identity = { path = "crates/premium-discount-identity" }
+premium-discount-verdict = { path = "crates/premium-discount-verdict" }
+premium-discount-nav = { path = "crates/premium-discount-nav" }
+premium-discount-schema = { path = "crates/premium-discount-schema" }
+premium-discount-filter = { path = "crates/premium-discount-filter" }
+premium-discount-mcp-protocol = { path = "crates/premium-discount-mcp-protocol" }
+premium-discount-sds = { path = "crates/premium-discount-sds" }
+premium-discount-manifest = { path = "crates/premium-discount-manifest" }
+premium-discount-sensor = { path = "crates/premium-discount-sensor" }
+premium-discount-nlp = { path = "crates/premium-discount-nlp", default-features = false }
+premium-discount-window = { path = "crates/premium-discount-window" }
+premium-discount-nms = { path = "crates/premium-discount-nms" }
+premium-discount-quant = { path = "crates/premium-discount-quant" }
+premium-discount-vision = { path = "crates/premium-discount-vision" }
+premium-discount-relay = { path = "crates/premium-discount-relay" }
+premium-discount-analytic = { path = "crates/premium-discount-analytic" }
+# 헤드리스 코어 (apps/core). Tauri 셸(apps/desktop)이 쓴다
+premium-discount-app = { path = "apps/core" }
 
-# candle → Qntology/candle-rocm-vulkan 포크 (CUDA · ROCm-HIP · Vulkan · Metal). raon-zena · app/ 과 같은 커밋.
-# [patch] 는 빌드하는 쪽 루트의 것만 적용되므로, 이 crate 들을 링크하는 작업 공간도 같은 줄을 둔다.
+# candle → Qntology/candle-rocm-vulkan 포크 (CUDA · ROCm-HIP · Vulkan · Metal). raon-zena · logis-center 와 같은 커밋.
+# 예전 세 매니페스트(crates/ · app/ · app/src-tauri)에 같은 줄이 있던 것을 여기 하나로 합쳤다.
+# [patch] 는 빌드하는 쪽 루트의 것만 적용되므로, 이 crate 들을 링크하는 다른 작업 공간도 같은 줄을 둔다.
 [patch.crates-io]
 candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
 candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+
+# 디버그 정보는 끈다 (예전 app/ · app/src-tauri 의 값). 모바일 빌드(staticlib·cdylib)는 의존성 전부를 한 파일로 묶는데,
+# 디버그 정보가 있으면 파일 하나가 수 GB가 된다. 이제 작업 공간이 하나라 crates/ 의 디버그 빌드에도 적용된다.
+[profile.dev]
+debug = 0
 
 [profile.dev.package.candle-core]
 opt-level = 3
@@ -79,7 +97,14 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.gemm]
 opt-level = 3
-# hashId(secp256k1 공개 키 주소)를 시험에서 수천 번 부른다(웹 분석의 페이지 · 요소 해시). 디버그 빌드에서도 빠르게
+# aarch64(Android)에서는 최적화가 없는 빌드가 gemm-f16을 컴파일하지 못한다: fp16 어셈블리 헬퍼(#[inline])가
+# fp16 기능이 없는 함수로 따로 만들어져 "instruction requires: fullfp16" 오류가 난다. 두 크레이트만 최적화해 인라인되게 한다.
+# (행렬 곱 속도에도 도움이 된다. 예전 app/ · app/src-tauri 의 값)
+[profile.dev.package.gemm-common]
+opt-level = 3
+[profile.dev.package.gemm-f16]
+opt-level = 3
+# hashId(secp256k1 공개 키 주소)를 시험에서 수천 번 부른다(웹 분석의 페이지 · 요소 해시). 디버그 빌드에서도 빠르게 (예전 crates/ 의 값)
 [profile.dev.package.k256]
 opt-level = 3
 [profile.dev.package.elliptic-curve]

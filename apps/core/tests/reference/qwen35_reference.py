@@ -1,6 +1,6 @@
 """Qwen3.5-0.8B 참조 픽스처를 만든다 (transformers 5.23.0, torch 2.15.0+cpu, F32).
 
-Rust 이식(app/src/qwen35.rs)이 같은 프롬프트에 같은 그리디 토큰과 로짓을 내는지 확인하는 데 쓴다.
+Rust 이식(apps/core/src/qwen35.rs)이 같은 프롬프트에 같은 그리디 토큰과 로짓을 내는지 확인하는 데 쓴다.
 
     HF_HOME=<캐시> HF_HUB_OFFLINE=1 python qwen35_reference.py <모델 폴더> <출력 json>
 """

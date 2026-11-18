@@ -1,4 +1,4 @@
-// 실행: node --experimental-strip-types --test app/ui/coalesce.test.ts  (premium-discount 폴더에서)
+// 실행: node --experimental-strip-types --test web/desktop/coalesce.test.ts  (premium-discount 폴더에서)
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { coalesced, type RefreshOptions } from './coalesce.ts'

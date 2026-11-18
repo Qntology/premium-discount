@@ -7,7 +7,7 @@
 //! 이메일 · 전화번호 같은 식별 정보는 없다.
 //!
 //! 기준은 premium-discount 의 `contracts/wallet_v1.json`(ethers 로 뽑은 값)이다. 시험이 그 값을 그대로 낸다.
-//! 서버(TypeScript)는 같은 계약으로 `www/src/auth.ts` 의 `verifyWalletRequest` 를 시험한다.
+//! 서버(TypeScript)는 같은 계약으로 `workers/www/src/auth.ts` 의 `verifyWalletRequest` 를 시험한다.
 
 mod bip32;
 mod bip39;
