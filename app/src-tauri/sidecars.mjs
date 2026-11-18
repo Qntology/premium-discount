@@ -5,7 +5,7 @@
 //
 // Tauri 의 bundle.externalBin 은 빌드할 때 `binaries/<이름>-<대상 삼중항>[.exe]` 를 찾고, 설치할 때 삼중항을 떼어
 // 창 실행 파일 옆에 둔다(%LOCALAPPDATA%\premium.discount\premium-discount-app.exe …). 그래서 raon-zena 의
-// premium-discount-mcp 는 설치 폴더에서 코어를 찾는다(find_pd_app).
+// premium-discount-mcp 는 설치 폴더에서 코어를 찾는다(find_pd_app · find_mcp_server, crates/premium-discount-mcp/src/lib.rs).
 //
 // 쓰는 곳: tauri.sidecar.conf.json 의 beforeBuildCommand (`tauri build --config src-tauri/tauri.sidecar.conf.json`).
 // 사이드카는 기본 설정(tauri.conf.json)에 넣지 않는다: tauri-build 는 externalBin 파일이 없으면 `cargo build` 자체를
@@ -14,49 +14,86 @@
 // 사용: node src-tauri/sidecars.mjs [--no-build] [--target <삼중항>]
 //   --no-build  이미 만든 release 실행 파일을 옮기기만 한다
 //   --target    교차 빌드 대상 (기본: rustc 의 host)
+//
+// 이름 규칙과 설정의 약속은 sidecars.test.mjs 가 본다 (`node --test src-tauri/sidecars.test.mjs`).
 
 import { execFileSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const appDir = resolve(here, '..')
-const cratesDir = resolve(here, '../../crates')
-const args = process.argv.slice(2)
-const noBuild = args.includes('--no-build')
-const targetFlag = args.indexOf('--target')
-const target =
-  targetFlag >= 0
-    ? args[targetFlag + 1]
-    : execFileSync('rustc', ['-vV'], { encoding: 'utf8' })
-        .split('\n')
-        .find((l) => l.startsWith('host:'))
-        .slice(5)
-        .trim()
-const exe = target.includes('windows') ? '.exe' : ''
 
-const sidecars = [
-  { name: 'premium-discount-app', manifest: join(appDir, 'Cargo.toml'), pkg: 'premium-discount-app', dir: appDir },
-  { name: 'premium-discount-mcp', manifest: join(cratesDir, 'Cargo.toml'), pkg: 'premium-discount-mcp', dir: cratesDir },
-]
+/** 사이드카 이름 (tauri.sidecar.conf.json 의 externalBin 은 `binaries/<이름>`) */
+export const SIDECARS = ['premium-discount-app', 'premium-discount-mcp']
 
-const out = join(here, 'binaries')
-mkdirSync(out, { recursive: true })
-for (const s of sidecars) {
-  const crossArgs = targetFlag >= 0 ? ['--target', target] : []
-  if (!noBuild) {
-    console.log(`[sidecars] cargo build --release -p ${s.pkg} --bin ${s.name} ${crossArgs.join(' ')}`)
-    execFileSync('cargo', ['build', '--release', '--manifest-path', s.manifest, '-p', s.pkg, '--bin', s.name, ...crossArgs], {
-      stdio: 'inherit',
-    })
+/** rustc 의 host 삼중항 */
+export function hostTriple() {
+  return execFileSync('rustc', ['-vV'], { encoding: 'utf8' })
+    .split('\n')
+    .find((l) => l.startsWith('host:'))
+    .slice(5)
+    .trim()
+}
+
+/** 대상의 실행 파일 확장자 */
+export function exeSuffix(target) {
+  return target.includes('windows') ? '.exe' : ''
+}
+
+/** Tauri 가 빌드할 때 찾는 파일 이름: `<이름>-<삼중항>[.exe]` (설치할 때 삼중항을 뗀다) */
+export function stagedName(name, target) {
+  return `${name}-${target}${exeSuffix(target)}`
+}
+
+/**
+ * 사이드카를 만들고(build) `out` 에 Tauri 이름으로 복사한다. 복사한 경로들을 돌려준다.
+ * cross 가 true 면 `cargo build --target` 의 자리(target/<삼중항>/release)에서 찾는다.
+ */
+export function stage({
+  target,
+  cross = false,
+  noBuild = false,
+  appDir = resolve(here, '..'),
+  cratesDir = resolve(here, '../../crates'),
+  out = join(here, 'binaries'),
+  build = (manifest, pkg, bin, extra) =>
+    execFileSync('cargo', ['build', '--release', '--manifest-path', manifest, '-p', pkg, '--bin', bin, ...extra], { stdio: 'inherit' }),
+  log = (m) => console.log(m),
+}) {
+  const sources = {
+    'premium-discount-app': { manifest: join(appDir, 'Cargo.toml'), dir: appDir },
+    'premium-discount-mcp': { manifest: join(cratesDir, 'Cargo.toml'), dir: cratesDir },
   }
-  const built = join(s.dir, 'target', ...(targetFlag >= 0 ? [target] : []), 'release', s.name + exe)
-  if (!existsSync(built)) {
-    console.error(`[sidecars] ${built} 이 없습니다 (--no-build 이면 먼저 cargo build --release 를 하세요)`)
+  mkdirSync(out, { recursive: true })
+  const staged = []
+  for (const name of SIDECARS) {
+    const s = sources[name]
+    const extra = cross ? ['--target', target] : []
+    if (!noBuild) {
+      log(`[sidecars] cargo build --release -p ${name} --bin ${name} ${extra.join(' ')}`)
+      build(s.manifest, name, name, extra)
+    }
+    const built = join(s.dir, 'target', ...(cross ? [target] : []), 'release', name + exeSuffix(target))
+    if (!existsSync(built)) {
+      throw new Error(`[sidecars] ${built} 이 없습니다 (--no-build 이면 먼저 cargo build --release 를 하세요)`)
+    }
+    const dest = join(out, stagedName(name, target))
+    copyFileSync(built, dest)
+    log(`[sidecars] ${built} -> ${dest}`)
+    staged.push(dest)
+  }
+  return staged
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const args = process.argv.slice(2)
+  const targetFlag = args.indexOf('--target')
+  const cross = targetFlag >= 0
+  try {
+    stage({ target: cross ? args[targetFlag + 1] : hostTriple(), cross, noBuild: args.includes('--no-build') })
+  } catch (e) {
+    console.error(e.message)
     process.exit(1)
   }
-  const dest = join(out, `${s.name}-${target}${exe}`)
-  copyFileSync(built, dest)
-  console.log(`[sidecars] ${built} -> ${dest}`)
 }
