@@ -5,12 +5,12 @@
 #            (logis-center workers/common 370d67a3 에서 옮겨 왔다. 이제 이쪽이 주인이다)
 #   cron     premium-discount-cron (scheduled): 평가 대기열 · 판정 · 지갑 타임트라이얼 정리
 #   migrations/  두 워커(www · cron)가 같이 쓰는 D1 스키마
-#   www/     아직 TypeScript (다음 단계)
+#   www      premium-discount-worker-www (fetch): 1단계 = 뼈대 · 세션 · 인증 · 요청 제한 · 레거시 처리기. 큰 모듈 넷(evaluations · navtrials · graph · analytic)은 2단계
 #
 # 원본 TypeScript 와 같은 동작이 목표다(같은 SQL · 같은 D1 호출 순서 · 같은 JSON). 차이와 고친 버그는 docs/workers-rs.md 에 적는다.
 [workspace]
 resolver = "2"
-members = ["common", "cron"]
+members = ["common", "cron", "www"]
 
 [workspace.package]
 version = "0.1.0"

@@ -4,6 +4,7 @@
 // - D1: 진짜 Miniflare D1 을 감싼다. 문장을 실행하기 전에 http://harness/d1 에 (sql, 묶은 값, 방법)을 알리고, 시험대가
 //   { fail } (그 문장을 던지게) · { after: [{ sql, args }] } (실행 뒤 같은 DB 에 끼워 넣을 문장 — www 가 그 사이 표를 넣는 경합)를 돌려준다.
 //   그래서 D1 호출의 순서 · 글 · 값이 두 판에서 그대로 견주어진다. 실행 결과(행 수 · 바뀐 행 수)는 실행 끝에 함께 보낸다.
+// - batch: 문장 목록을 op "batch" 한 번으로 알린다(sql 은 " ;; " 로 이음, args 는 문장마다). cron 은 batch 를 쓰지 않는다.
 // - Vectorize: upsert · getByIds · deleteByIds · query 를 http://harness/vec 로. 저장소와 장애 주입은 시험대에 있다.
 //   값(Float32Array)은 형 · 길이 · 비트 FNV 로 줄여 보낸다.
 // - 실행 하나(scheduled)를 감싸 시계를 scheduledTime 으로 맞추고, 끝에 console 기록 · 결과 · 밖으로 샌 예외를 보낸다.
@@ -45,6 +46,7 @@ function summary(op, out) {
 function wrapStmt(db, stmt, sql, args) {
   return new Proxy(stmt, { get(t, prop) {
     if (prop === "bind") return (...a) => wrapStmt(db, t.bind(...a), sql, a);
+    if (prop === "__harness") return { raw: t, sql, args };
     if (prop === "first" || prop === "all" || prop === "run" || prop === "raw") return async (...x) => {
       const c = await ctl("d1", { op: prop, sql, args: args.map(enc) });
       if (c.fail) { results.push({ op: prop, threw: c.fail }); throw new Error(c.fail); }
@@ -61,6 +63,17 @@ function wrapD1(db) {
   if (!db || typeof db.prepare !== "function") return db;
   return new Proxy(db, { get(t, prop) {
     if (prop === "prepare") return (sql) => wrapStmt(t, t.prepare(sql), sql, []);
+    // batch (www 의 analytic · navtrials): 문장 목록을 한 번에 알리고, 진짜 문장으로 풀어 실행한다
+    if (prop === "batch") return async (stmts) => {
+      const list = stmts.map((x) => (x && x.__harness) || { raw: x, sql: "?", args: [] });
+      const c = await ctl("d1", { op: "batch", sql: list.map((x) => x.sql).join(" ;; "), args: list.map((x) => x.args.map(enc)) });
+      if (c.fail) { results.push({ op: "batch", threw: c.fail }); throw new Error(c.fail); }
+      let out;
+      try { out = await t.batch(list.map((x) => x.raw)); }
+      catch (e) { results.push({ op: "batch", threw: String(e) }); throw e; }
+      results.push({ op: "batch", changes: out.map((r) => (r && r.meta ? r.meta.changes : undefined)) });
+      return out;
+    };
     const v = Reflect.get(t, prop); return typeof v === "function" ? v.bind(t) : v; } });
 }
 async function vecCall(op, payload) {

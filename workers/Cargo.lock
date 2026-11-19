@@ -694,6 +694,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "premium-discount-worker-www"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "hmac",
+ "indexmap",
+ "js-sys",
+ "k256",
+ "premium-discount-identity",
+ "premium-discount-worker-common",
+ "regex",
+ "serde_json",
+ "sha2",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "worker",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"

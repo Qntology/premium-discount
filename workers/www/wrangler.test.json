@@ -1,8 +1,10 @@
 {
 	"compatibility_date": "2026-04-01",
-	"main": "src/index.ts",
+	"main": "build/index.js",
+	"build": {
+		"command": "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+	},
 	"name": "premium-discount-test",
-	"upload_source_maps": true,
 	"d1_databases": [
 		{
 			"binding": "apac1_premium_discount",
@@ -41,15 +43,6 @@
 		"directory": "../../web/www/",
 		"binding": "ASSETS"
 	},
-	"rules": [
-		{
-			"type": "Text",
-			"globs": [
-				"**/*.html"
-			],
-			"fallthrough": true
-		}
-	],
 	"r2_buckets": [
 		{
 			"binding": "CDN",
