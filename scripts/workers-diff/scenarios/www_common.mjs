@@ -12,13 +12,15 @@
 //     sql: [[sql, ...args], …],           요청 전에 DB 에 넣을 씨앗 행
 //     vectors: { id: { values, metadata } }, vec: { query: (body, store) => result, … }   가짜 Vectorize 의 처음 상태 · 답
 //     faults: [{ match, op?, nth?, message? }]  D1 문장 장애
-//     race: { match, op?, after: [{ sql, args }] }  match 가 든 문장을 처음 실행한 뒤 끼워 넣을 문장 (실행마다 한 번, 경합 흉내)
+//     race: { match, op?, after?: [{ sql, args }], before?: [...], times? }  match 가 든 문장을 실행한 뒤(after) · 실행하기 바로 전(before,
+//                                         batch 에도) 끼워 넣을 문장 (경합 흉내). times 번 맞을 때까지(기본 1, 실행마다). 여럿이면 목록으로
 //     s3: ({ method, path, n }) => { status, body } | { throw } | Response   가짜 S3 의 답 (n: 이 시나리오에서 몇 번째 S3 호출)
 //     fetch: ({ url, method, headers, body }) => { status, body, headers } | { throw }   그 밖의 바깥 요청의 답
 //     requests: [{ method, path, headers, cookies, jar, body, cf, at }],  차례로 보낼 요청.
 //        headers · body · path 는 함수(prev) 일 수 있다: prev = 이 쪽(ts · rs)에서 앞서 받은 응답들 ({ status, headers, body, … })
 //        at = 가상 시계(ms, 기본 T0 + 차례 × 1000). cf = request.cf 에 덮을 값 (null 이면 기본값 없이)
 //   }
+import { createHash } from "node:crypto";
 import { ethers } from "ethers";
 
 export const BASE_URL = "https://premium.discount";
@@ -95,7 +97,17 @@ export const WALLET_PHRASES = [
 export async function walletHeaders(phrase, { time = T0, method = "POST", path = "/nav/trials", body = "" } = {}) {
   const wallet = ethers.Wallet.fromPhrase(phrase);
   const address = wallet.address.toLowerCase();
-  const sha = ethers.sha256(ethers.toUtf8Bytes(body)).slice(2);
-  const message = ["premium.discount request v1", `address: ${address}`, `time: ${time}`, `method: ${method.toUpperCase()}`, `path: ${path}`, `body-sha256: ${sha}`].join("\n");
+  const message = walletMessage(address, { time, method, path, body });
   return { "x-pd-address": address, "x-pd-time": String(time), "x-pd-signature": await wallet.signMessage(message) };
 }
+
+/** 지갑이 서명하는 글 (auth.ts walletRequestMessage) */
+export function walletMessage(address, { time = T0, method = "POST", path = "/nav/trials", body = "" } = {}) {
+  const sha = ethers.sha256(ethers.toUtf8Bytes(body)).slice(2);
+  return ["premium.discount request v1", `address: ${address.toLowerCase()}`, `time: ${time}`, `method: ${method.toUpperCase()}`, `path: ${path}`, `body-sha256: ${sha}`].join("\n");
+}
+
+/** fix-wallet-replay 의 키: 서명한 글의 SHA-256 hex (wallet_nonces.nonce) */
+export const walletNonce = (message) => createHash("sha256").update(message, "utf8").digest("hex");
+/** wallet_nonces 행 넣기 (race 의 before · 씨앗 sql) */
+export const NONCE_INSERT = `INSERT INTO wallet_nonces ("nonce", "expires_at") VALUES (?1, ?2)`;

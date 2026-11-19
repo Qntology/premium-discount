@@ -10,8 +10,8 @@
 //! 인증의 두 번째 갈래는 지갑(익명 계정)이다: 요청마다 EIP-191 서명(x-pd-address · x-pd-time · x-pd-signature)을 붙인다
 //! ([`verify_wallet_request`]). 규칙과 기준값은 contracts/wallet_v1.json 이고 기기 쪽 crates/premium-discount-identity 가 같은 값을 낸다.
 //!
-//! 2단계 모듈이 쓰는 것: [`read_session_credentials`] · [`verified_address`] · [`verify_wallet_request`] · [`address_from_email`] ·
-//! [`wallet_request_message`]. 원본의 async 함수 가운데 crypto.subtle 만 기다리는 것(HMAC · SHA-256)은 Rust 에서 바로 계산한다.
+//! 모듈이 쓰는 것: [`read_session_credentials`] · [`verified_address`] · `verify_wallet_request_once`(지갑 서명 + 한 번만 쓰기,
+//! fix-wallet-replay) · [`address_from_email`] · [`wallet_request_message`]. 원본의 async 함수 가운데 crypto.subtle 만 기다리는 것(HMAC · SHA-256)은 Rust 에서 바로 계산한다.
 
 use hmac::{Hmac, Mac};
 use premium_discount_worker_common::jsv::{js_trim, num_to_string, to_lower, to_upper};
@@ -150,7 +150,7 @@ pub enum SessionCheck {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm::{check_session, issue_session, verified_address};
+pub use wasm::{check_session, issue_session, verified_address, verify_wallet_request_once};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
@@ -246,6 +246,22 @@ mod wasm {
             _ => None,
         }
     }
+
+    /// 지갑 서명 확인 + 한 번만 쓰기 — 지갑 서명을 받는 모든 경로(navtrials · analytic 의 주인 경로)가 이것을 쓴다.
+    ///
+    /// 고침(fix-wallet-replay): 원본 `verifyWalletRequest`(auth.ts 209)는 같은 서명을 다시 보내는 것을 막지 않았다. 서명 글에는 경로만 있고
+    /// 쿼리가 없어(contracts/wallet_v1.json), 잡은 `DELETE /nav/trials?app=X` 를 5분 안에 `DELETE /nav/trials` 로 다시 보내면 콜렉션 전부가
+    /// 지워졌다. 계약은 그대로 두고, 받은 서명(서명한 글의 SHA-256)을 시각 검사가 받는 동안(서명 시각 + 5분) D1 wallet_nonces 에 기억해
+    /// 다시 쓰면 서명이 틀린 것과 같이(None → 각 경로의 401) 막는다. 서명 확인을 먼저 해 틀린 서명은 D1 에 닿지 않는다.
+    /// 기한 지난 키 지우기와 키 잡기는 batch 하나(한 번 오감)이고, 잡기는 `INSERT … ON CONFLICT DO NOTHING` 의 바뀐 행 수로 본다 —
+    /// 같은 요청 둘이 동시에 와도 하나만 1 을 받는다. D1 이 던지면 그대로 샌다(각 경로의 try 안이라 500)
+    pub async fn verify_wallet_request_once(req: &Req, env: &Env, body: &[u8], now_ms: f64) -> R<Option<String>> {
+        let Some(sig) = super::verify_wallet_signature(req, body, now_ms) else { return Ok(None) };
+        let cleanup = js::bind_exact(&env.prepare("DB", super::SQL_WALLET_NONCE_CLEANUP)?, &[V::Num(now_ms)])?;
+        let claim = js::bind_exact(&env.prepare("DB", super::SQL_WALLET_NONCE_CLAIM)?, &[V::from(sig.nonce.as_str()), V::Num(sig.expires_at)])?;
+        let out = env.batch("DB", &V::from(vec![cleanup, claim])).await?;
+        Ok((crate::util::changes_of(&out.at(1)) == 1.0).then_some(sig.address))
+    }
 }
 
 // ───────────────────────── 지갑 (익명 계정) ─────────────────────────
@@ -315,10 +331,22 @@ fn is_wallet_time(s: &str) -> bool {
     (1..=15).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `verifyWalletRequest(request, body, nowMs)` — 지갑 서명이 맞으면 그 주소(소문자), 아니면 None.
+/// 확인된 지갑 서명 ([`verify_wallet_signature`])
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalletSignature {
+    /// 서명한 주소 (소문자)
+    pub address: String,
+    /// 한 번만 쓰기의 키: 서명한 글의 SHA-256 hex. 서명 바이트가 아니라 글이라, 같은 글의 다른 서명 꼴(v 27 ↔ 0 · 35 이상, n − s,
+    /// 16진 대소문자 — 모두 [`verify_message`] 가 받는다)도 같은 키다
+    pub nonce: String,
+    /// 이 서명을 시각 검사가 받는 마지막 때 (ms) = 서명 시각 + [`WALLET_MAX_SKEW_MS`]. 그 뒤로는 시각 검사가 먼저 막는다
+    pub expires_at: f64,
+}
+
+/// 지갑 서명 확인 (`verifyWalletRequest` 의 계산): 맞으면 주소 · 한 번만 쓰기의 키 · 그 키를 기억할 기한.
 /// 시각이 5분 안이고 서명에서 되살린 주소가 x-pd-address 와 같아야 한다. body 는 요청 본문 바이트 그대로(본문을 읽은 쪽이 넘긴다).
-/// 서명 글의 path 는 `new URL(request.url).pathname` (쿼리는 들어가지 않는다)
-pub fn verify_wallet_request(req: &Req, body: &[u8], now_ms: f64) -> Option<String> {
+/// 서명 글의 path 는 `new URL(request.url).pathname` (쿼리는 들어가지 않는다 — 그래서 [`verify_wallet_request_once`] 가 다시 쓰기를 막는다)
+pub fn verify_wallet_signature(req: &Req, body: &[u8], now_ms: f64) -> Option<WalletSignature> {
     let address = to_lower(js_trim(&crate::util::header_or_empty(req, "x-pd-address")));
     let time_text = js_trim(&crate::util::header_or_empty(req, "x-pd-time")).to_string();
     let signature = js_trim(&crate::util::header_or_empty(req, "x-pd-signature")).to_string();
@@ -330,8 +358,23 @@ pub fn verify_wallet_request(req: &Req, body: &[u8], now_ms: f64) -> Option<Stri
         return None;
     }
     let message = wallet_request_message(&address, time_ms, &req.method, &crate::util::pathname(req), body);
-    (verify_message(&message, &signature)? == address).then_some(address)
+    if verify_message(&message, &signature)? != address {
+        return None;
+    }
+    Some(WalletSignature { address, nonce: hex(&Sha256::digest(message.as_bytes())), expires_at: time_ms + WALLET_MAX_SKEW_MS })
 }
+
+/// `verifyWalletRequest(request, body, nowMs)` 의 서명 확인만 — 지갑 서명이 맞으면 그 주소(소문자), 아니면 None.
+/// 처리기는 이것 대신 다시 쓰기까지 막는 [`verify_wallet_request_once`] 를 쓴다
+pub fn verify_wallet_request(req: &Req, body: &[u8], now_ms: f64) -> Option<String> {
+    verify_wallet_signature(req, body, now_ms).map(|s| s.address)
+}
+
+/// 고침(fix-wallet-replay): 기한 지난 키 지우기. 지갑 요청마다 10개까지 — 요청 하나가 키 하나를 넣으므로 2 이상이면 지난 행이 쌓이지 않고,
+/// 한꺼번에 몰린 뒤의 밀린 행도 다음 요청들이 9개씩 줄인다. D1/SQLite 의 DELETE 에는 LIMIT 이 없어 하위 질의로 묶는다. ?1 = 지금 (ms)
+pub const SQL_WALLET_NONCE_CLEANUP: &str = "DELETE FROM wallet_nonces WHERE \"nonce\" IN (SELECT \"nonce\" FROM wallet_nonces WHERE \"expires_at\" < ?1 LIMIT 10)";
+/// 키 잡기: 바뀐 행이 1 이면 이 요청이 처음, 0 이면 이미 쓴 서명이다. ?1 = 키, ?2 = 기한 (ms)
+pub const SQL_WALLET_NONCE_CLAIM: &str = "INSERT INTO wallet_nonces (\"nonce\", \"expires_at\") VALUES (?1, ?2) ON CONFLICT DO NOTHING";
 
 #[cfg(test)]
 mod tests {

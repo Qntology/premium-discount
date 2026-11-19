@@ -7,8 +7,10 @@ import evaluations from "./scenarios/www_evaluations.mjs";
 import navtrials from "./scenarios/www_navtrials.mjs";
 import graph from "./scenarios/www_graph.mjs";
 import analytic from "./scenarios/www_analytic.mjs";
+import wallet from "./scenarios/www_wallet.mjs";
 
-const BY_MODULE = { session, auth, legacy, evaluations, navtrials, graph, analytic };
+// wallet: 지갑 서명 한 번만 쓰기(fix-wallet-replay) — navtrials · analytic 의 지갑 경로를 함께 본다
+const BY_MODULE = { session, auth, legacy, evaluations, navtrials, graph, analytic, wallet };
 
 export const SCENARIOS = Object.entries(BY_MODULE).flatMap(([module, list]) => list.map((s) => ({ module, ...s })));
 

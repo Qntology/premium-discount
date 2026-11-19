@@ -1708,11 +1708,16 @@ wry 0.57.2, tokenizers 0.22.2, safetensors 0.8.0 · 0.4.5, half 2.7.1, tokio 1.5
 앱 코어 단위 시험(`cargo test -p premium-discount-app --lib`)은 이번에 돌리지 않았습니다. 디스크 여유가 5 GB 이고 앱 디버그 시험 빌드는 7 GB 남짓이라서입니다
 (옛 `app/target` 14 GB · `crates/target` 12 GB 는 지우지 않음). 코어의 lib · 시험 · 예제(quant_probe 빼고)는 위 `cargo check` 로 컴파일을 확인했습니다.
 
-## 27. cron Worker 를 Rust(workers-rs)로 (2026-11-19)
+## 27. cron · www Worker 를 Rust(workers-rs)로 (2026-11-19)
 
 `workers/cron` 을 workers-rs 0.8.7 로 다시 썼습니다(logis-center 와 같은 방식). `workers/` 는 자기 Cargo 작업 공간(wasm32, 루트의 `exclude`)이고,
 공용 층 `workers/common`(premium-discount-worker-common)은 logis-center `workers/common`(370d67a3)에서 옮겨 와 이제 이 저장소가 주인입니다.
 판정은 `premium-discount-verdict` crate 를 그대로 씁니다(초월 함수 고리 `Math` · `evidence_in` · `judge_in` 를 더해 cron 은 JS 의 `Math` 를 넘김).
 원본 TS(0538044)와 Miniflare 차분 시험(`scripts/workers-diff`, `node cron.mjs`)으로 47개 시나리오가 같고, 원본 버그 둘
-(기다리지 않은 `return reject` · 프로토타입을 거치는 가중치 조회)을 고쳤습니다. www 는 아직 TypeScript 입니다.
+(기다리지 않은 `return reject` · 프로토타입을 거치는 가중치 조회)을 고쳤습니다.
+
+`workers/www` 도 같은 방식으로 Rust 로 옮겼습니다(원본 35781c0): 1단계(뼈대 · 세션 · 인증 · 요청 제한 · 레거시 처리기)와 2단계(evaluations · navtrials ·
+graph · analytic). 원본 버그 일곱을 고쳤고, 보안 · 경합 고침 둘을 더했습니다 — 지갑 서명 한 번만 쓰기(서명 글에 쿼리가 없어 잡은 서명을 다른 쿼리로
+다시 보낼 수 있던 것, 새 표 `wallet_nonces` = migrations/0010)와 타임트라이얼의 조건 건 쓰기(동시 요청이 수를 잃거나 두 번 등록하던 것).
+고친 원본과 차분 시험 227개가 같습니다. 배포 전에 0010 을 D1 에 적용해야 합니다. TS 원본(`src/*.ts`)과 node 시험은 남겼습니다.
 구조 · 빌드 · 시험대 · 고친 버그 · 알려진 차이는 [`docs/workers-rs.md`](docs/workers-rs.md).

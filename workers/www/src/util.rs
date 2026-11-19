@@ -125,6 +125,17 @@ pub fn parse_uuid(value: &V, field: &str) -> premium_discount_worker_common::R<S
     }
 }
 
+/// `Number(res?.meta?.changes ?? 0)` — D1 실행 결과(run · batch 의 한 칸)의 바뀐 행 수. 조건 건 쓰기(fix-wallet-replay · fix-nav-lost-update)가 본다
+pub fn changes_of(res: &V) -> f64 {
+    let meta = if res.is_nullish() { V::Undef } else { res.get("meta") };
+    let changes = if meta.is_nullish() { V::Undef } else { meta.get("changes") };
+    if changes.is_nullish() {
+        0.0
+    } else {
+        changes.to_num()
+    }
+}
+
 /// `binds(n)` — IN 목록용 자리표시자 `?1, ?2, ...`
 pub fn binds(n: usize) -> String {
     (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")

@@ -118,7 +118,7 @@ mod wasm {
     use wasm_bindgen::JsValue;
 
     use super::*;
-    use crate::auth::{read_session_credentials, verified_address, verify_wallet_request};
+    use crate::auth::{read_session_credentials, verified_address, verify_wallet_request_once};
     use crate::blob::blob_to_base64;
     use crate::ratelimit::{is_rate_limited, RETRY_AFTER_SECONDS};
     use crate::util::{empty_response, header_opt, header_or_empty, json_response, pathname};
@@ -395,7 +395,8 @@ mod wasm {
                 return Ok(error("body too large", 413, &origin, true));
             }
             let owner = if WALLET_HEADERS.iter().any(|h| !req.header(h).is_null()) {
-                verify_wallet_request(req, body, now_ms)
+                // 고침(fix-wallet-replay): 서명 확인 + 한 번만 쓰기 (auth.rs). 이미 쓴 서명은 틀린 서명과 같이 401
+                verify_wallet_request_once(req, env, body, now_ms).await?
             } else if read_session_credentials(req).is_some() {
                 verified_address(req, env).await
             } else {

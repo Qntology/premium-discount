@@ -1,12 +1,14 @@
 //! 계약 · 벡터 시험 (호스트에서 돈다):
 //! - contracts/wallet_v1.json — `wallet.test.ts` 의 단언 모두 (서명 글 · 계약 서명 받기 · 위조 · 5분 · 새 지갑). 지갑 확인은
-//!   2단계 모듈(navtrials · analytic)의 경로에서만 쓰여, 1단계의 차분 시험대로는 닿지 않으므로 여기서 본다
+//!   navtrials · analytic 의 경로에서만 쓰여 1단계 시험대로는 닿지 않아 여기서 봤다 (2단계부터는 시험대의 www_navtrials ·
+//!   www_analytic · www_wallet 시나리오도 닿는다)
+//!   그리고 fix-wallet-replay 의 한 번만 쓰기 키(서명한 글의 SHA-256 · 기한) — D1 에 기억하는 쪽은 시험대 scenarios/www_wallet.mjs
 //! - contracts/analytic_blob_v1.json — blob.ts 의 계약 (crates/premium-discount-analytic 와 같은 파일)
 //! - tests/render_vectors.json — 원본 renderHtml 로 뽑은 바이트 (scripts/workers-diff/www_render_vectors.mjs)
 
 use premium_discount_worker_common::jsv::{from_json, stringify, V};
 use premium_discount_worker_common::web::Req;
-use premium_discount_worker_www::auth::{verify_message, verify_wallet_request, wallet_request_message, WALLET_MAX_SKEW_MS};
+use premium_discount_worker_www::auth::{verify_message, verify_wallet_request, verify_wallet_signature, wallet_request_message, WALLET_MAX_SKEW_MS};
 use premium_discount_worker_www::blob::decode_blob;
 use premium_discount_worker_www::render::render_html;
 use serde_json::Value;
@@ -88,6 +90,35 @@ fn wallet_forgeries_and_skew_are_rejected() {
     let (req, body) = signed(r, None, None, &[]);
     assert_eq!(verify_wallet_request(&req, &body, t + WALLET_MAX_SKEW_MS + 1.0), None, "5분이 넘으면");
     assert_eq!(verify_wallet_request(&req, &body, t - WALLET_MAX_SKEW_MS - 1.0), None, "5분 앞서도");
+}
+
+#[test]
+fn wallet_replay_key_is_the_signed_message() {
+    use sha2::{Digest, Sha256};
+    let c: Value = serde_json::from_str(WALLET_V1).unwrap();
+    for r in c["requests"].as_array().unwrap() {
+        let t = r["time_ms"].as_f64().unwrap();
+        let (req, body) = signed(r, None, None, &[]);
+        let s = verify_wallet_signature(&req, &body, t).expect("계약 서명");
+        let want: String = Sha256::digest(r["message"].as_str().unwrap().as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(s.nonce, want, "키 = 서명한 글의 SHA-256");
+        assert_eq!(s.expires_at, t + WALLET_MAX_SKEW_MS, "기한 = 서명 시각 + 5분 (시각 검사가 받는 마지막 때)");
+        assert_eq!(verify_wallet_signature(&req, &body, s.expires_at).map(|x| x.nonce), Some(want.clone()), "기한까지는 시각 검사를 지난다");
+        assert_eq!(verify_wallet_signature(&req, &body, s.expires_at + 1.0), None, "기한 뒤로는 시각 검사가 막는다");
+        // 쿼리만 바꾼 다시 보내기는 같은 글 → 같은 키 (fix-wallet-replay 가 막는 꼴)
+        let path = format!("{}?app=0x{}", r["path"].as_str().unwrap(), "9".repeat(40));
+        let (q, _) = signed(r, None, Some(&path), &[]);
+        assert_eq!(verify_wallet_signature(&q, &body, t).map(|x| x.nonce), Some(want.clone()), "쿼리는 키에 들어가지 않는다");
+        // 같은 글의 다른 서명 꼴(v 27/28 → 0/1, 16진 대문자)도 받고 같은 키다
+        let sig = r["signature"].as_str().unwrap();
+        let v = u8::from_str_radix(&sig[130..], 16).unwrap();
+        let v_form = format!("{}{:02x}", &sig[..130], v - 27);
+        let upper = format!("0x{}", sig[2..].to_uppercase());
+        for form in [v_form, upper] {
+            let (f, _) = signed(r, None, None, &[("x-pd-signature", form.as_str())]);
+            assert_eq!(verify_wallet_signature(&f, &body, t).map(|x| x.nonce), Some(want.clone()), "{form}");
+        }
+    }
 }
 
 #[test]

@@ -173,7 +173,9 @@ async function run(variant, scenario) {
   const bindings = { ...DEFAULT_BINDINGS, ...(scenario.bindings || {}) };
   for (const [k, v] of Object.entries(bindings)) if (v === undefined) delete bindings[k];
   const limits = scenario.limits || {};
-  let raceFired = false;
+  // race: 한 칸 또는 목록. 칸마다 맞은 횟수를 센다 (times 번까지, 기본 1)
+  const races = scenario.race ? (Array.isArray(scenario.race) ? scenario.race : [scenario.race]) : [];
+  const raceFired = races.map(() => 0);
   const outbound = async (req) => {
     const url = new URL(req.url);
     if (url.hostname === "harness") {
@@ -193,12 +195,14 @@ async function run(variant, scenario) {
           counter[key] = n;
           if (f.nth === undefined || f.nth === n) reply.fail = f.message || "D1_ERROR: injected failure";
         }
-        // race: 맞는 문장을 처음 실행한 뒤 같은 DB 에 끼워 넣을 문장 (다른 요청이 그 사이 같은 request_id 로 넣은 경합 — cron.mjs 와 같은 꼴)
-        const race = scenario.race;
-        if (race && !raceFired && body.sql.includes(race.match) && (!race.op || race.op === body.op)) {
-          raceFired = true;
-          reply.after = race.after;
-        }
+        // race: 맞는 문장을 실행한 뒤(after) · 실행하기 바로 전(before) 같은 DB 에 끼워 넣을 문장 — 다른 요청이 그 사이 쓴 경합
+        // (cron.mjs 와 같은 꼴). before 는 batch 에도 된다(그 batch 의 앞). times 번 맞을 때까지 (기본 1)
+        races.forEach((race, k) => {
+          if (raceFired[k] >= (race.times ?? 1) || !body.sql.includes(race.match) || (race.op && race.op !== body.op)) return;
+          raceFired[k]++;
+          if (race.after) reply.after = [...(reply.after || []), ...race.after];
+          if (race.before) reply.before = [...(reply.before || []), ...race.before];
+        });
         return Response.json(reply);
       }
       if (kind === "rl") {

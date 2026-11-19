@@ -39,10 +39,12 @@ function collect(body, headers = {}, extra = {}) {
   return { method: "POST", path: "/analytic/events", headers: h, body: raw, ...extra };
 }
 
-/** 지갑으로 서명한 주인 요청 (analytic.test.ts 의 owner). 서명 글의 path 는 쿼리 없는 경로다 */
+/** 지갑으로 서명한 주인 요청 (analytic.test.ts 의 owner). 서명 글의 path 는 쿼리 없는 경로다.
+ *  서명 시각은 부를 때마다 1 ms 씩 늘린다: 실제 앱처럼 요청마다 새로 서명한다 (같은 서명을 다시 쓰면 fix-wallet-replay 가 401 로 막는다) */
+let signedAt = T0;
 async function owner(method, path, { body, query = "", phrase = WALLET_PHRASES[0], headers = {} } = {}) {
   const text = body === undefined ? "" : typeof body === "string" ? body : JSON.stringify(body);
-  const sig = await walletHeaders(phrase, { time: T0, method, path, body: text });
+  const sig = await walletHeaders(phrase, { time: signedAt++, method, path, body: text });
   return { method, path: path + query, headers: { ...app({ "Content-Type": "application/json" }), ...sig, ...headers }, ...(text ? { body: text } : {}) };
 }
 
@@ -136,11 +138,11 @@ const lonePieces = click({
   },
 });
 
-// 앞 응답의 next 로 다음 쪽 (서명 글의 path 는 쿼리 없는 경로라 미리 서명해 둔다)
-const nextPage = {
+// 앞 응답의 next 로 다음 쪽 (서명 글의 path 는 쿼리 없는 경로라 미리 서명해 둔다. 쪽마다 새 서명)
+const nextPage = async () => ({
   ...(await owner("GET", "/analytic/events")),
   path: (prev) => `/analytic/events?host=shop.example.com&limit=2&since=${last(prev).body.next.since}&after_id=${last(prev).body.next.after_id}`,
-};
+});
 
 const sessionEnv = { ...SECRETS };
 const sessionHeaders = { ...creds(HASH, TOKEN), "Content-Type": "application/json", "cf-connecting-ip": VISITOR_IP };
@@ -201,7 +203,7 @@ export default [
     requests: [collect([click()])],
   },
   {
-    name: "www_analytic_owner_limits", module: M,
+    name: "www_analytic_owner_limits", module: M, fixes: ["fix-wallet-replay"],
     covers: ["analytic.ts: 주인 쪽은 GET 이 읽기 제한기, POST · DELETE 가 쓰기 제한기 (429 는 주인 CORS)"],
     limits: { EVAL_READ_LIMITER: false, EVAL_WRITE_LIMITER: (n) => n === 1 },
     requests: [
@@ -212,7 +214,7 @@ export default [
     fetch: () => html(meta(WALLET)),
   },
   {
-    name: "www_analytic_sites_wallet", module: M,
+    name: "www_analytic_sites_wallet", module: M, fixes: ["fix-wallet-replay"],
     covers: [
       "analytic.test.ts: 사이트 주인 확인: 첫 화면의 meta 가 지갑 주소를 말해야 한다 (틀린 meta 403 + expected, 가져온 주소, 503 → 403, 'not a host' 400, 경로 붙은 주소 200 · cc, 행, GET 목록, 서명 없으면 401)",
     ],
@@ -229,7 +231,7 @@ export default [
     fetch: sequence(html(`<meta name="premium-discount-site" content="0x${"b".repeat(40)}">`), html("down", 503), html(meta(WALLET)), html(meta(WALLET))),
   },
   {
-    name: "www_analytic_events_read", module: M,
+    name: "www_analytic_events_read", module: M, fixes: ["fix-wallet-replay"],
     covers: ["analytic.test.ts: 사건 읽기: 확인된 주인만(확인 전 403 · 다른 지갑 403), (시각, id) 커서로 빠짐없이, base64 gzip 으로, 주인은 오래된 사건을 지운다(5건)"],
     requests: [
       collect({ events: [1, 2, 3, 4, 5].map((seq) => click({ seq })) }),
@@ -238,9 +240,9 @@ export default [
       await owner("POST", "/analytic/sites", { body: { host: "shop.example.com" } }),
       await owner("GET", "/analytic/events", { query: "?host=shop.example.com", phrase: STRANGER }),
       await owner("GET", "/analytic/events", { query: "?host=shop.example.com&limit=2" }),
-      nextPage,
-      nextPage,
-      nextPage,
+      await nextPage(),
+      await nextPage(),
+      await nextPage(),
       await owner("DELETE", "/analytic/events", { query: `?host=shop.example.com&before=${T0 + 1}` }),
       await owner("GET", "/analytic/events", { query: "?host=shop.example.com" }),
     ],
@@ -362,7 +364,7 @@ export default [
     ],
   },
   {
-    name: "www_analytic_owner_edges", module: M,
+    name: "www_analytic_owner_edges", module: M, fixes: ["fix-wallet-replay"],
     covers: ["analytic.ts 주인 쪽 가장자리: 지갑 머리글이 하나라도 있으면 세션을 보지 않음, 4 KB 본문 413, 등록 본문(null · 수 · 깨진 JSON · 'localhost'), 가져오기 실패, meta 의 여러 모양, 512 KB 넘어 있는 meta, 지우기 · 목록 인자"],
     bindings: sessionEnv,
     s3: () => s3json({ token: TOKEN, email: OWNER_EMAIL }),
@@ -405,7 +407,7 @@ export default [
     },
   },
   {
-    name: "www_analytic_d1_faults", module: M,
+    name: "www_analytic_d1_faults", module: M, fixes: ["fix-wallet-replay"],
     covers: ["analytic.ts: try 안의 D1 오류는 console 에 'analytic error' 와 함께 찍고 500 (수집은 수집 CORS, 주인은 주인 CORS)"],
     faults: [{ match: "INSERT INTO web_events", op: "batch" }, { match: "INSERT INTO analytic_sites" }, { match: "SELECT 1 AS ok", nth: 1 }],
     requests: [
@@ -416,7 +418,7 @@ export default [
     fetch: () => html(meta(WALLET)),
   },
   {
-    name: "www_analytic_since_infinity", module: M,
+    name: "www_analytic_since_infinity", module: M, fixes: ["fix-wallet-replay"],
     covers: ["analytic.ts events: since=Infinity · 아주 큰 수를 그대로 묶는다"],
     sql: [[`INSERT INTO analytic_sites ("cc", "host", "owner", "verified_at") VALUES (?1, ?2, ?3, ?4)`, hashId("shop.example.com"), "shop.example.com", WALLET, 1]],
     requests: [
@@ -456,7 +458,7 @@ export default [
     requests: [collect([click({ sid: "s".repeat(63) + EMOJI })])],
   },
   {
-    name: "www_analytic_fix_list_limit", module: M, fixes: ["fix-analytic-list-limit"],
+    name: "www_analytic_fix_list_limit", module: M, fixes: ["fix-analytic-list-limit", "fix-wallet-replay"],
     covers: ["fix-analytic-list-limit: limit=2.5 는 2 로 (원본은 LIMIT 2.5 를 SQLite 가 거절해 500)"],
     sql: [[`INSERT INTO analytic_sites ("cc", "host", "owner", "verified_at") VALUES (?1, ?2, ?3, ?4)`, hashId("shop.example.com"), "shop.example.com", WALLET, 1]],
     requests: [

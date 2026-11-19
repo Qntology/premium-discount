@@ -12,6 +12,22 @@
 //! 런마다의 결과(status)는 stored · repeat · replaced · expired · invalid 이고, created(코스 id 가 서버에 처음 생김) ·
 //! duplicate(이 사용자가 이미 등록함) · best · evicted · route(고스트 따라가기 판정) · error 가 붙는다 (원본 머리말 그대로).
 //!
+//! ## 고침: 동시에 들어온 쓰기 (fix-nav-lost-update)
+//!
+//! 원본은 nav_trials · nav_courses 를 읽은 값으로 계산한 절대값으로 upsert 했다(`"runs" = excluded."runs"`, `"sums" = excluded."sums"` …).
+//! 그래서 같은 코스의 첫 등록 둘이 동시에 오면 runs 가 2 가 아니라 1 이 되고(하나를 잃음), 같은 사용자의 같은 요청 둘은 둘 다 등록을
+//! 읽지 못해 합계 · 판정 수에 두 번 들어갔다. 고친 쓰기(낙관적 동시성):
+//! - **등록**: batch 앞에서 `INSERT … ON CONFLICT DO NOTHING` 을 batch 하나로 보내 바뀐 행이 1 인 것만 처음 등록이다(원본의 SELECT 자리).
+//!   등록이 합계 · 판정 수를 쓸지 정하므로 batch 밖 앞으로 옮겼다. 그 뒤에서 실패하면(D1 오류 · 원본처럼 던지는 TypeError)
+//!   잡은 등록을 지워 되돌린다 — 원본은 등록도 같은 batch 라 실패하면 남지 않았다.
+//! - **수**(runs · premium · discount)는 상대 갱신(`"runs" = "runs" + ?`), last_day 는 `MAX("last_day", ?)` — 다시 시도가 필요 없다.
+//! - **읽은 값에서 계산한 JSON**(내 콜렉션의 best, 합계의 record · sums)은 읽은 글에 조건을 건 UPDATE 이고, 처음 넣는 행은
+//!   `INSERT … ON CONFLICT DO NOTHING`, 밀어내기는 읽은 touched 에 조건을 건 DELETE 다. 이 쓰기들은 원본처럼 batch 하나에 그대로 두고
+//!   (충돌이 없으면 D1 왕복 수가 원본과 같다), batch 의 결과에서 바뀐 행이 0 인 것만 batch 뒤에 다시 읽어 계산해 `NAV_RETRIES`(3) 번까지
+//!   다시 쓴다(첫 등록이 졌으면 갱신 갈래로, created 는 false 로). 다 쓰면 던져 500 — 그때 batch 의 나머지는 이미 쓰였다.
+//! - 충돌이 없는 요청의 응답과 D1 끝 상태는 원본과 같다. 다른 것은 D1 에 직접 넣은 숫자 아닌 수뿐이다(원본은 JS `"x" + 1` = "x1",
+//!   SQL 의 `'x' + 1` = 1 — 시험대 `stored_rows_odd`).
+//!
 //! ## 옮긴 방식
 //!
 //! - 같은 SQL 글(템플릿 리터럴의 탭 · 줄바꿈까지), 같은 D1 호출 차례(지갑 기한 지우기 → 앱마다 콜렉션 → 등록 → 합계 → 고스트 → batch),
@@ -488,9 +504,9 @@ mod wasm {
     use wasm_bindgen::{JsCast, JsValue};
 
     use super::*;
-    use crate::auth::{read_session_credentials, verified_address, verify_wallet_request};
+    use crate::auth::{read_session_credentials, verified_address, verify_wallet_request_once};
     use crate::ratelimit::{is_rate_limited, RETRY_AFTER_SECONDS};
-    use crate::util::{empty_response, header_or_empty, hv, json_response, pathname};
+    use crate::util::{changes_of, empty_response, header_or_empty, hv, json_response, pathname};
 
     /// 본문을 V 로 옮기는 깊이 (본문 0 → runs 1 → 런 2 → steps 3 → 체크포인트 4 → vectors 5 → 벡터 6 → vector 7 → 수 8).
     /// 이보다 깊은 객체 · 배열은 빈 것으로 둔다 — 원본은 그 깊이에서 객체인지(형)만 본다
@@ -531,8 +547,15 @@ mod wasm {
     const SQL_EXPIRE_MINE: &str = "DELETE FROM nav_trials WHERE \"account\" = ?1 AND \"last_day\" < ?2";
     const SQL_COLLECTION: &str = "SELECT * FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2";
     const SQL_EVICT: &str = "DELETE FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3";
-    const SQL_UPSERT_TRIAL: &str = "INSERT INTO nav_trials (\"account\", \"kind\", \"app\", \"course\", \"steps\", \"runs\", \"premium\", \"discount\", \"best\", \"last\", \"last_day\", \"touched\")\n\t\t\t\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)\n\t\t\t\t\t ON CONFLICT (\"account\", \"app\", \"course\") DO UPDATE SET \"runs\" = excluded.\"runs\", \"premium\" = excluded.\"premium\",\n\t\t\t\t\t   \"discount\" = excluded.\"discount\", \"best\" = excluded.\"best\", \"last\" = excluded.\"last\", \"last_day\" = excluded.\"last_day\",\n\t\t\t\t\t   \"touched\" = excluded.\"touched\"";
-    const SQL_UPSERT_COURSE: &str = "INSERT INTO nav_courses (\"course\", \"app\", \"steps\", \"runs\", \"premium\", \"discount\", \"record\", \"sums\", \"last_day\")\n\t\t\t\t\t VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)\n\t\t\t\t\t ON CONFLICT (\"course\") DO UPDATE SET \"runs\" = excluded.\"runs\", \"premium\" = excluded.\"premium\", \"discount\" = excluded.\"discount\",\n\t\t\t\t\t   \"record\" = excluded.\"record\", \"sums\" = excluded.\"sums\", \"last_day\" = excluded.\"last_day\"";
+    // 고침(fix-nav-lost-update): 원본의 두 upsert(excluded."runs" · "sums" … 로 읽은 값에서 계산한 절대값을 썼다) 대신.
+    // 수는 상대 갱신, 읽은 값에서 계산한 JSON(best · record · sums)은 읽은 글에 조건을 건다. 처음 넣는 행은 ON CONFLICT DO NOTHING
+    const SQL_EVICT_IF: &str = "DELETE FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3 AND \"touched\" = ?4";
+    const SQL_TRIAL_ROW: &str = "SELECT * FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3";
+    const SQL_INSERT_TRIAL: &str = "INSERT INTO nav_trials (\"account\", \"kind\", \"app\", \"course\", \"steps\", \"runs\", \"premium\", \"discount\", \"best\", \"last\", \"last_day\", \"touched\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT (\"account\", \"app\", \"course\") DO NOTHING";
+    const SQL_UPDATE_TRIAL: &str = "UPDATE nav_trials SET \"runs\" = \"runs\" + ?5, \"premium\" = \"premium\" + ?6, \"discount\" = \"discount\" + ?7, \"best\" = ?8, \"last\" = ?9, \"last_day\" = MAX(\"last_day\", ?10), \"touched\" = ?11 WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3 AND \"best\" = ?4";
+    const SQL_COURSE_ROW: &str = "SELECT * FROM nav_courses WHERE \"course\" = ?1";
+    const SQL_INSERT_COURSE: &str = "INSERT INTO nav_courses (\"course\", \"app\", \"steps\", \"runs\", \"premium\", \"discount\", \"record\", \"sums\", \"last_day\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (\"course\") DO NOTHING";
+    const SQL_UPDATE_COURSE: &str = "UPDATE nav_courses SET \"runs\" = \"runs\" + 1, \"premium\" = \"premium\" + ?4, \"discount\" = \"discount\" + ?5, \"record\" = ?6, \"sums\" = ?7, \"last_day\" = MAX(\"last_day\", ?8) WHERE \"course\" = ?1 AND \"record\" = ?2 AND \"sums\" = ?3";
     const SQL_COUNT_UP: &str = "INSERT INTO nav_counts (\"hash\", \"day\", \"type\", \"recipe\", \"n\") VALUES (?1, ?2, ?3, ?4, 1)\n\t\t\t\t ON CONFLICT (\"hash\", \"day\", \"type\", \"recipe\") DO UPDATE SET \"n\" = \"n\" + 1";
     const SQL_REGISTER: &str = "INSERT INTO nav_registrations (\"id\", \"day\") VALUES (?1, ?2) ON CONFLICT DO NOTHING";
     const SQL_VECTOR: &str = "INSERT INTO nav_vectors (\"hash\", \"space\", \"dims\", \"vector\", \"day\") VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING";
@@ -543,9 +566,6 @@ mod wasm {
 
     fn sql_courses(n: usize) -> String {
         format!("SELECT * FROM nav_courses WHERE \"course\" IN ({})", crate::util::binds(n))
-    }
-    fn sql_registrations(n: usize) -> String {
-        format!("SELECT \"id\" FROM nav_registrations WHERE \"id\" IN ({})", crate::util::binds(n))
     }
     fn sql_counts(n: usize) -> String {
         let marks = (0..n).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(", ");
@@ -633,11 +653,14 @@ mod wasm {
         let mut out = IndexMap::new();
         for part in courses.chunks(IN_CHUNK) {
             for r in rows(env, &sql_courses(part.len()), part).await? {
-                // { ...r, record: JSON.parse(r.record), sums: JSON.parse(r.sums) }
+                // { ...r, record: JSON.parse(r.record), sums: JSON.parse(r.sums), stored: { record: r.record, sums: r.sums } }
+                // stored 는 읽은 글 그대로 — 합계의 조건 건 갱신(fix-nav-lost-update)이 그 글과 견준다
+                let stored = obj! { "record" => r.get("record"), "sums" => r.get("sums") };
                 let record = js_parse(&r.g("record")?)?;
                 let sums = js_parse(&r.g("sums")?)?;
                 r.put("record", record);
                 r.put("sums", sums);
+                r.put("stored", stored);
                 out.insert(mk(&r.get("course")), r);
             }
         }
@@ -650,8 +673,54 @@ mod wasm {
         Ok(xs.get(&num_to_string(len.to_num() - 1.0)))
     }
 
+    /// 고침(fix-nav-lost-update): 조건 건 쓰기가 맞지 않을 때(다른 요청이 그 사이 그 행을 바꿈) 다시 읽어 계산해 다시 쓰는 횟수
+    const NAV_RETRIES: usize = 3;
+    /// 다시 시도를 다 쓰면 던지는 글 (처리기의 catch → console 뒤 500)
+    const NAV_CONFLICT: &str = "nav trials: concurrent updates did not settle";
+
+    /// 이 요청이 내 콜렉션의 한 행에 더한 런들 (`RunAdds`): 수(상대 갱신) · 그 런들 중 최고 기록(처음으로 가장 빠른 것) · 가장 늦은 날짜
+    struct Adds {
+        runs: f64,
+        premium: f64,
+        discount: f64,
+        best: V,
+        best_total: f64,
+        last_day: f64,
+    }
+
+    /// `note(key, run, premium, discount)` — 런 하나를 그 행의 adds 에 더한다
+    fn note(adds: &mut IndexMap<String, Adds>, key: &str, run: &ParsedRun, premium: f64, discount: f64) {
+        let Some(a) = adds.get_mut(key) else {
+            adds.insert(key.to_string(), Adds { runs: 1.0, premium, discount, best: run.splits_v(), best_total: run.total, last_day: run.day });
+            return;
+        };
+        a.runs += 1.0;
+        a.premium += premium;
+        a.discount += discount;
+        if run.total < a.best_total {
+            a.best = run.splits_v();
+            a.best_total = run.total;
+        }
+        a.last_day = a.last_day.max(run.day);
+    }
+
+    /// batch 의 조건 건 쓰기 (`WriteCheck`): 바뀐 행이 0 이면 무엇을 다시 할지
+    enum Check {
+        Evict { app: String, index: usize },
+        Trial { key: String },
+        Course { course: String, insert: bool },
+    }
+
+    /// `sums.map((s, k) => s + (run.splits[k] ?? 0))` — 배열이 아니면 원본처럼 TypeError (`<expr>.map is not a function`)
+    fn sums_plus(sums: &V, run: &ParsedRun, expr: &str) -> R<Vec<V>> {
+        if !sums.is_arr() {
+            return Err(Throw::type_error(format!("{expr}.map is not a function")));
+        }
+        Ok(sums.items().iter().enumerate().map(|(k, s)| add(s, &V::Num(run.splits.get(k).copied().unwrap_or(0.0)))).collect())
+    }
+
     /// `storeRuns(db, account, items, nowMs)` — 확인 → (지갑) 기한 지난 내 코스 지우기 → 앱마다 콜렉션 읽기 → 보낸 순서대로 적용 →
-    /// 계정 없는 합계 · 개수 · 대표 벡터와 함께 한 번에 쓰기
+    /// 등록 잡기 → 계정 없는 합계 · 개수 · 대표 벡터와 함께 한 번에 쓰기 → 조건이 맞지 않은 쓰기만 다시 (fix-nav-lost-update, 머리말)
     async fn store_runs(env: &Env, account: &Account, items: &[V], now_ms: f64) -> R<Vec<V>> {
         let today = day_of(now_ms);
         let oldest = if account.kind == "wallet" { wallet_oldest_day(now_ms) } else { NAV_FIRST_DAY };
@@ -680,31 +749,38 @@ mod wasm {
             js::run(&stmt(env, SQL_EXPIRE_MINE, &[key.clone(), V::Num(oldest)])?).await?;
         }
 
-        // 앱마다 내 콜렉션 (최대 10행)
+        // 앱마다 내 콜렉션 (최대 10행). base 는 읽은 행 그대로 — 조건 건 쓰기(fix-nav-lost-update)가 그 값(best · touched)을 본다
         let mut collections: IndexMap<String, IndexMap<String, V>> = IndexMap::new();
         let apps: IndexSet<String> = runs.iter().flatten().map(|r| r.app.clone()).collect();
         for app in &apps {
             let mut collection = IndexMap::new();
             for r in rows(env, SQL_COLLECTION, &[key.clone(), V::from(app.as_str())]).await? {
-                // { ...r, best: JSON.parse(r.best), last: JSON.parse(r.last) }
+                // { ...r, best: JSON.parse(r.best), last: JSON.parse(r.last), base: r }
+                let base = r.deep_clone();
                 let best = js_parse(&r.g("best")?)?;
                 let last = js_parse(&r.g("last")?)?;
                 r.put("best", best);
                 r.put("last", last);
+                r.put("base", base);
                 collection.insert(mk(&r.get("course")), r);
             }
             collections.insert(app.clone(), collection);
         }
 
-        // 보낸 순서대로 적용한다. touched 는 받은 시각(ms) × 1000 + 요청 안의 순서라, 같은 요청 안에서도 뒤의 런이 더 최근이다
+        // 보낸 순서대로 적용한다. touched 는 받은 시각(ms) × 1000 + 요청 안의 순서라, 같은 요청 안에서도 뒤의 런이 더 최근이다.
+        // adds 는 이 요청이 그 행에 더한 것 (상대 갱신 · 다시 시도에 쓴다)
         let mut dirty: IndexMap<String, (String, V)> = IndexMap::new();
-        let mut evicted: Vec<(String, V)> = Vec::new();
+        let mut adds: IndexMap<String, Adds> = IndexMap::new();
+        // (앱, 코스, 읽은 행(없으면 undefined), 밀어낸 런의 차례)
+        let mut evicted: Vec<(String, V, V, usize)> = Vec::new();
         for (i, run) in runs.iter().enumerate() {
             let Some(run) = run else { continue };
             let collection = collections.get_mut(&run.app).expect("앱마다 읽어 두었다");
             let touched = V::Num(now_ms * 1000.0 + i as f64);
-            let premium = V::Num(if run.kind == 1 { 1.0 } else { 0.0 });
-            let discount = V::Num(if run.kind == -1 { 1.0 } else { 0.0 });
+            let p = if run.kind == 1 { 1.0 } else { 0.0 };
+            let d = if run.kind == -1 { 1.0 } else { 0.0 };
+            let premium = V::Num(p);
+            let discount = V::Num(d);
             let course = V::from(run.course.as_str());
             let dirty_key = format!("{}|{}", run.app, run.course);
             if let Some(row) = collection.get(&mk(&course)).cloned() {
@@ -719,7 +795,8 @@ mod wasm {
                 row.put("last_day", js_max(&row.get("last_day"), run.day));
                 row.put("touched", touched);
                 results[i] = obj! { "course" => course.clone(), "status" => "repeat", "best" => best };
-                dirty.insert(dirty_key, (run.app.clone(), row));
+                dirty.insert(dirty_key.clone(), (run.app.clone(), row));
+                note(&mut adds, &dirty_key, run, p, d);
             } else {
                 let mut status = "stored";
                 let mut gone = V::Undef;
@@ -732,9 +809,11 @@ mod wasm {
                         }
                     }
                     let oldest_course = oldest_row.get("course");
+                    let gone_key = format!("{}|{}", run.app, oldest_course.to_str());
                     collection.shift_remove(&mk(&oldest_course));
-                    dirty.shift_remove(&format!("{}|{}", run.app, oldest_course.to_str()));
-                    evicted.push((run.app.clone(), oldest_course.clone()));
+                    dirty.shift_remove(&gone_key);
+                    adds.shift_remove(&gone_key);
+                    evicted.push((run.app.clone(), oldest_course.clone(), oldest_row.get("base"), i));
                     status = "replaced";
                     gone = oldest_course;
                 }
@@ -750,7 +829,9 @@ mod wasm {
                     "touched" => touched,
                 };
                 collection.insert(mk(&course), fresh.clone());
-                dirty.insert(dirty_key, (run.app.clone(), fresh));
+                dirty.insert(dirty_key.clone(), (run.app.clone(), fresh));
+                adds.shift_remove(&dirty_key);
+                note(&mut adds, &dirty_key, run, p, d);
                 let result = obj! { "course" => course.clone(), "status" => status };
                 if gone.truthy() {
                     result.put("evicted", gone);
@@ -759,171 +840,412 @@ mod wasm {
             }
         }
 
-        // 사용자마다 코스 등록은 한 번: 사용자 코스 id = hashId(<계정 키> + <코스 id>)
+        // 사용자마다 코스 등록은 한 번: 사용자 코스 id = hashId(<계정 키> + <코스 id>).
+        // 고침(fix-nav-lost-update): 원본은 등록을 읽어(SELECT) 보고 batch 에서 넣어, 같은 사용자의 동시 요청 둘이 모두 처음 등록으로 세어
+        // 합계 · 판정 수에 두 번 들어갔다. 등록을 먼저 잡는다: INSERT … ON CONFLICT DO NOTHING 의 바뀐 행이 1 이면 이 요청이 처음이다
+        // (같은 요청에서 같은 코스를 두 번 보내면 앞의 것만). 등록이 합계 · 판정 수를 쓸지 정하므로 batch 밖 앞으로 옮겼고,
+        // 아래에서 쓰지 못하면(D1 오류 · 원본처럼 던지는 TypeError) 잡은 등록을 되돌린다
         let registration_of = |run: &ParsedRun| hash_str(&format!("{}{}", account.key, run.course));
-        let mut registered: IndexSet<String> = IndexSet::new();
-        let ids = unique(runs.iter().flatten().map(|r| V::from(registration_of(r))));
-        for part in ids.chunks(IN_CHUNK) {
-            for r in rows(env, &sql_registrations(part.len()), part).await? {
-                registered.insert(mk(&r.get("id")));
-            }
-        }
-        // 이번에 처음 등록하는 런 (같은 요청 안에서 같은 코스를 두 번 보내면 앞의 것만)
-        let mut fresh = vec![false; runs.len()];
-        for (i, run) in runs.iter().enumerate() {
-            let Some(run) = run else { continue };
-            let id = mk(&V::from(registration_of(run)));
-            let known = registered.contains(&id);
-            results[i].put("duplicate", V::from(known));
-            if !known {
-                registered.insert(id);
-                fresh[i] = true;
-            }
-        }
-
-        // 계정 없는 코스 합계: 코스 id 가 없으면 새로 만들고(created), 있으면 처음 등록하는 런만 더한다(등록한 사용자 수 · 결정 수 · 구간 합)
-        let courses = unique(runs.iter().flatten().map(|r| V::from(r.course.as_str())));
-        let mut totals = read_courses(env, &courses).await?;
-        let mut changed: IndexSet<String> = IndexSet::new();
-        for (i, run) in runs.iter().enumerate() {
-            let Some(run) = run else { continue };
-            let ck = mk(&V::from(run.course.as_str()));
-            let prev = totals.get(&ck).cloned();
-            results[i].put("created", V::from(prev.is_none()));
-            if !fresh[i] {
-                continue;
-            }
-            let premium = if run.kind == 1 { 1.0 } else { 0.0 };
-            let discount = if run.kind == -1 { 1.0 } else { 0.0 };
-            let Some(prev) = prev else {
-                totals.insert(
-                    ck.clone(),
-                    obj! {
-                        "course" => run.course.as_str(),
-                        "app" => run.app.as_str(),
-                        "steps" => json(&V::from(run.steps_v())),
-                        "runs" => 1,
-                        "premium" => premium,
-                        "discount" => discount,
-                        "record" => run.splits_v(),
-                        "sums" => run.splits_v(),
-                        "last_day" => run.day,
-                    },
-                );
-                changed.insert(ck);
-                continue;
-            };
-            if less_than(&V::Num(run.total), &last_of(&prev.g("record")?)?) == Some(true) {
-                prev.put("record", run.splits_v());
-            }
-            prev.put("runs", add(&prev.get("runs"), &V::Num(1.0)));
-            prev.put("premium", add(&prev.get("premium"), &V::Num(premium)));
-            prev.put("discount", add(&prev.get("discount"), &V::Num(discount)));
-            // prev.sums = prev.sums.map((s, k) => s + (run.splits[k] ?? 0))
-            let sums = prev.g("sums")?;
-            if !sums.is_arr() {
-                return Err(Throw::type_error("prev.sums.map is not a function"));
-            }
-            let summed: Vec<V> = sums.items().iter().enumerate().map(|(k, s)| add(s, &V::Num(run.splits.get(k).copied().unwrap_or(0.0)))).collect();
-            prev.put("sums", V::from(summed));
-            prev.put("last_day", js_max(&prev.get("last_day"), run.day));
-            changed.insert(ck);
-        }
-
-        let mut statements: Vec<V> = Vec::new();
-        for (app, course) in &evicted {
-            // 같은 요청에서 다시 들어온 코스는 dirty 에 있으니 아래 upsert 가 되살린다
-            statements.push(stmt(env, SQL_EVICT, &[key.clone(), V::from(app.as_str()), course.clone()])?);
-        }
-        for (app, row) in dirty.values() {
-            statements.push(stmt(
-                env,
-                SQL_UPSERT_TRIAL,
-                &[
-                    key.clone(),
-                    V::from(account.kind),
-                    V::from(app.as_str()),
-                    row.get("course"),
-                    row.get("steps"),
-                    row.get("runs"),
-                    row.get("premium"),
-                    row.get("discount"),
-                    json(&row.get("best")),
-                    json(&row.get("last")),
-                    row.get("last_day"),
-                    row.get("touched"),
-                ],
-            )?);
-        }
-        for t in totals.values() {
-            if !changed.contains(&mk(&t.get("course"))) {
-                continue;
-            }
-            statements.push(stmt(
-                env,
-                SQL_UPSERT_COURSE,
-                &[
-                    t.get("course"),
-                    t.get("app"),
-                    t.get("steps"),
-                    t.get("runs"),
-                    t.get("premium"),
-                    t.get("discount"),
-                    json(&t.get("record")),
-                    json(&t.get("sums")),
-                    t.get("last_day"),
-                ],
-            )?);
-        }
-        let count_up = |hash: V, day: f64, kind: i32| stmt(env, SQL_COUNT_UP, &[hash, V::Num(day), V::Num(kind as f64), V::from(NAV_RECIPE)]);
-        for (i, run) in runs.iter().enumerate() {
-            let Some(run) = run else { continue };
-            if !fresh[i] {
-                continue;
-            }
-            statements.push(stmt(env, SQL_REGISTER, &[V::from(registration_of(run)), V::Num(run.day)])?);
-            if run.kind != 0 {
-                statements.push(count_up(V::from(run.course.as_str()), run.day, run.kind)?);
-            }
-        }
-
-        // 고스트 따라가기 판정. 고스트가 공개됐는지는 이 요청을 쓰기 전의 합계로 본다
-        let ghost_ids = unique(runs.iter().flatten().filter_map(|r| r.ghost.as_deref().map(V::from)));
-        let ghosts = read_courses(env, &ghost_ids).await?;
-        for (i, run) in runs.iter().enumerate() {
-            let Some(run) = run else { continue };
-            let Some(ghost_id) = &run.ghost else { continue };
-            let ghost = ghosts.get(&mk(&V::from(ghost_id.as_str())));
-            let marks = match ghost {
-                Some(g) if fresh[i] && strict_eq(&g.get("app"), &V::from(run.app.as_str())) && js_ge(&g.get("runs"), PUBLISH_MIN_RUNS) => {
-                    let steps = run.steps_v();
-                    let ghost_steps = js_parse(&g.get("steps"))?;
-                    route_marks(&steps, &ghost_steps)?
-                }
-                _ => None,
-            };
-            let Some(marks) = marks else {
-                results[i].put("route", V::Null);
-                continue;
-            };
-            for (step, kind) in &marks {
-                statements.push(count_up(V::from(checkpoint_id_v(step)?), run.day, *kind)?);
-            }
-            let premium = marks.iter().filter(|(_, k)| *k == 1).count();
-            let discount = marks.iter().filter(|(_, k)| *k == -1).count();
-            results[i].put("route", obj! { "ghost" => ghost_id.as_str(), "premium" => premium, "discount" => discount });
-        }
+        let mut first_day: IndexMap<String, f64> = IndexMap::new();
         for run in runs.iter().flatten() {
-            for v in &run.vectors {
-                statements.push(stmt(
-                    env,
-                    SQL_VECTOR,
-                    &[V::from(v.hash.as_str()), V::from(v.space.as_str()), V::from(v.vector.len()), V::bytes(v.bytes()), V::Num(run.day)],
-                )?);
+            first_day.entry(registration_of(run)).or_insert(run.day);
+        }
+        let mut claims = Vec::new();
+        for (id, day) in &first_day {
+            claims.push(stmt(env, SQL_REGISTER, &[V::from(id.as_str()), V::Num(*day)])?);
+        }
+        let claim_out = env.batch("DB", &V::from(claims)).await?;
+        let claimed: Vec<String> = first_day.keys().enumerate().filter(|(k, _)| changes_of(&claim_out.at(*k)) > 0.0).map(|(_, id)| id.clone()).collect();
+        let mut fresh = vec![false; runs.len()];
+        let mut seen: IndexSet<String> = IndexSet::new();
+        for (i, run) in runs.iter().enumerate() {
+            let Some(run) = run else { continue };
+            let id = registration_of(run);
+            let first = seen.insert(id.clone());
+            let is_fresh = first && claimed.contains(&id);
+            results[i].put("duplicate", V::from(!is_fresh));
+            fresh[i] = is_fresh;
+        }
+
+        // 코스 id(mk) → 처음 등록하는 런의 차례
+        let mut changed: IndexMap<String, usize> = IndexMap::new();
+        let mut checks: Vec<Option<Check>> = Vec::new();
+        let written: R<Vec<V>> = async {
+            // 계정 없는 코스 합계: 코스 id 가 없으면 새로 만들고(created), 있으면 처음 등록하는 런만 더한다 (원본과 같은 계산)
+            let courses = unique(runs.iter().flatten().map(|r| V::from(r.course.as_str())));
+            let mut totals = read_courses(env, &courses).await?;
+            for (i, run) in runs.iter().enumerate() {
+                let Some(run) = run else { continue };
+                let ck = mk(&V::from(run.course.as_str()));
+                let prev = totals.get(&ck).cloned();
+                results[i].put("created", V::from(prev.is_none()));
+                if !fresh[i] {
+                    continue;
+                }
+                let premium = if run.kind == 1 { 1.0 } else { 0.0 };
+                let discount = if run.kind == -1 { 1.0 } else { 0.0 };
+                let Some(prev) = prev else {
+                    totals.insert(
+                        ck.clone(),
+                        obj! {
+                            "course" => run.course.as_str(),
+                            "app" => run.app.as_str(),
+                            "steps" => json(&V::from(run.steps_v())),
+                            "runs" => 1,
+                            "premium" => premium,
+                            "discount" => discount,
+                            "record" => run.splits_v(),
+                            "sums" => run.splits_v(),
+                            "last_day" => run.day,
+                        },
+                    );
+                    changed.insert(ck, i);
+                    continue;
+                };
+                if less_than(&V::Num(run.total), &last_of(&prev.g("record")?)?) == Some(true) {
+                    prev.put("record", run.splits_v());
+                }
+                prev.put("runs", add(&prev.get("runs"), &V::Num(1.0)));
+                prev.put("premium", add(&prev.get("premium"), &V::Num(premium)));
+                prev.put("discount", add(&prev.get("discount"), &V::Num(discount)));
+                // prev.sums = prev.sums.map((s, k) => s + (run.splits[k] ?? 0))
+                prev.put("sums", V::from(sums_plus(&prev.g("sums")?, run, "prev.sums")?));
+                prev.put("last_day", js_max(&prev.get("last_day"), run.day));
+                changed.insert(ck, i);
+            }
+
+            let mut statements: Vec<V> = Vec::new();
+            for (app, course, base, index) in &evicted {
+                // 읽은 행은 그때의 touched 일 때만 지운다 (그 사이 다른 요청이 다시 달린 코스를 지우지 않게). 이 요청에서 넣었다가 밀려난 행은 D1 에 없다
+                if base.is_undef() {
+                    statements.push(stmt(env, SQL_EVICT, &[key.clone(), V::from(app.as_str()), course.clone()])?);
+                    checks.push(None);
+                } else {
+                    statements.push(stmt(env, SQL_EVICT_IF, &[key.clone(), V::from(app.as_str()), course.clone(), base.get("touched")])?);
+                    checks.push(Some(Check::Evict { app: app.clone(), index: *index }));
+                }
+            }
+            for (dirty_key, (app, row)) in &dirty {
+                let a = &adds[dirty_key];
+                let base = row.get("base");
+                if base.is_undef() {
+                    statements.push(stmt(
+                        env,
+                        SQL_INSERT_TRIAL,
+                        &[
+                            key.clone(),
+                            V::from(account.kind),
+                            V::from(app.as_str()),
+                            row.get("course"),
+                            row.get("steps"),
+                            row.get("runs"),
+                            row.get("premium"),
+                            row.get("discount"),
+                            json(&row.get("best")),
+                            json(&row.get("last")),
+                            row.get("last_day"),
+                            row.get("touched"),
+                        ],
+                    )?);
+                } else {
+                    // 읽은 행: 수는 더하고, best 는 읽은 글일 때만 바꾼다
+                    statements.push(stmt(
+                        env,
+                        SQL_UPDATE_TRIAL,
+                        &[
+                            key.clone(),
+                            V::from(app.as_str()),
+                            row.get("course"),
+                            base.get("best"),
+                            V::Num(a.runs),
+                            V::Num(a.premium),
+                            V::Num(a.discount),
+                            json(&row.get("best")),
+                            json(&row.get("last")),
+                            V::Num(a.last_day),
+                            row.get("touched"),
+                        ],
+                    )?);
+                }
+                checks.push(Some(Check::Trial { key: dirty_key.clone() }));
+            }
+            for t in totals.values() {
+                let Some(&ri) = changed.get(&mk(&t.get("course"))) else { continue };
+                let run = runs[ri].as_ref().expect("처음 등록하는 런");
+                let stored = t.get("stored");
+                let course = t.get("course");
+                if stored.is_undef() {
+                    statements.push(stmt(
+                        env,
+                        SQL_INSERT_COURSE,
+                        &[
+                            course.clone(),
+                            t.get("app"),
+                            t.get("steps"),
+                            t.get("runs"),
+                            t.get("premium"),
+                            t.get("discount"),
+                            json(&t.get("record")),
+                            json(&t.get("sums")),
+                            t.get("last_day"),
+                        ],
+                    )?);
+                    checks.push(Some(Check::Course { course: course.to_str(), insert: true }));
+                } else {
+                    statements.push(stmt(
+                        env,
+                        SQL_UPDATE_COURSE,
+                        &[
+                            course.clone(),
+                            stored.get("record"),
+                            stored.get("sums"),
+                            V::Num(if run.kind == 1 { 1.0 } else { 0.0 }),
+                            V::Num(if run.kind == -1 { 1.0 } else { 0.0 }),
+                            json(&t.get("record")),
+                            json(&t.get("sums")),
+                            V::Num(run.day),
+                        ],
+                    )?);
+                    checks.push(Some(Check::Course { course: course.to_str(), insert: false }));
+                }
+            }
+            let count_up = |hash: V, day: f64, kind: i32| stmt(env, SQL_COUNT_UP, &[hash, V::Num(day), V::Num(kind as f64), V::from(NAV_RECIPE)]);
+            for (i, run) in runs.iter().enumerate() {
+                let Some(run) = run else { continue };
+                if fresh[i] && run.kind != 0 {
+                    statements.push(count_up(V::from(run.course.as_str()), run.day, run.kind)?);
+                    checks.push(None);
+                }
+            }
+
+            // 고스트 따라가기 판정. 고스트가 공개됐는지는 이 요청을 쓰기 전의 합계로 본다
+            let ghost_ids = unique(runs.iter().flatten().filter_map(|r| r.ghost.as_deref().map(V::from)));
+            let ghosts = read_courses(env, &ghost_ids).await?;
+            for (i, run) in runs.iter().enumerate() {
+                let Some(run) = run else { continue };
+                let Some(ghost_id) = &run.ghost else { continue };
+                let ghost = ghosts.get(&mk(&V::from(ghost_id.as_str())));
+                let marks = match ghost {
+                    Some(g) if fresh[i] && strict_eq(&g.get("app"), &V::from(run.app.as_str())) && js_ge(&g.get("runs"), PUBLISH_MIN_RUNS) => {
+                        let steps = run.steps_v();
+                        let ghost_steps = js_parse(&g.get("steps"))?;
+                        route_marks(&steps, &ghost_steps)?
+                    }
+                    _ => None,
+                };
+                let Some(marks) = marks else {
+                    results[i].put("route", V::Null);
+                    continue;
+                };
+                for (step, kind) in &marks {
+                    statements.push(count_up(V::from(checkpoint_id_v(step)?), run.day, *kind)?);
+                    checks.push(None);
+                }
+                let premium = marks.iter().filter(|(_, k)| *k == 1).count();
+                let discount = marks.iter().filter(|(_, k)| *k == -1).count();
+                results[i].put("route", obj! { "ghost" => ghost_id.as_str(), "premium" => premium, "discount" => discount });
+            }
+            for run in runs.iter().flatten() {
+                for v in &run.vectors {
+                    statements.push(stmt(
+                        env,
+                        SQL_VECTOR,
+                        &[V::from(v.hash.as_str()), V::from(v.space.as_str()), V::from(v.vector.len()), V::bytes(v.bytes()), V::Num(run.day)],
+                    )?);
+                    checks.push(None);
+                }
+            }
+            if statements.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(env.batch("DB", &V::from(statements)).await?.items())
+        }
+        .await;
+        let out = match written {
+            Ok(out) => out,
+            Err(err) => {
+                // 쓰지 못했다: 이번에 잡은 등록을 되돌린다 (원본은 등록도 같은 batch 라 실패하면 남지 않았다). 되돌리기의 실패는 삼킨다
+                if !claimed.is_empty() {
+                    let ids: Vec<V> = claimed.iter().map(|id| V::from(id.as_str())).collect();
+                    let undo: R<()> = async {
+                        for part in ids.chunks(IN_CHUNK) {
+                            let sql = format!("DELETE FROM nav_registrations WHERE \"id\" IN ({})", crate::util::binds(part.len()));
+                            js::run(&stmt(env, &sql, part)?).await?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let _ = undo;
+                }
+                return Err(err);
+            }
+        };
+
+        // 조건이 맞지 않은 쓰기 (다른 요청이 그 사이 그 행을 바꿈): 다시 읽어 계산해 다시 쓴다
+        let mut retry_trials: Vec<String> = Vec::new();
+        let mut retry_courses: Vec<String> = Vec::new();
+        let mut retry_evictions: Vec<(String, usize)> = Vec::new();
+        for (res, check) in out.iter().zip(&checks) {
+            let Some(check) = check else { continue };
+            if changes_of(res) > 0.0 {
+                continue;
+            }
+            match check {
+                Check::Trial { key } => retry_trials.push(key.clone()),
+                Check::Course { course, insert } => {
+                    // 새 코스를 넣으려 했는데 다른 요청이 먼저 만들었다
+                    if *insert {
+                        for (i, run) in runs.iter().enumerate() {
+                            if run.as_ref().is_some_and(|r| &r.course == course) {
+                                results[i].put("created", V::from(false));
+                            }
+                        }
+                    }
+                    retry_courses.push(course.clone());
+                }
+                Check::Evict { app, index } => retry_evictions.push((app.clone(), *index)),
             }
         }
-        if !statements.is_empty() {
-            env.batch("DB", &V::from(statements)).await?;
+        for dirty_key in &retry_trials {
+            let (app, row) = &dirty[dirty_key];
+            let a = &adds[dirty_key];
+            let mut done = false;
+            let mut attempt = 0;
+            while attempt < NAV_RETRIES && !done {
+                attempt += 1;
+                let cur = js::first(&stmt(env, SQL_TRIAL_ROW, &[key.clone(), V::from(app.as_str()), row.get("course")])?).await?;
+                if cur.is_nullish() {
+                    let res = js::run(&stmt(
+                        env,
+                        SQL_INSERT_TRIAL,
+                        &[
+                            key.clone(),
+                            V::from(account.kind),
+                            V::from(app.as_str()),
+                            row.get("course"),
+                            row.get("steps"),
+                            V::Num(a.runs),
+                            V::Num(a.premium),
+                            V::Num(a.discount),
+                            json(&a.best),
+                            json(&row.get("last")),
+                            V::Num(a.last_day),
+                            row.get("touched"),
+                        ],
+                    )?)
+                    .await?;
+                    done = changes_of(&res) > 0.0;
+                    continue;
+                }
+                let stored = js_parse(&cur.g("best")?)?;
+                let best = if less_than(&V::Num(a.best_total), &last_of(&stored)?) == Some(true) { a.best.clone() } else { stored };
+                let res = js::run(&stmt(
+                    env,
+                    SQL_UPDATE_TRIAL,
+                    &[
+                        key.clone(),
+                        V::from(app.as_str()),
+                        row.get("course"),
+                        cur.get("best"),
+                        V::Num(a.runs),
+                        V::Num(a.premium),
+                        V::Num(a.discount),
+                        json(&best),
+                        json(&row.get("last")),
+                        V::Num(a.last_day),
+                        row.get("touched"),
+                    ],
+                )?)
+                .await?;
+                done = changes_of(&res) > 0.0;
+            }
+            if !done {
+                return Err(Throw::error(NAV_CONFLICT));
+            }
+        }
+        for course in &retry_courses {
+            let ri = changed[&mk(&V::from(course.as_str()))];
+            let run = runs[ri].as_ref().expect("처음 등록하는 런");
+            let premium = V::Num(if run.kind == 1 { 1.0 } else { 0.0 });
+            let discount = V::Num(if run.kind == -1 { 1.0 } else { 0.0 });
+            let mut done = false;
+            let mut attempt = 0;
+            while attempt < NAV_RETRIES && !done {
+                attempt += 1;
+                let cur = js::first(&stmt(env, SQL_COURSE_ROW, &[V::from(course.as_str())])?).await?;
+                if cur.is_nullish() {
+                    let res = js::run(&stmt(
+                        env,
+                        SQL_INSERT_COURSE,
+                        &[
+                            V::from(course.as_str()),
+                            V::from(run.app.as_str()),
+                            json(&V::from(run.steps_v())),
+                            V::Num(1.0),
+                            premium.clone(),
+                            discount.clone(),
+                            json(&run.splits_v()),
+                            json(&run.splits_v()),
+                            V::Num(run.day),
+                        ],
+                    )?)
+                    .await?;
+                    done = changes_of(&res) > 0.0;
+                    continue;
+                }
+                let record = js_parse(&cur.g("record")?)?;
+                let sums = js_parse(&cur.g("sums")?)?;
+                let next_record = if less_than(&V::Num(run.total), &last_of(&record)?) == Some(true) { run.splits_v() } else { record };
+                let next_sums = V::from(sums_plus(&sums, run, "sums")?);
+                let res = js::run(&stmt(
+                    env,
+                    SQL_UPDATE_COURSE,
+                    &[
+                        V::from(course.as_str()),
+                        cur.get("record"),
+                        cur.get("sums"),
+                        premium.clone(),
+                        discount.clone(),
+                        json(&next_record),
+                        json(&next_sums),
+                        V::Num(run.day),
+                    ],
+                )?)
+                .await?;
+                done = changes_of(&res) > 0.0;
+            }
+            if !done {
+                return Err(Throw::error(NAV_CONFLICT));
+            }
+        }
+        for (app, index) in &retry_evictions {
+            // 밀어내려던 코스를 그 사이 다른 요청이 다시 달렸다: 콜렉션을 다시 읽어 넘치면 이 요청이 쓰지 않은 것 중 가장 오래된 것을 밀어낸다
+            let mine: IndexSet<String> = dirty.values().filter(|(a, _)| a == app).map(|(_, row)| mk(&row.get("course"))).collect();
+            let mut done = false;
+            let mut attempt = 0;
+            while attempt < NAV_RETRIES && !done {
+                attempt += 1;
+                let all = rows(env, SQL_COLLECTION, &[key.clone(), V::from(app.as_str())]).await?;
+                let candidates: Vec<&V> = all.iter().filter(|r| !mine.contains(&mk(&r.get("course")))).collect();
+                if all.len() <= MAX_COURSES || candidates.is_empty() {
+                    done = true;
+                    break;
+                }
+                let mut oldest_row = candidates[0];
+                for b in &candidates[1..] {
+                    if less_than(&b.get("touched"), &oldest_row.get("touched")) == Some(true) {
+                        oldest_row = b;
+                    }
+                }
+                let res = js::run(&stmt(env, SQL_EVICT_IF, &[key.clone(), V::from(app.as_str()), oldest_row.get("course"), oldest_row.get("touched")])?).await?;
+                if changes_of(&res) > 0.0 {
+                    results[*index].put("evicted", oldest_row.get("course"));
+                    done = true;
+                }
+            }
+            if !done {
+                return Err(Throw::error(NAV_CONFLICT));
+            }
         }
         Ok(results)
     }
@@ -1034,7 +1356,8 @@ mod wasm {
     /// `authenticate(request, body, env, nowMs)` — 지갑 헤더가 있으면 지갑으로만, 없으면 세션으로 확인한다. 어느 쪽도 아니면 None
     async fn authenticate(req: &Req, env: &Env, now_ms: f64) -> R<Option<Account>> {
         if has_wallet_headers(req) {
-            return Ok(match verify_wallet_request(req, &req.body, now_ms) {
+            // 고침(fix-wallet-replay): 서명 확인 + 한 번만 쓰기 (auth.rs). 이미 쓴 서명은 틀린 서명과 같이 None → 401
+            return Ok(match verify_wallet_request_once(req, env, &req.body, now_ms).await? {
                 Some(address) => Some(Account { kind: "wallet", key: account_key(&env.get("AUTHOR_KEY_SECRET"), "wallet", &address)? }),
                 None => None,
             });
