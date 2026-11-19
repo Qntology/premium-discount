@@ -1,3 +1,381 @@
-// 2단계: graph.ts — /graph · /graph/local · /graph/similar · /graph/view. 옮길 node 시험: graph.test.ts
-// 시나리오 모양은 www_common.mjs 머리말. 이름은 www_graph_ 로 시작하고 module 은 "graph" 으로 둔다.
-export default [];
+// graph.ts — /graph · /graph/local · /graph/similar · /graph/view (공개, 읽기 제한기). graph.test.ts 의 단언을 모두 옮겼고(`covers`),
+// SCENARIOS.md 의 GR · R-06~08 · RL-04 와 premium-discount-mcp(crates/premium-discount-mcp/src/graph.rs)가 보내는 요청을 그대로 보낸다.
+//
+// 가짜 Vectorize: 시험대의 기본 getByIds 는 values 를 돌려주지 않고 query 는 늘 빈 결과라 similar 를 시험할 수 없다. 그래서 이 파일의
+// `vecStore()` 를 시나리오의 `vec` 칸(시험대가 원래 받는 시나리오별 답)으로 넘긴다: 씨앗 `vectors: { id: { values, metadata } }` 를
+// 저장소로 쓰고, getByIds 는 values 까지 돌려주며(운영 Vectorize 처럼 숫자 배열), query 는 받은 벡터의 요약(형 · 길이 · Float64 FNV)과
+// 같은 저장 벡터를 찾아 코사인으로 순위를 매긴다(filter 는 metadata 의 같은 값, topK 기본 5). 공용 파일(www_mocks_src.mjs · www.mjs)은
+// 바꾸지 않았다 — 다른 시나리오의 Vectorize 동작 · 기록은 그대로다.
+import { IP, PARENT_ID, AUTHOR, evaluation, unitVector } from "./www_common.mjs";
+
+const M = "graph";
+const READ = { EVAL_READ_LIMITER: true };
+const SECRET = { AUTHOR_KEY_SECRET: "k" };
+const get = (path, extra = {}) => ({ path, headers: { "cf-connecting-ip": IP, ...extra } });
+// premium-discount-mcp 의 GraphClient: ureq 2.12.1(기본 기능)의 GET — 머리글은 ureq 가 붙이는 것뿐이고, cf-connecting-ip 는 Cloudflare 가 붙인다
+const mcp = (path) => ({ path, headers: { "User-Agent": "ureq/2.12.1", Accept: "*/*", "accept-encoding": "gzip", "cf-connecting-ip": IP } });
+
+// graph.test.ts 의 id 들: 스레드 하나(ROOT ← A, B, C)와 따로 떨어진 평가 하나. ROOT 는 판정 행이 없다
+const ROOT = "0190f0a0-0000-7000-8000-0000000000a0";
+const A = "0190f0a0-0000-7000-8000-0000000000a1";
+const B = "0190f0a0-0000-7000-8000-0000000000a2";
+const C = "0190f0a0-0000-7000-8000-0000000000a3";
+const LONE = "0190f0a0-0000-7000-8000-0000000000b0";
+const MISSING = "0190f0a0-0000-7000-8000-0000000000ff";
+
+/** seedVerdict (fakes.ts) — eval_verdicts 행 */
+function verdict(v) {
+  const at = v.updated_at ?? 1_000;
+  return [
+    `INSERT INTO eval_verdicts ("eval_id", "cc", "to", "evidence", "value", "up", "down", "level", "rank", "tier", "grade", "tier_since", "reasons", "recipe", "updated_at", "judged_at")
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?12, ?12)`,
+    v.eval_id, v.cc ?? "example.com", v.to ?? null, v.evidence ?? 0, v.value ?? 0, v.up ?? 0, v.down ?? 0, v.level ?? null, v.rank ?? null,
+    v.tier, v.grade ?? null, at, JSON.stringify(v.reasons ?? []), v.recipe ?? "pd-verdict/1",
+  ];
+}
+
+// graph.test.ts 의 seedGraph
+const SEED_GRAPH = [
+  evaluation({ id: ROOT, created_at: 1 }),
+  evaluation({ id: A, ref: ROOT, root: ROOT, created_at: 2 }),
+  evaluation({ id: B, ref: ROOT, root: ROOT, created_at: 3 }),
+  evaluation({ id: C, ref: ROOT, root: ROOT, created_at: 4 }),
+  evaluation({ id: LONE, created_at: 5 }),
+  verdict({ eval_id: A, tier: "premium", grade: 2 }),
+  verdict({ eval_id: B, tier: "discount", grade: -1 }),
+  verdict({ eval_id: C, tier: "neutral", grade: 0 }),
+  verdict({ eval_id: LONE, tier: "premium", grade: 1 }),
+];
+
+// ---- 값을 가진 가짜 Vectorize (위 머리말) ----
+function fnv(u8) {
+  let h = 2166136261;
+  for (const b of u8) h = Math.imul(h ^ b, 16777619) >>> 0;
+  return h.toString(16).padStart(8, "0");
+}
+// mocks_src.mjs 의 vectorSummary 가 배열에 쓰는 것과 같은 요약
+const summaryFnv = (values) => fnv(new Uint8Array(new Float64Array(values).buffer));
+function cosine(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return na && nb ? dot / Math.sqrt(na * nb) : 0;
+}
+/** 저장 벡터의 values 를 돌려주는 getByIds 와 코사인 query. over: { getByIds?, query? } 로 한쪽만 바꿀 수 있다 */
+export function vecStore(over = {}) {
+  return {
+    getByIds: ({ ids }, store) => ids.filter((id) => store.has(id)).map((id) => ({ id, values: store.get(id).values, metadata: store.get(id).metadata })),
+    query: ({ vector, options }, store) => {
+      const q = vector && vector.tag === "[object Array]"
+        ? [...store.values()].find((v) => Array.isArray(v.values) && v.values.length === vector.len && summaryFnv(v.values) === vector.fnv)
+        : null;
+      if (!q) return { matches: [], count: 0 };
+      const filter = (options && options.filter) || {};
+      const scored = [...store]
+        .filter(([, v]) => Array.isArray(v.values) && v.values.length === q.values.length && Object.entries(filter).every(([k, x]) => (v.metadata || {})[k] === x))
+        .map(([id, v]) => ({ id, score: cosine(q.values, v.values) }))
+        .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const matches = scored.slice(0, (options && options.topK) ?? 5);
+      return { matches, count: matches.length };
+    },
+    ...over,
+  };
+}
+/** 정해 둔 matches 를 돌려주는 query (fakes.ts 의 vec.matches 와 같다: topK 로 자르고 필터는 흉내 내지 않는다) */
+const fixedMatches = (matches) => ({ options }) => {
+  const m = matches.slice(0, (options && options.topK) ?? 5);
+  return { matches: m, count: m.length };
+};
+/** 작은 차원의 벡터: 축 i 에 가까운 정도를 다르게 */
+const v4 = (...xs) => xs;
+
+// similar 시나리오의 작은 저장소: A 와 가까운 차례 LONE > B > C > ROOT, 다른 cc 의 X 는 A 와 똑같지만 filter 로 빠진다
+const OTHER = "0190f0a0-0000-7000-8000-0000000000c0";
+const SMALL_VECTORS = {
+  [A]: { values: v4(1, 0, 0, 0), metadata: { cc: "example.com", root: ROOT } },
+  [LONE]: { values: v4(0.9, 0.1, 0, 0), metadata: { cc: "example.com", root: LONE } },
+  [B]: { values: v4(0.7, 0.3, 0.1, 0), metadata: { cc: "example.com", root: ROOT } },
+  [C]: { values: v4(0.2, 0.9, 0.1, 0.3), metadata: { cc: "example.com", root: ROOT } },
+  [ROOT]: { values: v4(-0.5, 0.5, 0.5, 0.5), metadata: { cc: "example.com", root: ROOT } },
+  [OTHER]: { values: v4(1, 0, 0, 0), metadata: { cc: "other.com", root: OTHER } },
+};
+
+// MCP 시나리오의 씨앗: app:// 자리(code.exe)의 스레드 둘, 작성자 셋(대소문자만 다른 주소는 같은 작성자 키)
+const MCP_IDS = Array.from({ length: 6 }, (_, i) => `0190f0a1-0000-7000-8000-00000000000${i}`);
+const MCP_SEED = [
+  evaluation({ id: MCP_IDS[0], cc: "code.exe", from: AUTHOR, created_at: 10 }),
+  evaluation({ id: MCP_IDS[1], cc: "code.exe", from: AUTHOR.toUpperCase().replace("0X", "0x"), ref: MCP_IDS[0], root: MCP_IDS[0], created_at: 11 }),
+  evaluation({ id: MCP_IDS[2], cc: "code.exe", from: "0x00000000000000000000000000000000000000cd", ref: MCP_IDS[1], root: MCP_IDS[0], created_at: 12 }),
+  evaluation({ id: MCP_IDS[3], cc: "code.exe", from: "guest:abc", created_at: 13 }),
+  evaluation({ id: MCP_IDS[4], cc: "code.exe", from: "0x00000000000000000000000000000000000000cd", ref: MCP_IDS[3], root: MCP_IDS[3], created_at: 14 }),
+  evaluation({ id: MCP_IDS[5], cc: "example.com", created_at: 15 }),
+  verdict({ eval_id: MCP_IDS[0], cc: "code.exe", tier: "premium", grade: 2, rank: 0.8, evidence: 4.5 }),
+  verdict({ eval_id: MCP_IDS[1], cc: "code.exe", tier: "unrated", grade: null }),
+  verdict({ eval_id: MCP_IDS[3], cc: "code.exe", tier: "discount", grade: -2 }),
+];
+const MCP_VECTORS = Object.fromEntries(
+  MCP_IDS.slice(0, 5).map((id, i) => [id, { values: unitVector(i + 2).slice(0, 16), metadata: { cc: "code.exe", root: i < 3 ? MCP_IDS[0] : MCP_IDS[3] } }])
+);
+
+// 200건 넘는 도메인 · 스레드 (GR-03 · GR-06): BIG_ROOT 를 뿌리로 한 205건, 앞 세 건(가장 오래된 것)이 부모
+const BIG_ROOT = "0190f0a2-0000-7000-8000-000000000000";
+const bigId = (i) => `0190f0a2-0000-7000-8000-${String(i).padStart(12, "0")}`;
+const BIG_SEED = Array.from({ length: 205 }, (_, i) =>
+  i === 0 ? evaluation({ id: BIG_ROOT, cc: "big.example", created_at: 100 }) : evaluation({ id: bigId(i), cc: "big.example", ref: bigId(i % 3), root: BIG_ROOT, created_at: 100 + i, from: `0x${String(i % 4).padStart(40, "0")}` })
+);
+
+export default [
+  // ---- graph.test.ts ----
+  {
+    name: "graph_rate_limited", module: M,
+    covers: ["graph.test.ts: 그래프 JSON API는 읽기 제한에 걸리면 429다 (D1·Vectorize를 조회하지 않는다) — Retry-After 60, 키는 IP", "SCENARIOS RL-04"],
+    bindings: SECRET, limits: { EVAL_READ_LIMITER: false }, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
+    requests: [get("/graph?cc=example.com"), get(`/graph/local?id=${PARENT_ID}`), get(`/graph/similar?id=${PARENT_ID}`)],
+  },
+  {
+    name: "graph_empty_domain", module: M,
+    covers: ["graph.test.ts: 제한 안에서는 그대로 응답한다 — 빈 그래프 { nodes: [], edges: [], summary: 0 · 0 · 0 · 0 }"],
+    bindings: SECRET, limits: READ,
+    requests: [get("/graph?cc=example.com")],
+  },
+  {
+    name: "graph_domain_tiers", module: M,
+    covers: [
+      "graph.test.ts: /graph: 평가 노드에 tier·grade가 붙고(판정 행이 없으면 unrated, null), summary는 평가 노드의 등급별 개수다 · 도메인·작성자 노드에는 등급이 없다 · 답글 연결 3",
+      "SCENARIOS GR-01 · GR-04 · GR-05 · R-06 · DB-09",
+    ],
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH,
+    requests: [get("/graph?cc=example.com")],
+  },
+  {
+    name: "graph_local_thread", module: M,
+    covers: ["graph.test.ts: /graph/local: 스레드의 평가만 센다", "SCENARIOS GR-07"],
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH,
+    requests: [get(`/graph/local?id=${B}`), get(`/graph/local?id=${LONE}`)],
+  },
+  {
+    name: "graph_similar_tiers", module: M,
+    covers: ["graph.test.ts: /graph/similar: 유사 노드에도 tier·grade가 붙고 summary는 유사 노드만 센다 · 자기 자신(A)은 빠진다 · 엣지 차례 LONE, ROOT, B"],
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH,
+    vectors: { [A]: { values: unitVector(2) } },
+    vec: vecStore({ query: fixedMatches([A, LONE, ROOT, B].map((id, i) => ({ id, score: [1, 0.9, 0.8, 0.7][i] }))) }),
+    requests: [get(`/graph/similar?id=${A}`)],
+  },
+  {
+    name: "graph_view_not_limited", module: M,
+    covers: [
+      "graph.test.ts: /graph/view 페이지는 제한 대상이 아니다 (200, text/html, 제한기를 부르지 않음)",
+      "graph.test.ts: 뷰의 인라인 스크립트는 문법이 맞고, 로컬 원문 오버레이가 들어 있다 — 본문 바이트가 원본과 같다",
+      "SCENARIOS R-08 · GR-15",
+    ],
+    limits: { EVAL_READ_LIMITER: false },
+    requests: [get("/graph/view"), get("/graph/view?cc=example.com")],
+  },
+
+  // ---- premium-discount-mcp 의 요청 (pd_graph_inspect) ----
+  {
+    name: "graph_mcp_domain", module: M,
+    covers: ["premium-discount-mcp: query_of(cc) → GET /graph?cc=code.exe (app:// 자리) — 작성자 키 · 스레드 · tier 분포를 summarize 가 읽는다"],
+    bindings: SECRET, limits: READ, sql: MCP_SEED,
+    requests: [mcp("/graph?cc=code.exe"), mcp("/graph?cc=example.com"), mcp("/graph?cc=store.steampowered.com")],
+  },
+  {
+    name: "graph_mcp_local", module: M,
+    covers: ["premium-discount-mcp: mode local → GET /graph/local?id=<소문자 UUID> (가운데 평가 · 답글의 답글)"],
+    bindings: SECRET, limits: READ, sql: MCP_SEED,
+    requests: [mcp(`/graph/local?id=${MCP_IDS[2]}`), mcp(`/graph/local?id=${MCP_IDS[3]}`)],
+  },
+  {
+    name: "graph_mcp_similar", module: M,
+    covers: ["premium-discount-mcp: mode similar → GET /graph/similar?id=…&topK=5 · top_k 없으면 10 · 1 · 49 (서버와 같은 검사 범위)"],
+    bindings: SECRET, limits: READ, sql: MCP_SEED, vectors: MCP_VECTORS, vec: vecStore(),
+    requests: [mcp(`/graph/similar?id=${MCP_IDS[0]}&topK=5`), mcp(`/graph/similar?id=${MCP_IDS[0]}&topK=10`), mcp(`/graph/similar?id=${MCP_IDS[3]}&topK=1`), mcp(`/graph/similar?id=${MCP_IDS[3]}&topK=49`)],
+  },
+  {
+    name: "graph_mcp_errors", module: M,
+    covers: ["premium-discount-mcp: 서버 오류는 본문의 error 를 읽는다 — 429 'rate limit exceeded' · 404 'not found' · 404 'vector not found'"],
+    bindings: SECRET, limits: { EVAL_READ_LIMITER: (n) => n !== 1 }, sql: MCP_SEED, vectors: {}, vec: vecStore(),
+    requests: [mcp(`/graph/local?id=${MCP_IDS[0]}`), mcp(`/graph/local?id=${MISSING}`), mcp(`/graph/similar?id=${MCP_IDS[0]}&topK=10`), mcp(`/graph/similar?id=${MISSING}&topK=10`)],
+  },
+
+  // ---- 가장자리 ----
+  {
+    name: "graph_bad_params", module: M,
+    covers: ["SCENARIOS GR-02 (cc 형식 오류 400) · GR-09 (id 형식 오류 400) · GR-11 (topK 0 · 50 → 400, 최대 49)"],
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
+    requests: [
+      get("/graph"), get("/graph?cc="), get("/graph?cc=bad"), get("/graph?cc=exa_mple.com"), get(`/graph?cc=${"a".repeat(61)}.com`),
+      get("/graph/local"), get("/graph/local?id=abc"), get(`/graph/local?id=${A}x`),
+      get("/graph/similar"), get("/graph/similar?id=abc&topK=0"),
+      ...["0", "50", "1.5", "", "abc", "-1", "Infinity"].map((k) => get(`/graph/similar?id=${A}&topK=${k}`)),
+      // 1 · 49 · 49.0 · 0x10 · 1e1 은 통과 (Number(raw) 가 1~49 의 정수)
+      ...["1", "49", "49.0", "0x10", "1e1"].map((k) => get(`/graph/similar?id=${A}&topK=${k}`)),
+    ],
+  },
+  {
+    name: "graph_query_decoding", module: M,
+    // searchParams.get: + 는 공백 · %xx 풀기 · 처음 것. parseDomain 은 trim · 소문자, parseUuid 는 대문자 UUID 를 소문자로
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
+    requests: [
+      get("/graph?cc=+Ex%61mple.COM+"), get("/graph?cc=example.com&cc=bad"), get("/graph?cc=bad&cc=example.com"), get("/graph?CC=example.com"),
+      get(`/graph/local?id=${B.toUpperCase()}`), get(`/graph/local?id=%20${B}`), get(`/graph/similar?id=${A.toUpperCase()}&topK=+2+`),
+      get(`/graph/similar?topK=3&id=${A}&topK=60`), get(`/graph?cc=%E2%82%AC.com`), get(`/graph?cc=%FF.com`),
+    ],
+  },
+  {
+    name: "graph_methods_and_paths", module: M,
+    covers: ["SCENARIOS R-07 · GR-16 (POST /graph → 405, 제한기보다 먼저)", "그래프 경로가 아니면 null → 레거시(418)"],
+    bindings: SECRET, limits: { EVAL_READ_LIMITER: false }, sql: SEED_GRAPH,
+    requests: [
+      { ...get("/graph?cc=example.com"), method: "POST", body: "{}" }, { ...get("/graph/view"), method: "PUT", body: "x" },
+      { ...get("/graph/local"), method: "DELETE" }, { ...get("/graph/similar"), method: "OPTIONS" }, { ...get("/graph"), method: "HEAD" },
+      { ...get("/graph"), method: "PATCH", body: "x" },
+      get("/graph/"), get("/graph/view/"), get("/graphs"), get("/GRAPH"), get("/graph/x"), get("/graph/%6Cocal?id=" + A),
+    ],
+  },
+  {
+    name: "graph_local_not_found", module: M,
+    covers: ["SCENARIOS GR-08 (스레드 그래프 id 없음 → 404)"],
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH,
+    requests: [get(`/graph/local?id=${MISSING}`)],
+  },
+  {
+    name: "graph_similar_cosine", module: M,
+    covers: ["SCENARIOS GR-10 (유사 그래프: 자기 자신 제외, 같은 cc) · topK 기본 10 → query topK 11 · topK 2 → 3 · 49 → 50"],
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
+    requests: [get(`/graph/similar?id=${A}`), get(`/graph/similar?id=${A}&topK=2`), get(`/graph/similar?id=${A}&topK=49`), get(`/graph/similar?id=${C}&topK=1`)],
+  },
+  {
+    name: "graph_similar_missing", module: M,
+    covers: ["SCENARIOS GR-12 (D1 행은 있는데 벡터 없음 → 404 vector not found)", "평가 행이 없으면 Vectorize 를 부르지 않고 404 not found"],
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH,
+    vectors: { [B]: { metadata: { cc: "example.com" } }, [C]: { values: null }, [ROOT]: { values: [] } },
+    vec: vecStore(),
+    // A: 저장소에 없음 · B: values 없음 · C: values null · ROOT: 빈 배열은 참이라 빈 벡터로 query · MISSING: 평가 행 없음
+    requests: [get(`/graph/similar?id=${A}`), get(`/graph/similar?id=${B}`), get(`/graph/similar?id=${C}`), get(`/graph/similar?id=${ROOT}`), get(`/graph/similar?id=${MISSING}`)],
+  },
+  {
+    name: "graph_similar_phantom", module: M,
+    covers: ["SCENARIOS GR-13 (벡터는 있는데 D1 행이 없음 → 노드로 나옴, D1 을 확인하지 않음 · 판정 없음 unrated)"],
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH,
+    vectors: { ...SMALL_VECTORS, [MISSING]: { values: v4(0.95, 0.05, 0, 0), metadata: { cc: "example.com" } } },
+    vec: vecStore(),
+    requests: [get(`/graph/similar?id=${A}&topK=3`)],
+  },
+  {
+    name: "graph_similar_empty", module: M,
+    // 자기 자신만 나오면 빈 그래프이고 판정 조회(IN)를 하지 않는다 · 같은 id 가 여러 번 · 대문자 id 는 자기 자신이 아니다
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH,
+    vectors: { [A]: { values: v4(1, 0, 0, 0), metadata: { cc: "example.com" } } },
+    vec: vecStore({
+      query: ({ options }) =>
+        options.topK === 11
+          ? { matches: [{ id: A, score: 1 }], count: 1 }
+          : { matches: [{ id: A.toUpperCase(), score: 0.99 }, { id: B, score: 0.5 }, { id: B, score: 0.5 }, { id: A, score: 1 }, { id: C }], count: 5 },
+    }),
+    requests: [get(`/graph/similar?id=${A}`), get(`/graph/similar?id=${A}&topK=4`)],
+  },
+  {
+    name: "graph_secret_missing", module: M,
+    covers: ["SCENARIOS GR-14 · CF-05 (AUTHOR_KEY_SECRET 없음 → 500 internal error, 행이 없으면 200 · similar 는 비밀을 쓰지 않음)"],
+    bindings: { AUTHOR_KEY_SECRET: undefined }, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
+    requests: [get("/graph?cc=example.com"), get(`/graph/local?id=${A}`), get("/graph?cc=nobody.example"), get(`/graph/similar?id=${A}&topK=2`)],
+  },
+  {
+    name: "graph_secret_empty", module: M,
+    bindings: { AUTHOR_KEY_SECRET: "" }, limits: READ, sql: SEED_GRAPH,
+    requests: [get("/graph?cc=example.com")],
+  },
+  {
+    name: "graph_limit_200", module: M,
+    covers: ["SCENARIOS GR-03 (200건 초과 → 최신 200건만, DESC) · GR-06 (부모가 응답에 없으면 reply 없음) · 스레드는 오래된 200건(ASC)"],
+    bindings: SECRET, limits: READ, sql: BIG_SEED,
+    requests: [get("/graph?cc=big.example"), get(`/graph/local?id=${bigId(204)}`)],
+  },
+  {
+    name: "graph_rate_limiter_variants", module: M,
+    covers: ["SCENARIOS RL-05 (제한기 없음 · IP 없음 · 제한기 고장 → 통과)"],
+    bindings: SECRET, sql: SEED_GRAPH,
+    // 1: 던짐(통과) · 2: success 없음(막힘) · 3: success true · 4: IP 머리글 없음(제한기를 부르지 않음)
+    limits: { EVAL_READ_LIMITER: (n) => (n === 1 ? "throw" : n === 2 ? {} : { success: true }) },
+    requests: [get("/graph?cc=example.com"), get("/graph?cc=example.com"), get("/graph?cc=example.com"), { path: "/graph?cc=example.com" }],
+  },
+  {
+    name: "graph_no_limiter", module: M,
+    bindings: SECRET, sql: SEED_GRAPH,
+    requests: [get("/graph?cc=example.com")],
+  },
+  {
+    name: "graph_d1_faults", module: M,
+    // D1 이 던지면 catch 가 잡아 console 'graph error <err>' · 500
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
+    faults: [
+      { match: "LEFT JOIN eval_verdicts", nth: 1 },
+      { match: `SELECT "root" FROM evaluations`, nth: 1 },
+      { match: "LEFT JOIN eval_verdicts", nth: 2, message: "D1_ERROR: thread read failed" },
+      { match: `SELECT "cc" FROM evaluations`, nth: 1 },
+      { match: `FROM eval_verdicts WHERE "eval_id" IN`, nth: 1 },
+    ],
+    requests: [
+      get("/graph?cc=example.com"), get(`/graph/local?id=${B}`), get(`/graph/local?id=${B}`), get(`/graph/similar?id=${A}&topK=2`), get(`/graph/similar?id=${A}&topK=2`),
+      get(`/graph/similar?id=${A}&topK=2`),
+    ],
+  },
+  {
+    name: "graph_vectorize_faults", module: M,
+    // getByIds · query 가 던지거나 이상한 모양을 돌려줄 때 — 모두 try 안이라 500 (console 에 원본의 TypeError 글)
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS,
+    vec: (() => {
+      const base = vecStore();
+      // 답의 차례는 실행(ts · rs)마다 처음부터: 시험대가 실행마다 새로 만드는 저장소(store)에 매단다
+      const seen = new WeakMap();
+      const step = (store, k) => {
+        const c = seen.get(store) || { g: 0, q: 0 };
+        seen.set(store, c);
+        return c[k]++;
+      };
+      const gets = [() => ({ fail: "vectorize unavailable" }), () => null, () => ({}), () => "abc", () => [[0.5, 0.5]], (b, s) => base.getByIds(b, s)];
+      // 알려진 차이: matches 의 id 가 글이 아니면(예: [7]) 원본은 그 값을 그대로 묶어 D1 이 던지고 Rust 는 글로 묶는다 — Vectorize 의 id 는 늘 글이라 넣지 않았다
+      const queries = [() => ({ fail: "query timeout" }), () => null, () => ({}), () => ({ matches: "x" }), () => ({ matches: [null] }), (b, s) => base.query(b, s)];
+      return {
+        getByIds: (b, s) => gets[Math.min(step(s, "g"), gets.length - 1)](b, s),
+        query: (b, s) => queries[Math.min(step(s, "q"), queries.length - 1)](b, s),
+      };
+    })(),
+    requests: Array.from({ length: 10 }, () => get(`/graph/similar?id=${A}&topK=2`)),
+  },
+  {
+    name: "graph_vector_values_shapes", module: M,
+    // values 가 글 · 길이 있는 객체 · 수일 때 Array.from 의 결과가 query 로 간다 (원본 그대로)
+    bindings: SECRET, limits: READ, sql: SEED_GRAPH,
+    vectors: { [A]: { values: "ab" }, [B]: { values: { length: 2, 0: 0.5 } }, [C]: { values: 3 }, [ROOT]: { values: [0.25, "x", null, true] } },
+    vec: vecStore(),
+    requests: [get(`/graph/similar?id=${A}`), get(`/graph/similar?id=${B}`), get(`/graph/similar?id=${C}`), get(`/graph/similar?id=${ROOT}`)],
+  },
+  {
+    name: "graph_odd_verdict_tiers", module: M,
+    // eval_verdicts.tier 가 네 등급 밖이면(cron 만 쓰므로 생기지 않음) 원본 그대로 summary 에 NaN(null) 칸이 생기고 __proto__ 는 무시된다
+    bindings: SECRET, limits: READ,
+    sql: [
+      ...["gold", "__proto__", "constructor", "1", "toString"].map((t, i) => evaluation({ id: `0190f0a3-0000-7000-8000-00000000000${i}`, cc: "odd.example", created_at: i })),
+      ...["gold", "__proto__", "constructor", "1", "toString"].map((t, i) => verdict({ eval_id: `0190f0a3-0000-7000-8000-00000000000${i}`, cc: "odd.example", tier: t, grade: i })),
+    ],
+    requests: [get("/graph?cc=odd.example")],
+  },
+  {
+    name: "graph_verdict_join", module: M,
+    // LEFT JOIN: 판정 행이 있으나 grade 가 NULL(unrated) · 판정 행이 다른 cc 의 사본이어도 평가의 cc 로 묶인다 · 같은 작성자의 대소문자
+    bindings: SECRET, limits: READ,
+    sql: [
+      evaluation({ id: ROOT, created_at: 1, from: "0xABCDEF0000000000000000000000000000000001" }),
+      evaluation({ id: A, ref: ROOT, root: ROOT, created_at: 2, from: "0xabcdef0000000000000000000000000000000001" }),
+      evaluation({ id: B, ref: A, root: ROOT, created_at: 2, from: "guest:Zz" }),
+      verdict({ eval_id: ROOT, tier: "unrated", grade: null }),
+      verdict({ eval_id: A, cc: "elsewhere.com", tier: "neutral", grade: 0, rank: 0.1 }),
+    ],
+    requests: [get("/graph?cc=example.com"), get(`/graph/local?id=${A}`)],
+  },
+];
