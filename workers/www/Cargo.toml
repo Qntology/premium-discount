@@ -13,6 +13,8 @@ crate-type = ["cdylib", "rlib"]
 premium-discount-worker-common.workspace = true
 # hashMessage · 주소 (ethers 와 같은 값). 지갑 서명 확인(auth.rs)이 쓴다
 premium-discount-identity.workspace = true
+# RECIPE (판정 행이 없는 평가에 붙이는 규칙 이름, evaluations.rs) — 원본은 cron/src/verdict.ts 의 RECIPE
+premium-discount-verdict.workspace = true
 indexmap.workspace = true
 url.workspace = true
 hmac.workspace = true

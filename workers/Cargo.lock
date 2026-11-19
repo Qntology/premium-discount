@@ -703,6 +703,7 @@ dependencies = [
  "js-sys",
  "k256",
  "premium-discount-identity",
+ "premium-discount-verdict",
  "premium-discount-worker-common",
  "regex",
  "serde_json",

@@ -12,6 +12,7 @@
 //     sql: [[sql, ...args], …],           요청 전에 DB 에 넣을 씨앗 행
 //     vectors: { id: { values, metadata } }, vec: { query: (body, store) => result, … }   가짜 Vectorize 의 처음 상태 · 답
 //     faults: [{ match, op?, nth?, message? }]  D1 문장 장애
+//     race: { match, op?, after: [{ sql, args }] }  match 가 든 문장을 처음 실행한 뒤 끼워 넣을 문장 (실행마다 한 번, 경합 흉내)
 //     s3: ({ method, path, n }) => { status, body } | { throw } | Response   가짜 S3 의 답 (n: 이 시나리오에서 몇 번째 S3 호출)
 //     fetch: ({ url, method, headers, body }) => { status, body, headers } | { throw }   그 밖의 바깥 요청의 답
 //     requests: [{ method, path, headers, cookies, jar, body, cf, at }],  차례로 보낼 요청.

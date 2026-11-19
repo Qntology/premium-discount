@@ -146,6 +146,7 @@ async function run(variant, scenario) {
   const bindings = { ...DEFAULT_BINDINGS, ...(scenario.bindings || {}) };
   for (const [k, v] of Object.entries(bindings)) if (v === undefined) delete bindings[k];
   const limits = scenario.limits || {};
+  let raceFired = false;
   const outbound = async (req) => {
     const url = new URL(req.url);
     if (url.hostname === "harness") {
@@ -164,6 +165,12 @@ async function run(variant, scenario) {
           const n = (counter[key] || 0) + 1;
           counter[key] = n;
           if (f.nth === undefined || f.nth === n) reply.fail = f.message || "D1_ERROR: injected failure";
+        }
+        // race: 맞는 문장을 처음 실행한 뒤 같은 DB 에 끼워 넣을 문장 (다른 요청이 그 사이 같은 request_id 로 넣은 경합 — cron.mjs 와 같은 꼴)
+        const race = scenario.race;
+        if (race && !raceFired && body.sql.includes(race.match) && (!race.op || race.op === body.op)) {
+          raceFired = true;
+          reply.after = race.after;
         }
         return Response.json(reply);
       }
