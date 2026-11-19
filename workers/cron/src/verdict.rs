@@ -5,7 +5,8 @@
 //! - 초월 함수: wasm32 의 libm `pow` · `tanh` 는 V8 과 마지막 자리가 다를 때가 있다. 원본과 같은 비트를 내려고 JS 의
 //!   `Math.pow` · `Math.tanh` 를 [`Math`] 로 넘긴다(V8 에서 `2 ** x` 와 `Math.pow(2, x)` 는 같은 값).
 //! - 가중치: 원본은 `PARAMS.weights[v.kind] ?? 0` 이라 `constructor` · `toString` 같은 Object.prototype 이름이면 함수가 나와
-//!   E · v 가 NaN 이 된다. crate 의 `Params::weight` 는 모르는 종류를 0 으로 본다. 원본 그대로 옮기려고 [`weight_of`] 가 그 이름에 NaN 을 준다.
+//!   E · v 가 NaN 이 된다. crate 의 `Params::weight` 는 모르는 종류를 0 으로 본다 — crate 쪽이 계약에 맞아 그것을 쓴다
+//!   ([`weight_of`], 고친 버그 fix-weight-own. 고치기 전 커밋 56705a3 은 원본처럼 NaN 을 주었다).
 
 use premium_discount_verdict::{Math, Params, Tier, TrackParams};
 use premium_discount_worker_common::jsv::V;
@@ -42,33 +43,14 @@ pub fn math() -> &'static Math {
     }
 }
 
-/// Object.prototype 의 속성 이름 (V8). `PARAMS.weights[이 이름]` 은 undefined 가 아니라 함수 · 객체다
-const PROTOTYPE_KEYS: [&str; 12] = [
-    "constructor",
-    "__defineGetter__",
-    "__defineSetter__",
-    "hasOwnProperty",
-    "__lookupGetter__",
-    "__lookupSetter__",
-    "isPrototypeOf",
-    "propertyIsEnumerable",
-    "toString",
-    "valueOf",
-    "__proto__",
-    "toLocaleString",
-];
-
-/// `PARAMS.weights[kind] ?? 0` 을 수로. 원본 그대로: Object.prototype 이름이면 함수(또는 객체)가 나와 `weight > 0` 은 거짓,
-/// `weight * credit * …` 은 NaN — 그래서 NaN 으로 둔다 (www 는 vote · vote_outcome 만 받으므로 www 를 거친 표에는 생기지 않는다)
+/// 표 종류의 가중치 — crate 의 `Params::weight` (모르는 종류는 0).
+///
+/// 고침(fix-weight-own): 원본은 `PARAMS.weights[v.kind] ?? 0` 이라 `constructor` · `toString` 같은 Object.prototype 이름이면
+/// 함수가 나와 E · v 가 NaN 이 되고, eval_verdicts 의 NOT NULL 에 걸려 processVerdicts 가 던졌다. 그 평가의 표시가 지워지지 않아
+/// 그 뒤의 모든 실행이 같은 자리에서 멈췄다(판정 · 지갑 정리 모두). www 는 vote · vote_outcome 만 받으므로 www 를 거치지 않고
+/// 들어간 표에서만 생긴다. 계약(contracts/verdict_v1.json)과 crate 는 모르는 종류를 0 으로 본다
 pub fn weight_of(kind: &V) -> f64 {
-    let key = kind.to_key();
-    if let Some(w) = params().weights.get(&key) {
-        return *w;
-    }
-    if PROTOTYPE_KEYS.contains(&key.as_str()) {
-        return f64::NAN;
-    }
-    0.0
+    params().weight(&kind.to_key())
 }
 
 /// D1 의 tier 글 → 등급. 모르는 글이면 None (원본에서는 어떤 등급과도 같지 않다)
@@ -92,8 +74,9 @@ mod tests {
         assert_eq!(weight_of(&V::from("vote_outcome")), 0.5);
         assert_eq!(weight_of(&V::from("nope")), 0.0);
         assert_eq!(weight_of(&V::Null), 0.0);
-        assert!(weight_of(&V::from("constructor")).is_nan());
-        assert!(weight_of(&V::from("__proto__")).is_nan());
+        // 고침: Object.prototype 이름도 모르는 종류 (원본은 NaN 이 되었다)
+        assert_eq!(weight_of(&V::from("constructor")), 0.0);
+        assert_eq!(weight_of(&V::from("__proto__")), 0.0);
     }
 
     #[test]

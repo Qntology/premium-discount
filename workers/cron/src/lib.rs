@@ -7,7 +7,8 @@
 //!
 //! 같은 SQL · 같은 D1 호출 순서 · 같은 JSON(키 순서 · 수 표기) · 같은 예외 경계를 지킨다. 원본에서 밖으로 새던 예외는
 //! `scheduled` 의 거부(rejected promise)로 그대로 샌다 — 그래서 `#[event(scheduled)]`(늘 성공으로 끝냄) 대신
-//! 같은 이름의 wasm-bindgen 내보내기를 직접 쓴다. 원본의 버그는 `원본 그대로:` 주석으로 남긴다.
+//! 같은 이름의 wasm-bindgen 내보내기를 직접 쓴다. 원본을 그대로 옮긴 판은 커밋 56705a3 이고, 그 뒤 고친 버그는 `고침(id):`
+//! 주석과 docs/workers-rs.md 의 "고친 버그" 표에 있다(fix-return-await · fix-weight-own).
 
 pub mod moderation;
 pub mod navtrials;

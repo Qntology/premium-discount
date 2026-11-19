@@ -70,21 +70,15 @@ async fn claim(env: &Env, id: &V, now: f64) -> R<bool> {
     Ok(strict_eq(&res.g("meta")?.g("changes")?, &V::Num(1.0)))
 }
 
-/// try 블록이 `return reject(…)` · `return release(…)` 로 끝났을 때. 원본 그대로: async 함수의 try 안에서
-/// 기다리지 않고 돌려준 promise 는 catch 가 잡지 않는다 — 그 UPDATE 가 실패하면 예외가 processQueue 밖으로 샌다
-enum Tail {
-    Done,
-    Reject(String),
-    Release,
-}
-
 async fn process_one(env: &Env, id: &V, now: f64) -> R<()> {
     let row = js::first(&stmt(env, SQL_ROW, &[id.clone()])?).await?;
     if !row.truthy() {
         return Ok(());
     }
 
-    let attempt: R<Tail> = async {
+    // 고침(fix-return-await): 거부 · 되돌리기의 UPDATE 도 try 안에서 기다린다. 원본은 `return reject(…)` 를 기다리지 않아
+    // 그 UPDATE 가 실패하면 catch 를 지나 processQueue 밖으로 새고, 그 실행의 나머지 행 · 판정 · 지갑 정리가 모두 멈췄다
+    let attempt: R<()> = async {
         // 답글은 부모가 저장된 뒤에만 저장한다. 부모가 거부되었으면 답글도 거부한다
         let parent_ref = row.g("ref")?;
         if parent_ref.truthy() {
@@ -92,14 +86,14 @@ async fn process_one(env: &Env, id: &V, now: f64) -> R<()> {
             if parent.truthy() {
                 let state = parent.g("state")?;
                 if strict_eq(&state, &V::from("rejected")) || strict_eq(&state, &V::from("failed")) {
-                    return Ok(Tail::Reject("parent rejected".into()));
+                    return reject(env, id, "parent rejected", now).await;
                 }
                 // 부모가 아직 처리 중이다. 이번 시도는 세지 않고 다음 실행에 다시 본다
-                return Ok(Tail::Release);
+                return release(env, id, now).await;
             }
             let stored = js::first(&stmt(env, SQL_STORED, &[parent_ref])?).await?;
             if !stored.truthy() {
-                return Ok(Tail::Reject("parent missing".into()));
+                return reject(env, id, "parent missing", now).await;
             }
         }
 
@@ -110,19 +104,15 @@ async fn process_one(env: &Env, id: &V, now: f64) -> R<()> {
         let result = moderate(env, &row.g("text")?).await?;
         if result.profane() {
             // 사유는 걸린 질문 이름이다 (profanity, nsfw, illegal)
-            return Ok(Tail::Reject(result.flagged.join(",")));
+            return reject(env, id, &result.flagged.join(","), now).await;
         }
 
-        save(env, &row).await?;
-        Ok(Tail::Done)
+        save(env, &row).await
     }
     .await;
 
     match attempt {
-        Ok(Tail::Done) => Ok(()),
-        // 원본 그대로: 기다리지 않은 return — 실패하면 catch 를 지나 밖으로 샌다
-        Ok(Tail::Reject(reason)) => reject(env, id, &reason, now).await,
-        Ok(Tail::Release) => release(env, id, now).await,
+        Ok(()) => Ok(()),
         // 원문은 오류 메시지에 넣지 않는다. 오류 종류만 남긴다
         Err(err) => retry_or_fail(env, &row, now, &error_message(&err)).await,
     }

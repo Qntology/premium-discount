@@ -266,6 +266,59 @@ export const SCENARIOS = [
     faults: [{ match: "INSERT OR IGNORE INTO evaluations", op: "run", message: "D1_ERROR: disk full" }],
     steps: [{ sql: [queue({ id: PARENT_ID })] }, { run: Q }],
   },
+  // ---- 고친 버그가 닿는 곳 ----
+  {
+    name: "reject_update_fails",
+    covers: "거부 UPDATE 가 실패해도 그 행만 재시도로 남고 실행은 이어진다 (원본: 예외가 새어 다음 행 · 판정 · 지갑 정리가 멈춤)",
+    fixes: ["fix-return-await"],
+    decide: (t) => (t === "나쁜 말" ? { profanity: 0.9 } : {}),
+    faults: [{ match: `SET "state" = 'rejected'`, op: "run", nth: 1, message: "D1_ERROR: write conflict" }],
+    steps: (() => {
+      const vote = votes();
+      const next = voter();
+      return [
+        { sql: [queue({ id: evalId(1), text: "나쁜 말", created_at: 1 }), queue({ id: evalId(2), text: "좋은 말", created_at: 2 }), evaluation({ id: evalId(9) }), ...vote({ eval_id: evalId(9), voter: next(), value: 1, created_at: Q })] },
+        { run: Q },
+        { run: Q + MIN },
+      ];
+    })(),
+  },
+  {
+    name: "release_update_fails",
+    covers: "답글을 되돌리는 UPDATE 가 실패해도 그 행만 재시도로 남고 실행은 이어진다",
+    fixes: ["fix-return-await"],
+    decide: (t, run) => (run === 0 && t === "부모 글" ? "down" : {}),
+    faults: [{ match: `"attempts" = CASE WHEN`, op: "run", nth: 1, message: "D1_ERROR: write conflict" }],
+    steps: [
+      { sql: [queue({ id: PARENT_ID, text: "부모 글", created_at: 1 }), queue({ id: REPLY_ID, text: "답글", ref: PARENT_ID, root: PARENT_ID, created_at: 2 }), queue({ id: evalId(3), text: "따로", created_at: 3 })] },
+      { run: Q },
+      { run: Q + MIN },
+    ],
+  },
+  {
+    name: "verdict_prototype_kind",
+    covers: "www 를 거치지 않은 표의 종류가 Object.prototype 이름(constructor · toString)이면 모르는 종류(가중치 0)로 본다 (원본: NaN → NOT NULL 로 매 실행이 멈춤)",
+    fixes: ["fix-weight-own"],
+    steps: (() => {
+      const vote = votes();
+      const next = voter();
+      const today = Math.floor(V0 / DAY);
+      return [
+        {
+          sql: [
+            evaluation({ id: evalId(0x900) }), evaluation({ id: evalId(0x901) }),
+            ...vote({ eval_id: evalId(0x900), voter: next(), value: 1, created_at: V0 }),
+            ...vote({ eval_id: evalId(0x900), voter: next(), kind: "constructor", value: 1, created_at: V0 }),
+            ...vote({ eval_id: evalId(0x900), voter: next(), kind: "toString", value: -1, created_at: V0 }),
+            ...[1, 1, 1].flatMap((value) => vote({ eval_id: evalId(0x901), voter: next(), value, created_at: V0 })),
+            [`INSERT INTO nav_trials ("account", "kind", "app", "course", "steps", "runs", "premium", "discount", "best", "last", "last_day", "touched") VALUES ('w', 'wallet', 'app', 'old', '[]', 1, 0, 0, '[]', '[]', ?1, ?1)`, today - 60],
+          ],
+        },
+        { run: V0 },
+        { run: V0 + MIN },
+      ];
+    })(),
+  },
   // ---- 판정 (verdict.test.ts · verdict_v2.test.ts 는 crate 의 계약 시험, verdicts.test.ts 는 아래) ----
   {
     name: "verdict_scope_tiers",
