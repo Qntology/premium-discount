@@ -15,7 +15,8 @@
 //!
 //! `req` 는 들어온 요청 전부다(메서드 · 주소 · 머리글 · `cf` · 본문 바이트를 handler 가 미리 읽어 둠). 원본의 `request.json()` ·
 //! `request.arrayBuffer()` 는 `req.body` 를 읽으면 된다. 원본의 기본 인자 `nowMs = Date.now()` 는 `platform::now()` 로.
-//! 공용 도구: `crate::util`(cors_headers · json_response · empty_response · client_ip · pathname), `crate::auth`
+//! 공용 도구: `crate::util`(cors_headers · json_response · empty_response · client_ip · pathname ·
+//! evaluations.ts 에서 graph.ts 도 쓰던 validation_error / is_validation · parse_domain · parse_uuid · binds · verdict_summaries), `crate::auth`
 //! (read_session_credentials · verified_address · verify_wallet_request · address_from_email), `crate::ratelimit`
 //! (is_rate_limited · RETRY_AFTER_SECONDS), `crate::projection::author_key`, `crate::blob`.
 //! 차분 시나리오는 `scripts/workers-diff/scenarios/www_analytic.mjs` 에 넣는다(지금은 빈 목록).

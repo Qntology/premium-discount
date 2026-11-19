@@ -53,7 +53,7 @@ scripts/workers-diff/       차분 시험대 (아래)
 
 ```
 cd workers
-cargo test -j 2                                         # common(12 + aws_eth 5 + pako 1) · cron(12) · www(9 + contracts 7)
+cargo test -j 2                                         # common(12 + aws_eth 5 + pako 1) · cron(12) · www(10 + contracts 7)
 cargo check -j 2 --target wasm32-unknown-unknown        # 경고 없음
 cd cron && worker-build --release                       # build/index.js(20 KiB) · index_bg.wasm(329 KiB)
 ```
@@ -118,7 +118,7 @@ JSON 아닌 본문 · 429 · 서버 오류 · fetch 거부 · 키 없음 · 주�
 | `handler.rs` | index.ts 370~404 | session → evaluations → navtrials → analytic → graph → legacy. 앞에서 하는 일은 없다(요청을 그대로 넘김) |
 | `legacy.rs` | index.ts 405~1128 | 늘 418 (아래) |
 | `session.rs` · `auth.rs` · `ratelimit.rs` · `projection.rs` · `blob.rs` · `render.rs` | session · auth · ratelimit · projection · blob · renderHtml | 옮김 |
-| `util.rs` | evaluations.ts 의 `corsHeaders` 등 | 여러 모듈이 같이 쓰는 것 (CORS · JSON 응답 · IP · pathname) |
+| `util.rs` | evaluations.ts 의 `corsHeaders` · `ValidationError` · `parseDomain` · `parseUuid` · `verdictSummaries` | 여러 모듈이 같이 쓰는 것 (CORS · JSON 응답 · IP · pathname, 그리고 graph.ts 가 evaluations.ts 에서 가져다 쓰던 검사 · 판정 요약 — evaluations.rs 와 graph.rs 가 서로의 파일을 건드리지 않게) |
 | `evaluations.rs` · `navtrials.rs` · `graph.rs` · `analytic.rs` | 같은 이름의 .ts | **2단계** — 지금은 늘 `Ok(None)` |
 
 **이음매**: 네 모듈은 모두 `#[cfg(target_arch = "wasm32")] pub async fn handle(req: &Req, env: &Env) -> R<Option<Resp>>` 하나를 낸다.
@@ -188,7 +188,7 @@ ORIGINAL=raw node www.mjs          # 고치지 않은 원본 vs Rust — fixes �
 | 고친 원본 vs Rust (`node www.mjs`) | 47/47 동일 (session 23 · auth 14 · legacy 10) |
 | 고치지 않은 원본 vs Rust (`ORIGINAL=raw`) | 46 동일 · 1 다름 — `session_web_email_padded`(fix-web-session-email-trim) 뿐 |
 | cron 시험대 (`node cron.mjs`, mocks 에 batch 를 더한 뒤) | 47/47 동일 (그대로) |
-| `cargo test -j 2` (workers/www) | 단위 9 + contracts 7 (지갑 계약 · ethers 가장자리 · blob 계약 · renderHtml 벡터) |
+| `cargo test -j 2` (workers/www) | 단위 10 + contracts 7 (지갑 계약 · ethers 가장자리 · blob 계약 · renderHtml 벡터) |
 | `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
 
 ### 알려진 차이 · 남겨 둔 것
