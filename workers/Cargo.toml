@@ -1,0 +1,48 @@
+# Cloudflare Workers (workers-rs, wasm32-unknown-unknown). 루트 작업 공간(앱 · crates)과 따로 빌드한다:
+# 표적이 wasm 이고, 루트의 산출물 폴더 · 앱 의존성(tokio · LanceDB · candle)을 받으면 안 된다. 루트 Cargo.toml 의 exclude 에 있다.
+#
+#   common   premium-discount-worker-common: JS 값 모형(V) · D1 · Vectorize · fetch · gzip(pako) · aws4fetch · ethers
+#            (logis-center workers/common 370d67a3 에서 옮겨 왔다. 이제 이쪽이 주인이다)
+#   cron     premium-discount-cron (scheduled): 평가 대기열 · 판정 · 지갑 타임트라이얼 정리
+#   migrations/  두 워커(www · cron)가 같이 쓰는 D1 스키마
+#   www/     아직 TypeScript (다음 단계)
+#
+# 원본 TypeScript 와 같은 동작이 목표다(같은 SQL · 같은 D1 호출 순서 · 같은 JSON). 차이와 고친 버그는 docs/workers-rs.md 에 적는다.
+[workspace]
+resolver = "2"
+members = ["common", "cron"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/premium-discount"
+
+[workspace.dependencies]
+# 0.9 는 cloudflare:workers 의 tracing.getActiveSpan() 을 부르는데 지금 Miniflare/workerd 에는 없다 (worker-build 도 0.8.7)
+worker = { version = "=0.8.7", features = ["d1"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = "2"
+ryu-js = "1"
+flate2 = "1"
+regex = "1"
+fancy-regex = "0.18"
+# aws4fetch(S3 SigV4) · ethers 주소 — 순수 Rust (wasm 에서도 그대로). 판은 premium-discount-identity 가 잠근 것과 같다
+hmac = "0.12"
+sha2 = "0.10"
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
+getrandom = "0.3"
+url = "2"
+# premium-discount 의 crate (tokio · LanceDB · candle 없이 wasm32 로 빌드되는 것만)
+premium-discount-identity = { path = "../crates/premium-discount-identity" }
+premium-discount-verdict = { path = "../crates/premium-discount-verdict" }
+premium-discount-worker-common = { path = "common" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

@@ -1,0 +1,29 @@
+[package]
+name = "premium-discount-cron"
+description = "premium-discount-cron (1분 scheduled): 평가 대기열(욕설 검사 → evaluations · Vectorize) · PD-Verdict 판정 · 지갑 타임트라이얼 정리. 원본 workers/cron/src/*.ts(0538044)를 workers-rs 로"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+premium-discount-worker-common.workspace = true
+# 판정 규칙 (contracts/verdict_v1.json). 감쇠 · 순위의 초월 함수는 JS 의 Math 를 넘긴다 (verdict.rs)
+premium-discount-verdict.workspace = true
+indexmap.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+
+[features]
+# 시험대 확인용: JS 의 Math 대신 wasm 의 libm 으로 판정한다 (원본과 마지막 자리가 달라지는 것을 차분 시험이 잡는지 본다)
+libm-probe = []
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,14 @@
+{
+  "name": "premium-discount-workers-diff",
+  "private": true,
+  "type": "module",
+  "description": "원본 TypeScript 워커(0538044)와 workers-rs 판을 Miniflare 에서 같은 조건으로 돌려 견주는 시험대 (logis-center scripts/workers-diff 에서 가져옴)",
+  "scripts": {
+    "cron": "node cron.mjs",
+    "cron:raw": "node cron.mjs --raw"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.2",
+    "miniflare": "^4.20260730.0"
+  }
+}

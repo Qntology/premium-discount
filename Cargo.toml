@@ -4,7 +4,7 @@
 #   apps/core      헤드리스 코어 premium-discount-app (LanceDB 저장소 · 모델 · 동기화 · serve_lines, Tauri 없음)
 #   apps/desktop   데스크톱 · 모바일 Tauri 셸 premium-discount-desktop. 화면은 web/desktop
 #   web/           화면: web/desktop(앱 웹뷰) · web/www(www Worker 가 싣는 정적 파일)
-#   workers/       Cloudflare Workers(TypeScript): www · cron · 둘이 함께 쓰는 D1 migrations
+#   workers/       Cloudflare Workers: www(TypeScript) · cron(workers-rs) · 둘이 함께 쓰는 D1 migrations. Rust 는 자기 작업 공간(workers/Cargo.toml, wasm32)
 #
 # 원칙: 라이브러리(crates/)는 LanceDB · Tauri · 비동기 런타임(tokio)에 의존하지 않는다. 저장은 앱이 맡는다.
 # 모델 런타임은 AI 엔진 crate(nlp · vision · onnxruntime)에만 있고, 나머지(판정 · 내비게이션 · 계약 · 통계 · 센서 · 양자화 형식)는
@@ -37,6 +37,8 @@ members = [
     "apps/core",
     "apps/desktop",
 ]
+# workers/ 는 자기 작업 공간이다 (wasm32, workers/Cargo.toml). 루트가 삼키지 않게 뺀다
+exclude = ["workers"]
 
 [workspace.package]
 version = "0.1.0"
