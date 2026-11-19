@@ -275,7 +275,9 @@ pub async fn response_json(res: &JsValue) -> R<V> {
 
 /// worker::Request → [`crate::web::Req`] (`request.cf` 는 JS 값 그대로)
 pub async fn req_from(mut req: worker::Request) -> crate::web::Req {
-    let method = req.method().to_string().to_uppercase();
+    // `request.method` 그대로 (Fetch 가 표준 메서드만 대문자로 바꾼다). worker::Method 는 모르는 메서드를 GET 으로 바꾼다:
+    // workerd 가 받아 넘기는 PROPFIND · PURGE 같은 메서드가 원본의 405 갈래 대신 GET 처리로 새었다 — www 2단계(analytic)에서 고침
+    let method = req.inner().method();
     let url = req.url().map(|u| u.to_string()).unwrap_or_default();
     let headers: Vec<(String, String)> = req.headers().entries().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect();
     let cf = Reflect::get(req.inner(), &JsValue::from_str("cf")).map(|v| to_v(&v)).unwrap_or(V::Undef);

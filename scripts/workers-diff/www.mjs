@@ -20,6 +20,7 @@ import * as esbuild from "esbuild";
 import fs from "node:fs";
 import path from "node:path";
 import { createHmac } from "node:crypto";
+import zlib from "node:zlib";
 process.env.TZ = "UTC";
 import { execFileSync } from "node:child_process";
 import { AwsV4Signer } from "aws4fetch";
@@ -108,7 +109,33 @@ function fnv(bytes) {
   return h.toString(16).padStart(8, "0");
 }
 const isBytes = (a) => Array.isArray(a) && a.length > 8 && a.every((x) => Number.isInteger(x) && x >= 0 && x < 256);
-const shrink = (row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, isBytes(v) ? { blob: v.length, fnv: fnv(v) } : v]));
+// gzip 은 풀어서 견준다: 원본(pako)과 Rust(flate2)는 같은 글을 다른 바이트로 압축한다 (docs/workers-rs.md "gzip 바이트"). 풀리지 않으면 바이트 그대로
+const gunzipText = (buf) => {
+  try { return zlib.gunzipSync(buf).toString("utf8"); } catch { return null; }
+};
+const isGzip = (a) => a.length >= 2 && a[0] === 0x1f && a[1] === 0x8b;
+const shrinkBlob = (v) => {
+  const text = isGzip(v) ? gunzipText(Buffer.from(v)) : null;
+  return text !== null ? { gunzip: text } : { blob: v.length, fnv: fnv(v) };
+};
+const shrink = (row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, isBytes(v) ? shrinkBlob(v) : v]));
+// 묶은 값의 { $bytes, gzip: base64 }(mocks_src.mjs) · 응답 JSON 의 base64 gzip 글("H4sI…")을 푼 글로
+const B64_GZIP = /^H4sI[A-Za-z0-9+/]*={0,2}$/;
+function gunzipDeep(v) {
+  if (Array.isArray(v)) return v.map(gunzipDeep);
+  if (v && typeof v === "object") {
+    if (typeof v.$bytes === "string" && typeof v.gzip === "string") {
+      const text = gunzipText(Buffer.from(v.gzip, "base64"));
+      return text !== null ? { $bytes: v.$bytes, gunzip: text } : v;
+    }
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, gunzipDeep(x)]));
+  }
+  if (typeof v === "string" && B64_GZIP.test(v)) {
+    const text = gunzipText(Buffer.from(v, "base64"));
+    return text !== null ? { base64_gunzip: text } : v;
+  }
+  return v;
+}
 const sortHeaders = (h) => [...h].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 
 // 가짜 S3: aws4fetch 가 보낸 서명을 같은 x-amz-date 로 다시 계산해 맞는지 본다(logis-center commerce.mjs 와 같은 방식).
@@ -157,7 +184,7 @@ async function run(variant, scenario) {
         return Response.json({});
       }
       if (kind === "d1") {
-        events.push({ kind: "d1", op: body.op, sql: body.sql, args: body.args });
+        events.push({ kind: "d1", op: body.op, sql: body.sql, args: gunzipDeep(body.args) });
         const reply = {};
         for (const f of scenario.faults || []) {
           if (!body.sql.includes(f.match) || (f.op && f.op !== body.op)) continue;
@@ -259,7 +286,7 @@ async function run(variant, scenario) {
         let parsed;
         try { parsed = JSON.parse(text); } catch { parsed = text; }
         const hs = sortHeaders([...res.headers].filter(([k]) => k !== "set-cookie"));
-        out = { status: res.status, headers: Object.fromEntries(hs), setCookie, body: parsed };
+        out = { status: res.status, headers: Object.fromEntries(hs), setCookie, body: gunzipDeep(parsed) };
         // 무작위 값에서 계산한 값은 정규화가 가리므로 여기서 따로 확인한다 (앱 세션 발급)
         if (parsed && typeof parsed === "object" && typeof parsed.hash === "string" && typeof parsed.token === "string") {
           const host = bindings.SESSION_MAIL_HOST || "premium.discount";

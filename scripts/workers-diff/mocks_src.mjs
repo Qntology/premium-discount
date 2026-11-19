@@ -26,9 +26,12 @@ function enc(v) {
   if (typeof v === "number" && !Number.isFinite(v)) return { $: String(v) };
   if (typeof v === "number" && Object.is(v, -0)) return { $: "-0" };
   const b = bytesOf(v);
+  // gzip 바이트(1f 8b)는 통째로 보낸다: 시험대가 풀어서 견준다 (pako 와 Rust 의 flate2 는 같은 글을 다른 바이트로 압축한다)
+  if (b && b.length >= 2 && b[0] === 0x1f && b[1] === 0x8b) return { $bytes: Object.prototype.toString.call(v), gzip: b64(b) };
   if (b) return { $bytes: Object.prototype.toString.call(v), len: b.length, fnv: fnv(b) };
   return v;
 }
+function b64(u8) { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000)); return btoa(s); }
 function vectorSummary(values) {
   const tag = Object.prototype.toString.call(values);
   const b = bytesOf(values);
