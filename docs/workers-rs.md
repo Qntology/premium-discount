@@ -164,7 +164,7 @@ ORIGINAL=raw node www.mjs          # 고치지 않은 원본 vs Rust — fixes �
   머리글 · 본문 · 경로는 앞 응답의 함수일 수 있다(발급받은 세션으로 상태 묻기).
 - 무작위: 씨앗 덕분에 앱 세션 hash · token 도 두 판이 같아 그대로 견준다. 정규화(한쪽에만 있는 40 · 64자리 16진 값 → `<random#n>`)는 기본으로 끄고
   `random: true` 시나리오(또는 `NORMALIZE=1`)에서만 켠다. **정규화는 그 값에서 계산한 것끼리의 차이를 가린다**: 켜고 `ORIGINAL=raw` 로 돌리면
-  해시 하나만 다른 고침도 SAME 으로 보인다. 그래서 바꾼 값이 있으면 줄 끝에 `normalized=N` 을 찍고, 앱 세션 발급은 정규화와
+  fix-web-session-email-trim(주소 하나만 다름)도 SAME 으로 보인다. 그래서 바꾼 값이 있으면 줄 끝에 `normalized=N` 을 찍고, 앱 세션 발급은 정규화와
   상관없이 각 쪽에서 token = HMAC(SESSION_SECRET, "session|" + hash) · address · mailto 를 따로 확인해 `check` 칸에 남긴다.
 - 시나리오는 모듈마다 `scenarios/www_<모듈>.mjs`(모양은 `scenarios/www_common.mjs` 머리말)에 있고 `www_scenarios.mjs` 가 모은다.
   2단계는 `www_evaluations.mjs` · `www_navtrials.mjs` · `www_graph.mjs` · `www_analytic.mjs`(지금은 빈 목록)만 채우면 된다.
@@ -185,7 +185,8 @@ ORIGINAL=raw node www.mjs          # 고치지 않은 원본 vs Rust — fixes �
 
 | 무엇 | 결과 |
 | --- | --- |
-| 원본 vs Rust (`node www.mjs`, 원본 버그 그대로) | 47/47 동일 (session 23 · auth 14 · legacy 10) |
+| 고친 원본 vs Rust (`node www.mjs`) | 47/47 동일 (session 23 · auth 14 · legacy 10) |
+| 고치지 않은 원본 vs Rust (`ORIGINAL=raw`) | 46 동일 · 1 다름 — `session_web_email_padded`(fix-web-session-email-trim) 뿐 |
 | cron 시험대 (`node cron.mjs`, mocks 에 batch 를 더한 뒤) | 47/47 동일 (그대로) |
 | `cargo test -j 2` (workers/www) | 단위 9 + contracts 7 (지갑 계약 · ethers 가장자리 · blob 계약 · renderHtml 벡터) |
 | `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
@@ -206,6 +207,7 @@ ORIGINAL=raw node www.mjs          # 고치지 않은 원본 vs Rust — fixes �
 | --- | --- | --- | --- |
 | fix-return-await | index.ts 101 · 104 · 109 · 119 (`processOne`) | try 안의 `return reject(…)` · `return release(…)` 를 기다리지 않아, 그 UPDATE 가 실패하면 catch 를 지나 scheduled 밖으로 샜다. 그 실행의 나머지 행 · 판정 · 지갑 정리가 모두 멈추고 그 행은 lease(5분)가 끝날 때까지 processing 에 묶였다 → `return await`. 이제 실패는 그 행의 재시도(pending, last_error)로 남고 실행은 이어진다 | `reject_update_fails` · `release_update_fails` |
 | fix-weight-own | index.ts 386 (`computeVerdict`) | `PARAMS.weights[v.kind] ?? 0` 이 프로토타입을 거쳐 `constructor` · `toString` 등에 함수를 돌려줘 E · v 가 NaN → eval_verdicts 의 NOT NULL 에 걸려 processVerdicts 가 던졌다. 표시가 지워지지 않아 **그 뒤 모든 실행이 같은 자리에서 실패**(판정 · 지갑 정리 멈춤) → 자기 속성만 본다(`Object.hasOwn`, Rust 는 crate 의 `Params::weight`). www 는 vote · vote_outcome 만 받으므로 www 를 거치지 않고 들어간 표에서만 생긴다 | `verdict_prototype_kind` |
+| fix-web-session-email-trim | **www** auth.ts 162 (`checkSession`) | 웹 세션은 email 을 trim 해서 확인(비었나)하고는 `obj.email` 을 그대로 돌려줬다. 앱 세션은 trim 한 값을 돌려주므로, S3 객체의 email 에 앞뒤 공백 · 줄바꿈이 붙으면 같은 사람이 두 갈래에서 **다른 주소**(computeAddress(hashMessage(email)))가 되고, 그 주소가 평가 · 투표 · 타임트라이얼의 from 이 된다 → 확인에 쓴 trim 한 email 을 돌려준다 | `session_web_email_padded` |
 
 수정마다 Rust 와 `scripts/workers-diff/fixes/<워커>.mjs`(cron · www)의 글 패치(같은 id, 공백 무시 · 정해진 횟수만큼 맞아야 적용)가 짝입니다.
 

@@ -207,9 +207,8 @@ mod wasm {
             if !obj.truthy() || obj.type_of() != "object" {
                 return Ok(if issued { SessionCheck::Pending } else { SessionCheck::Invalid });
             }
-            let email_v = obj.get("email");
-            let email = match &email_v {
-                V::Str(s) => premium_discount_worker_common::jsv::js_trim(s).to_string(),
+            let email = match obj.get("email") {
+                V::Str(s) => premium_discount_worker_common::jsv::js_trim(&s).to_string(),
                 _ => String::new(),
             };
             if issued {
@@ -230,9 +229,9 @@ mod wasm {
                     return Ok(SessionCheck::Invalid);
                 }
             }
-            // 원본 그대로: 확인은 trim 한 email 로 했지만 돌려주는 것은 obj.email 그대로다
-            // (앱 세션은 trim 한 값을 돌려주므로, 앞뒤 공백이 있는 같은 이메일이 두 갈래에서 다른 주소가 된다)
-            Ok(SessionCheck::Verified(email_v.to_str()))
+            // 고침(fix-web-session-email-trim): 확인에 쓴 trim 한 email 을 돌려준다. 원본(auth.ts 162)은 obj.email 을 그대로 돌려줘,
+            // 앞뒤 공백 · 줄바꿈이 붙은 같은 이메일이 앱 세션(trim 한 값)과 웹 세션에서 다른 주소가 되었다
+            Ok(SessionCheck::Verified(email))
         }
         .await;
         r.unwrap_or(SessionCheck::Unavailable)

@@ -96,7 +96,8 @@ export default [
   },
   {
     name: "session_web_email_padded", module: M,
-    // 웹 세션: 확인은 trim 한 email 로 하지만 원본은 obj.email 그대로 주소를 만든다
+    // 웹 세션: 확인은 trim 한 email 로 하지만 원본은 obj.email 그대로 주소를 만든다 (fix-web-session-email-trim)
+    fixes: ["fix-web-session-email-trim"],
     bindings: SECRETS,
     s3: () => s3json({ token: TOKEN, email: " Web@E.com\n" }),
     requests: [status(app(creds(HASH, TOKEN)))],
