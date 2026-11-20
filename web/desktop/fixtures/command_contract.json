@@ -1,0 +1,132 @@
+{
+  "_comment": "Rust(src/commands.rs)와 화면(ui/commands.ts)이 공유하는 명령 계약. 명령 이름과 인자 모양을 양쪽 테스트가 이 파일로 확인한다. 한쪽을 바꾸면 양쪽 테스트가 깨진다.",
+  "cmd_submit_evaluation": {
+    "args": {
+      "text": "좋은 평가입니다",
+      "cc": "example.com",
+      "from": "",
+      "to": "",
+      "bcc": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "ref": "",
+      "local_parent": ""
+    }
+  },
+  "cmd_sync_cache": {
+    "args": {
+      "since": 0
+    }
+  },
+  "cmd_search_local": {
+    "args": {
+      "query": "좋은 평가입니다",
+      "top_k": 5,
+      "cc": "example.com"
+    }
+  },
+  "cmd_search_remote": {
+    "args": {
+      "query": "좋은 평가입니다",
+      "top_k": 5,
+      "cc": "example.com",
+      "root": "",
+      "ref": "",
+      "to": "",
+      "tier": ""
+    }
+  },
+  "cmd_search_merged": {
+    "args": {
+      "query": "좋은 평가입니다",
+      "top_k": 5,
+      "cc": "example.com",
+      "root": "",
+      "ref": "",
+      "to": "",
+      "tier": ""
+    }
+  },
+  "cmd_flush_outbox": {
+    "args": null
+  },
+  "cmd_vote": {
+    "args": {
+      "id": "0190f0a0-0000-7000-8000-0000000000aa",
+      "value": 1,
+      "kind": "vote"
+    }
+  },
+  "cmd_supersede": {
+    "args": {
+      "old": "0190f0a0-0000-7000-8000-0000000000aa",
+      "new": "0190f0a0-0000-7000-8000-0000000000bb"
+    }
+  },
+  "cmd_verdicts": {
+    "args": {
+      "ids": [
+        "0190f0a0-0000-7000-8000-0000000000aa"
+      ],
+      "refresh": false
+    }
+  },
+  "cmd_session": {
+    "args": {
+      "verify": false
+    }
+  },
+  "cmd_login_start": {
+    "args": null
+  },
+  "cmd_login_status": {
+    "args": null
+  },
+  "cmd_logout": {
+    "args": null
+  },
+  "cmd_app_status": {
+    "args": null
+  },
+  "cmd_model_status": {
+    "args": null
+  },
+  "cmd_model_download": {
+    "args": {
+      "variant": "text"
+    }
+  },
+  "cmd_model_download_cancel": {
+    "args": null
+  },
+  "cmd_item_draft": {
+    "args": {
+      "text": "겨울 패딩 최대 70% 할인",
+      "link": "https://shop.example/padding"
+    }
+  },
+  "cmd_analytic_site": {
+    "args": {
+      "host": "shop.example.com"
+    }
+  },
+  "cmd_analytic_sync": {
+    "args": {
+      "host": "shop.example.com",
+      "max_pages": 5
+    }
+  },
+  "cmd_analytic_report": {
+    "args": {
+      "host": "shop.example.com",
+      "query": "이번 달 결제 이탈 원인이 뭐야?",
+      "lang": "ko",
+      "top_k": 5
+    }
+  },
+  "cmd_analytic_forget": {
+    "args": {
+      "ids": [
+        "0190f0a0-0000-7000-8000-0000000000bb"
+      ]
+    }
+  }
+}

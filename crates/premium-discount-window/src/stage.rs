@@ -1,4 +1,4 @@
-//! 3단계 오버레이 창의 규칙: 단계 크기, 단계 옮기기, 누르기와 끌기 구분, 창 자리. `app/ui/stage.ts` 를 같은 수로 옮겼다.
+//! 3단계 오버레이 창의 규칙: 단계 크기, 단계 옮기기, 누르기와 끌기 구분, 창 자리. `web/desktop/stage.ts` 를 같은 수로 옮겼다.
 //!
 //! * 0단계 알약(360x56): 동기화 점과 최근 한 줄. 누르면 1단계, 끌면 창을 옮긴다.
 //! * 1단계 미니 피드(360x260): 최근 내 평가 3개와 빠른 입력. 맨 위 줄을 누르면 2단계, Esc 나 접기는 0단계.
@@ -7,7 +7,7 @@
 //! 모바일(Android · iOS)은 창 크기를 바꿀 수 없으므로 2단계를 전체 화면으로만 쓴다 ([`LayoutMode::Full`]).
 //!
 //! stage.ts 를 고치면 `tests/gen_stage_cases.mjs` 로 `tests/stage_cases.json` 을 다시 만들고 여기도 맞춘다.
-//! Rust 시험(`tests/stage_cases.rs`)과 TS 시험(`app/ui/stage.test.ts`)이 그 표를 함께 읽는다.
+//! Rust 시험(`tests/stage_cases.rs`)과 TS 시험(`web/desktop/stage.test.ts`)이 그 표를 함께 읽는다.
 
 /// 크기, 논리 픽셀.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,7 +78,7 @@ pub enum Stage {
     Drawer = 2,
 }
 
-/// 단계마다 창 크기 (논리 픽셀), 단계 번호 순서. app/ui/style.css 의 `--stage-w` / `--stage-h` 와 같은 값이다.
+/// 단계마다 창 크기 (논리 픽셀), 단계 번호 순서. web/desktop/style.css 의 `--stage-w` / `--stage-h` 와 같은 값이다.
 pub const STAGE_SIZE: [Size; 3] = [Size::new(360, 56), Size::new(360, 260), Size::new(400, 580)];
 
 /// 화면 가장자리(작업 영역)와의 여백, 논리 픽셀.

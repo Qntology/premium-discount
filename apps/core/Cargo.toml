@@ -1,0 +1,51 @@
+[package]
+name = "premium-discount-app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "premium_discount_app"
+path = "src/lib.rs"
+
+[features]
+default = []
+# GPU 백엔드. candle은 candle-rocm-vulkan 포크다(루트 Cargo.toml 의 [patch.crates-io]): raon-zena · logis-center와 같은 기능 이름이다.
+# 켠 백엔드만 빌드되고, 쓸 장치는 실행할 때 PD_DEVICE로 고른다 (utils.rs)
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+rocm = ["candle-core/rocm", "candle-nn/rocm"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+
+[dependencies]
+# 공용 crate (crates/): 명령 계약, 사전 욕설 필터, 내려받기 검증 규칙
+premium-discount-schema.workspace = true
+premium-discount-filter.workspace = true
+premium-discount-manifest.workspace = true
+# 웹 행동 분석 코어 (수집 사건 · PUG · 질의 · 시간 · 퍼널)와 웹 체크포인트 해시
+premium-discount-analytic.workspace = true
+premium-discount-nav.workspace = true
+anyhow = "1"
+async-trait = "0.1"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+# 입력 임베딩 표를 파일 매핑에서 행 단위로 읽는다 (candle 포크가 쓰는 판과 같아야 Dtype 타입이 맞는다)
+safetensors = "0.8"
+half = "2"
+futures = "0.3"
+getrandom = "0.3"
+# 로컬 원본 저장소(local.rs). raon-zena(zena-lexicon)와 같은 0.41 이고, 빌드에 protoc가 필요하다 (링크가 무거워 CARGO_BUILD_JOBS를 낮추는 편이 안전하다)
+lancedb = { version = "0.41", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+# raon-zena 와 같은 판 · 기능 (학습용 C++ 확장 esaxx 와 진행 막대 indicatif 는 쓰지 않는다)
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# 프로필(debug = 0, gemm-common · gemm-f16 opt-level 3)과 candle 포크 [patch.crates-io] 는 루트 작업 공간(../../Cargo.toml)에 있다.
+# 작업 공간 멤버의 [profile] · [patch] 는 cargo 가 쓰지 않으므로 여기 두지 않는다. 이 크레이트를 다른 작업 공간이 가져가면 그쪽 [patch]를 따른다.

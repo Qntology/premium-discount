@@ -18,14 +18,18 @@ use onnxruntime_sys as sys;
 use crate::{
     char_p_to_string,
     environment::Environment,
-    error::{assert_not_null_pointer, assert_null_pointer, status_to_result, NonMatchingDimensionsError, OrtApiError, OrtError, Result},
+    error::{
+        assert_not_null_pointer, assert_null_pointer, status_to_result, NonMatchingDimensionsError,
+        OrtApiError, OrtError, Result,
+    },
     g_ort,
     memory::MemoryInfo,
     tensor::{
         ort_owned_tensor::{OrtOwnedTensor, OrtOwnedTensorExtractor},
         OrtTensor,
     },
-    AllocatorType, GraphOptimizationLevel, MemType, TensorElementDataType, TypeToTensorElementDataType,
+    AllocatorType, GraphOptimizationLevel, MemType, TensorElementDataType,
+    TypeToTensorElementDataType,
 };
 
 #[cfg(feature = "model-fetching")]
@@ -104,16 +108,25 @@ impl<'a> SessionBuilder<'a> {
 
         // We use a u16 in the builder to cover the 16-bits positive values of a i32.
         let num_threads = num_threads as i32;
-        let status = unsafe { g_ort().SetIntraOpNumThreads.unwrap()(self.session_options_ptr, num_threads) };
+        let status =
+            unsafe { g_ort().SetIntraOpNumThreads.unwrap()(self.session_options_ptr, num_threads) };
         status_to_result(status).map_err(OrtError::SessionOptions)?;
         assert_null_pointer(status, "SessionStatus")?;
         Ok(self)
     }
 
     /// Set the session's optimization level
-    pub fn with_optimization_level(self, opt_level: GraphOptimizationLevel) -> Result<SessionBuilder<'a>> {
+    pub fn with_optimization_level(
+        self,
+        opt_level: GraphOptimizationLevel,
+    ) -> Result<SessionBuilder<'a>> {
         // Sets graph optimization level
-        unsafe { g_ort().SetSessionGraphOptimizationLevel.unwrap()(self.session_options_ptr, opt_level.into()) };
+        unsafe {
+            g_ort().SetSessionGraphOptimizationLevel.unwrap()(
+                self.session_options_ptr,
+                opt_level.into(),
+            )
+        };
         Ok(self)
     }
 
@@ -183,7 +196,14 @@ impl<'a> SessionBuilder<'a> {
 
         let env_ptr: *const sys::OrtEnv = self.env.env_ptr();
 
-        let status = unsafe { g_ort().CreateSession.unwrap()(env_ptr, model_path.as_ptr(), self.session_options_ptr, &mut session_ptr) };
+        let status = unsafe {
+            g_ort().CreateSession.unwrap()(
+                env_ptr,
+                model_path.as_ptr(),
+                self.session_options_ptr,
+                &mut session_ptr,
+            )
+        };
         status_to_result(status).map_err(OrtError::Session)?;
         assert_null_pointer(status, "SessionStatus")?;
         assert_not_null_pointer(session_ptr, "Session")?;
@@ -232,7 +252,13 @@ impl<'a> SessionBuilder<'a> {
         let status = unsafe {
             let model_data = model_bytes.as_ptr() as *const std::ffi::c_void;
             let model_data_length = model_bytes.len();
-            g_ort().CreateSessionFromArray.unwrap()(env_ptr, model_data, model_data_length, self.session_options_ptr, &mut session_ptr)
+            g_ort().CreateSessionFromArray.unwrap()(
+                env_ptr,
+                model_data,
+                model_data_length,
+                self.session_options_ptr,
+                &mut session_ptr,
+            )
         };
         status_to_result(status).map_err(OrtError::Session)?;
         assert_null_pointer(status, "SessionStatus")?;
@@ -393,14 +419,20 @@ impl<'a> Session<'a> {
             .map(|output| output.name.clone())
             .map(|n| CString::new(n).unwrap())
             .collect();
-        let output_names_ptr: Vec<*const i8> = output_names_cstring.iter().map(|n| n.as_ptr() as *const i8).collect();
+        let output_names_ptr: Vec<*const i8> = output_names_cstring
+            .iter()
+            .map(|n| n.as_ptr() as *const i8)
+            .collect();
 
-        let mut output_tensor_extractors_ptrs: Vec<*mut sys::OrtValue> = vec![std::ptr::null_mut(); self.outputs.len()];
+        let mut output_tensor_extractors_ptrs: Vec<*mut sys::OrtValue> =
+            vec![std::ptr::null_mut(); self.outputs.len()];
 
         // The C API expects pointers for the arrays (pointers to C-arrays)
         let input_ort_tensors: Vec<OrtTensor<TIn, D>> = input_arrays
             .into_iter()
-            .map(|input_array| OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array))
+            .map(|input_array| {
+                OrtTensor::from_array(&self.memory_info, self.allocator_ptr, input_array)
+            })
             .collect::<Result<Vec<OrtTensor<TIn, D>>>>()?;
         let input_ort_values: Vec<*const sys::OrtValue> = input_ort_tensors
             .iter()
@@ -424,21 +456,26 @@ impl<'a> Session<'a> {
         status_to_result(status).map_err(OrtError::Run)?;
 
         let memory_info_ref = &self.memory_info;
-        let outputs: Result<Vec<OrtOwnedTensor<TOut, ndarray::Dim<ndarray::IxDynImpl>>>> = output_tensor_extractors_ptrs
-            .into_iter()
-            .map(|ptr| {
-                let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-                let status = unsafe { g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _) };
-                status_to_result(status).map_err(OrtError::GetTensorTypeAndShape)?;
-                let dims = unsafe { get_tensor_dimensions(tensor_info_ptr) };
-                unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
-                let dims: Vec<_> = dims?.iter().map(|&n| n as usize).collect();
+        let outputs: Result<Vec<OrtOwnedTensor<TOut, ndarray::Dim<ndarray::IxDynImpl>>>> =
+            output_tensor_extractors_ptrs
+                .into_iter()
+                .map(|ptr| {
+                    let mut tensor_info_ptr: *mut sys::OrtTensorTypeAndShapeInfo =
+                        std::ptr::null_mut();
+                    let status = unsafe {
+                        g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr as _)
+                    };
+                    status_to_result(status).map_err(OrtError::GetTensorTypeAndShape)?;
+                    let dims = unsafe { get_tensor_dimensions(tensor_info_ptr) };
+                    unsafe { g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
+                    let dims: Vec<_> = dims?.iter().map(|&n| n as usize).collect();
 
-                let mut output_tensor_extractor = OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
-                output_tensor_extractor.tensor_ptr = ptr;
-                output_tensor_extractor.extract::<TOut>()
-            })
-            .collect();
+                    let mut output_tensor_extractor =
+                        OrtOwnedTensorExtractor::new(memory_info_ref, ndarray::IxDyn(&dims));
+                    output_tensor_extractor.tensor_ptr = ptr;
+                    output_tensor_extractor.extract::<TOut>()
+                })
+                .collect();
 
         // Reconvert to CString so drop impl is called and memory is freed
         let cstrings: Result<Vec<CString>> = input_names_ptr
@@ -476,12 +513,21 @@ impl<'a> Session<'a> {
                 input_arrays.len(),
                 self.inputs.len()
             );
-            return Err(OrtError::NonMatchingDimensions(NonMatchingDimensionsError::InputsCount {
-                inference_input_count: 0,
-                model_input_count: 0,
-                inference_input: input_arrays.iter().map(|input_array| input_array.shape().to_vec()).collect(),
-                model_input: self.inputs.iter().map(|input| input.dimensions.clone()).collect(),
-            }));
+            return Err(OrtError::NonMatchingDimensions(
+                NonMatchingDimensionsError::InputsCount {
+                    inference_input_count: 0,
+                    model_input_count: 0,
+                    inference_input: input_arrays
+                        .iter()
+                        .map(|input_array| input_array.shape().to_vec())
+                        .collect(),
+                    model_input: self
+                        .inputs
+                        .iter()
+                        .map(|input| input.dimensions.clone())
+                        .collect(),
+                },
+            ));
         }
 
         // Verify length of each individual inputs
@@ -490,11 +536,23 @@ impl<'a> Session<'a> {
             .zip(self.inputs.iter())
             .any(|(l, r)| l.shape().len() != r.dimensions.len());
         if inputs_different_length {
-            error!("Different input lengths: {:?} vs {:?}", self.inputs, input_arrays);
-            return Err(OrtError::NonMatchingDimensions(NonMatchingDimensionsError::InputsLength {
-                inference_input: input_arrays.iter().map(|input_array| input_array.shape().to_vec()).collect(),
-                model_input: self.inputs.iter().map(|input| input.dimensions.clone()).collect(),
-            }));
+            error!(
+                "Different input lengths: {:?} vs {:?}",
+                self.inputs, input_arrays
+            );
+            return Err(OrtError::NonMatchingDimensions(
+                NonMatchingDimensionsError::InputsLength {
+                    inference_input: input_arrays
+                        .iter()
+                        .map(|input_array| input_array.shape().to_vec())
+                        .collect(),
+                    model_input: self
+                        .inputs
+                        .iter()
+                        .map(|input| input.dimensions.clone())
+                        .collect(),
+                },
+            ));
         }
 
         // Verify shape of each individual inputs
@@ -507,22 +565,38 @@ impl<'a> Session<'a> {
             })
         });
         if inputs_different_shape {
-            error!("Different input lengths: {:?} vs {:?}", self.inputs, input_arrays);
-            return Err(OrtError::NonMatchingDimensions(NonMatchingDimensionsError::InputsLength {
-                inference_input: input_arrays.iter().map(|input_array| input_array.shape().to_vec()).collect(),
-                model_input: self.inputs.iter().map(|input| input.dimensions.clone()).collect(),
-            }));
+            error!(
+                "Different input lengths: {:?} vs {:?}",
+                self.inputs, input_arrays
+            );
+            return Err(OrtError::NonMatchingDimensions(
+                NonMatchingDimensionsError::InputsLength {
+                    inference_input: input_arrays
+                        .iter()
+                        .map(|input_array| input_array.shape().to_vec())
+                        .collect(),
+                    model_input: self
+                        .inputs
+                        .iter()
+                        .map(|input| input.dimensions.clone())
+                        .collect(),
+                },
+            ));
         }
 
         Ok(())
     }
 }
 
-unsafe fn get_tensor_dimensions(tensor_info_ptr: *const sys::OrtTensorTypeAndShapeInfo) -> Result<Vec<i64>> {
+unsafe fn get_tensor_dimensions(
+    tensor_info_ptr: *const sys::OrtTensorTypeAndShapeInfo,
+) -> Result<Vec<i64>> {
     let mut num_dims = 0;
     let status = g_ort().GetDimensionsCount.unwrap()(tensor_info_ptr, &mut num_dims);
     status_to_result(status).map_err(OrtError::GetDimensionsCount)?;
-    (num_dims != 0).then(|| ()).ok_or(OrtError::InvalidDimensions)?;
+    (num_dims != 0)
+        .then(|| ())
+        .ok_or(OrtError::InvalidDimensions)?;
 
     let mut node_dims: Vec<i64> = vec![0; num_dims as usize];
     let status = g_ort().GetDimensions.unwrap()(
@@ -558,18 +632,26 @@ mod dangerous {
         let status = unsafe { f(session_ptr, &mut num_nodes) };
         status_to_result(status).map_err(OrtError::InOutCount)?;
         assert_null_pointer(status, "SessionStatus")?;
-        (num_nodes != 0)
-            .then(|| ())
-            .ok_or_else(|| OrtError::InOutCount(OrtApiError::Msg("No nodes in model".to_owned())))?;
+        (num_nodes != 0).then(|| ()).ok_or_else(|| {
+            OrtError::InOutCount(OrtApiError::Msg("No nodes in model".to_owned()))
+        })?;
         Ok(num_nodes)
     }
 
-    fn extract_input_name(session_ptr: *mut sys::OrtSession, allocator_ptr: *mut sys::OrtAllocator, i: usize) -> Result<String> {
+    fn extract_input_name(
+        session_ptr: *mut sys::OrtSession,
+        allocator_ptr: *mut sys::OrtAllocator,
+        i: usize,
+    ) -> Result<String> {
         let f = g_ort().SessionGetInputName.unwrap();
         extract_io_name(f, session_ptr, allocator_ptr, i)
     }
 
-    fn extract_output_name(session_ptr: *mut sys::OrtSession, allocator_ptr: *mut sys::OrtAllocator, i: usize) -> Result<String> {
+    fn extract_output_name(
+        session_ptr: *mut sys::OrtSession,
+        allocator_ptr: *mut sys::OrtAllocator,
+        i: usize,
+    ) -> Result<String> {
         let f = g_ort().SessionGetOutputName.unwrap();
         extract_io_name(f, session_ptr, allocator_ptr, i)
     }
@@ -597,7 +679,11 @@ mod dangerous {
         Ok(name)
     }
 
-    pub(super) fn extract_input(session_ptr: *mut sys::OrtSession, allocator_ptr: *mut sys::OrtAllocator, i: usize) -> Result<Input> {
+    pub(super) fn extract_input(
+        session_ptr: *mut sys::OrtSession,
+        allocator_ptr: *mut sys::OrtAllocator,
+        i: usize,
+    ) -> Result<Input> {
         let input_name = extract_input_name(session_ptr, allocator_ptr, i)?;
         let f = g_ort().SessionGetInputTypeInfo.unwrap();
         let (input_type, dimensions) = extract_io(f, session_ptr, i)?;
@@ -608,7 +694,11 @@ mod dangerous {
         })
     }
 
-    pub(super) fn extract_output(session_ptr: *mut sys::OrtSession, allocator_ptr: *mut sys::OrtAllocator, i: usize) -> Result<Output> {
+    pub(super) fn extract_output(
+        session_ptr: *mut sys::OrtSession,
+        allocator_ptr: *mut sys::OrtAllocator,
+        i: usize,
+    ) -> Result<Output> {
         let output_name = extract_output_name(session_ptr, allocator_ptr, i)?;
         let f = g_ort().SessionGetOutputTypeInfo.unwrap();
         let (output_type, dimensions) = extract_io(f, session_ptr, i)?;
@@ -635,12 +725,15 @@ mod dangerous {
         assert_not_null_pointer(typeinfo_ptr, "TypeInfo")?;
 
         let mut tensor_info_ptr: *const sys::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-        let status = unsafe { g_ort().CastTypeInfoToTensorInfo.unwrap()(typeinfo_ptr, &mut tensor_info_ptr) };
+        let status = unsafe {
+            g_ort().CastTypeInfoToTensorInfo.unwrap()(typeinfo_ptr, &mut tensor_info_ptr)
+        };
         status_to_result(status).map_err(OrtError::CastTypeInfoToTensorInfo)?;
         assert_not_null_pointer(tensor_info_ptr, "TensorInfo")?;
 
         let mut type_sys = sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
-        let status = unsafe { g_ort().GetTensorElementType.unwrap()(tensor_info_ptr, &mut type_sys) };
+        let status =
+            unsafe { g_ort().GetTensorElementType.unwrap()(tensor_info_ptr, &mut type_sys) };
         status_to_result(status).map_err(OrtError::TensorElementType)?;
         (type_sys != sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED)
             .then(|| ())
@@ -660,7 +753,10 @@ mod dangerous {
 
         Ok((
             io_type,
-            node_dims.into_iter().map(|d| if d == -1 { None } else { Some(d as u32) }).collect(),
+            node_dims
+                .into_iter()
+                .map(|d| if d == -1 { None } else { Some(d as u32) })
+                .collect(),
         ))
     }
 }

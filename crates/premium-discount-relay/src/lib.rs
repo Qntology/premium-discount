@@ -119,10 +119,39 @@ pub fn quoted_spans(text: &str) -> Vec<String> {
     out
 }
 
+/// 글자와 숫자가 섞인 식별자 (`E0425`, `RTX3050`, `v1.4`). 숫자로 시작해 단위가 붙은 값(`3,000원`, `20kg`, 한국어 서술어
+/// `3,000원이다`)은 식별자가 아니라 값이다 ([`numeric_value`]).
 fn is_identifier(text: &str) -> bool {
     let letters = text.chars().any(|c| c.is_alphabetic());
     let digits = text.chars().any(|c| c.is_ascii_digit());
-    letters && digits && text.chars().count() >= 2
+    letters && digits && text.chars().count() >= 2 && !text.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// 숫자로 시작하는 낱말의 값: 수(`0-9 , .`)와 바로 붙은 단위. 한국어 Stanza 원형은 형태소를 `+` 로 잇으므로(`3,000+원+이+다`)
+/// 원형이 있으면 수 형태소와 다음 형태소(단위)를, 없으면 글자에서 수 뒤의 글자들을 단위로 붙인다. 숫자로 시작하지 않으면 None.
+fn numeric_value(t: &Token) -> Option<String> {
+    let surface = t.text.trim();
+    if !surface.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let is_number = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.');
+    if t.lemma.contains('+') {
+        let parts: Vec<&str> = t.lemma.split('+').collect();
+        if is_number(parts[0]) {
+            let unit = parts.get(1).filter(|u| u.chars().all(char::is_alphabetic) || **u == "%").copied().unwrap_or("");
+            return Some(format!("{}{}", parts[0], unit));
+        }
+    }
+    Some(surface.to_string())
+}
+
+/// 한국어 계사 서술어(`무료+이+다`, `3,000+원+이+다`)의 명사 부분. 주어(주제어)에 대한 값이다.
+fn copula_stem(t: &Token) -> Option<String> {
+    let parts: Vec<&str> = t.lemma.split('+').collect();
+    match parts.as_slice() {
+        [stem, "이", "다"] | [stem, "이", "었", "다"] if !stem.is_empty() => Some(lower(stem)),
+        _ => None,
+    }
 }
 
 /// 문장의 Relay Key (4.1절): 따옴표 이름, 고유명사, 글자 · 숫자 식별자, X · SYM 토큰, 복합 명사 덩어리. 중복은 하나로.
@@ -309,17 +338,16 @@ pub struct Claim {
     pub values: Vec<String>,
 }
 
-/// 3.4절 2단계의 주장 뽑기. 값은 NUM(뒤따르는 단위 낱말 · `%` 를 붙여서)과 ADJ 원형이다.
+/// 3.4절 2단계의 주장 뽑기. 핵심은 주어(한국어 주제어 `dislocated` 포함) · 목적어 · 뿌리의 원형, 값은 NUM(뒤따르는 단위 낱말 ·
+/// `%` 를 붙여서), 숫자로 시작하는 수+단위 낱말(`3,000원`), 한국어 계사 서술어의 명사(`배송비는 무료이다` 의 `무료`), ADJ 원형이다.
+/// 값이 된 낱말은 핵심에 넣지 않는다.
 pub fn claim(s: &Sentence) -> Claim {
     let mut c = Claim::default();
     for (i, t) in s.tokens.iter().enumerate() {
         let rel = t.deprel.split(':').next().unwrap_or("");
-        let content = matches!(t.upos.as_str(), "NOUN" | "PROPN" | "VERB" | "ADJ");
-        if content && matches!(rel, "nsubj" | "obj" | "root") && t.upos != "ADJ" {
-            c.core.insert(lemma_or_text(t));
-        }
-        if t.upos == "NUM" || (t.text.chars().any(|ch| ch.is_ascii_digit()) && !is_identifier(&t.text)) {
-            let mut v = t.text.trim().to_string();
+        let digits = t.text.chars().any(|ch| ch.is_ascii_digit());
+        if t.upos == "NUM" || (digits && !is_identifier(t.text.trim())) {
+            let mut v = numeric_value(t).unwrap_or_else(|| t.text.trim().to_string());
             if let Some(next) = s.tokens.get(i + 1) {
                 let unit = next.text.trim();
                 if unit == "%" || (next.upos == "NOUN" && next.head == i + 1) || (next.upos == "SYM" && unit.chars().count() <= 3) {
@@ -327,8 +355,21 @@ pub fn claim(s: &Sentence) -> Claim {
                 }
             }
             c.values.push(v);
-        } else if t.upos == "ADJ" {
+            continue;
+        }
+        if t.upos == "ADJ" {
             c.values.push(lemma_or_text(t));
+            continue;
+        }
+        if rel == "root" {
+            if let Some(stem) = copula_stem(t) {
+                c.values.push(stem);
+                continue;
+            }
+        }
+        let content = matches!(t.upos.as_str(), "NOUN" | "PROPN" | "VERB");
+        if content && matches!(rel, "nsubj" | "obj" | "root" | "dislocated") {
+            c.core.insert(lemma_or_text(t));
         }
     }
     c.values.sort();
@@ -434,6 +475,60 @@ pub fn compare(old: &Record, new: &Record, keys: &KeyClusters, embedder: &dyn Te
         Relation::Unrelated { containment }
     };
     (relation, comparison)
+}
+
+/// 판정 묶음의 평가 하나: 서버 id, 장소(`cc`), 대상(`to`, 없을 수 있음), 분석한 기록
+#[derive(Debug, Clone, Copy)]
+pub struct Entry<'a> {
+    pub id: &'a str,
+    pub cc: &'a str,
+    pub to: Option<&'a str>,
+    pub record: &'a Record,
+}
+
+/// 대체 관계 하나: `new_id` 가 `old_id` 를 대체한다. 옛 평가는 PD-Verdict 의 `superseded` 입력이 켜져 discount(−2, 이유 `superseded`)가 된다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Supersession {
+    pub old_id: String,
+    pub new_id: String,
+    pub changes: Vec<Change>,
+    pub containment: f32,
+}
+
+/// 3.4절을 평가 묶음에: 같은 장소 · 대상(`cc` · `to`)끼리 시간순(같으면 id 순)으로 놓고, 평가마다 그보다 늦은 평가들과 견줘 대체되는지 본다.
+/// 한 옛 평가에는 그것을 대체하는 가장 이른 새 평가 하나만 낸다(그 새 평가가 다시 대체되면 사슬로 이어짐). Relay Key 묶기는 묶음마다 한 번.
+/// 결과는 (cc, to, 옛 평가 시각) 순서다.
+pub fn supersessions(entries: &[Entry<'_>], embedder: &dyn TextEmbedder, cfg: &RelayConfig) -> Vec<Supersession> {
+    let mut groups: BTreeMap<(&str, Option<&str>), Vec<&Entry<'_>>> = BTreeMap::new();
+    for e in entries {
+        groups.entry((e.cc, e.to)).or_default().push(e);
+    }
+    let mut out = Vec::new();
+    for (_, mut group) in groups {
+        if group.len() < 2 {
+            continue;
+        }
+        group.sort_by(|a, b| a.record.at_ms.cmp(&b.record.at_ms).then_with(|| a.id.cmp(b.id)));
+        let all: Vec<RelayKey> = group.iter().flat_map(|e| e.record.sentences.iter().flat_map(relay_keys)).collect();
+        let keys = cluster_keys(&all, embedder, cfg);
+        for (i, old) in group.iter().enumerate() {
+            for new in &group[i + 1..] {
+                if new.record.at_ms <= old.record.at_ms {
+                    continue;
+                }
+                if let (Relation::Supersedes { changes, containment }, _) = compare(old.record, new.record, &keys, embedder, cfg) {
+                    out.push(Supersession {
+                        old_id: old.id.to_string(),
+                        new_id: new.id.to_string(),
+                        changes,
+                        containment,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

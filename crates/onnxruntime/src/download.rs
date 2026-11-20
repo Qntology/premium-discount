@@ -85,7 +85,10 @@ impl AvailableOnnxModel {
                 .map_err(OrtDownloadError::UreqError)?;
 
             assert!(resp.has("Content-Length"));
-            let len = resp.header("Content-Length").and_then(|s| s.parse::<usize>().ok()).unwrap();
+            let len = resp
+                .header("Content-Length")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap();
             info!(len, "Downloading {} bytes...", len);
 
             let mut reader = resp.into_reader();
@@ -93,7 +96,8 @@ impl AvailableOnnxModel {
             let f = fs::File::create(&model_filepath).unwrap();
             let mut writer = io::BufWriter::new(f);
 
-            let bytes_io_count = io::copy(&mut reader, &mut writer).map_err(OrtDownloadError::IoError)?;
+            let bytes_io_count =
+                io::copy(&mut reader, &mut writer).map_err(OrtDownloadError::IoError)?;
 
             if bytes_io_count == len as u64 {
                 Ok(model_filepath)

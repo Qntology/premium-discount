@@ -1,11 +1,11 @@
 // cron 테스트용 가짜 D1과 Vectorize.
-// D1은 node:sqlite(실제 SQLite)로 만든다. 그래서 cron/src/index.ts의 SQL이 실제로 실행되고,
-// www/migrations의 0002~0007을 그대로 적용해 컬럼과 제약도 운영과 같다.
+// D1은 node:sqlite(실제 SQLite)로 만든다. 그래서 workers/cron/src/index.ts의 SQL이 실제로 실행되고,
+// workers/migrations의 0002~0009를 그대로 적용해 컬럼과 제약도 운영과 같다.
 import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-const MIGRATIONS = ['0002_create_evaluations.sql', '0003_add_request_id.sql', '0004_eval_queue.sql', '0005_eval_bcc.sql', '0006_votes_verdicts.sql', '0007_nav_trials.sql']
+const MIGRATIONS = ['0002_create_evaluations.sql', '0003_add_request_id.sql', '0004_eval_queue.sql', '0005_eval_bcc.sql', '0006_votes_verdicts.sql', '0007_nav_trials.sql', '0008_web_analytics.sql', '0009_eval_supersedes.sql']
 
 function toSqliteValue(v: unknown): unknown {
 	// D1처럼 ArrayBuffer를 BLOB으로 받는다
@@ -27,7 +27,7 @@ function sqliteArgs(sql: string, args: unknown[]): unknown[] {
 	return [named]
 }
 
-// D1은 BLOB을 ArrayBuffer가 아니라 바이트 숫자 배열로 돌려준다 (cron/src/vector.ts 주석 참고)
+// D1은 BLOB을 ArrayBuffer가 아니라 바이트 숫자 배열로 돌려준다 (workers/cron/src/vector.ts 주석 참고)
 function fromSqliteRow(row: Record<string, unknown>): Record<string, unknown> {
 	const out: Record<string, unknown> = {}
 	for (const [k, v] of Object.entries(row)) out[k] = v instanceof Uint8Array ? Array.from(v) : v
@@ -65,7 +65,7 @@ export class FakeD1 {
 	constructor() {
 		this.sqlite = new DatabaseSync(':memory:')
 		for (const name of MIGRATIONS) {
-			const path = fileURLToPath(new URL(`../www/migrations/${name}`, import.meta.url))
+			const path = fileURLToPath(new URL(`../workers/migrations/${name}`, import.meta.url))
 			this.sqlite.exec(readFileSync(path, 'utf8'))
 		}
 	}

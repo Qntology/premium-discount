@@ -243,15 +243,39 @@ pub struct Verdict {
     pub reasons: Vec<String>,
 }
 
+/// 판정이 쓰는 초월 함수 두 개: 감쇠의 `2^x` 와 순위의 `tanh`.
+///
+/// 기본([`Math::STD`])은 Rust 표준(플랫폼의 libm)이다. 서버 cron(workers/cron, wasm32)은 JS 엔진의 `Math.pow` · `Math.tanh` 를
+/// 넘긴다: wasm32 의 libm 은 V8(fdlibm)과 마지막 자리가 다를 때가 있어(2^x 는 약 4.5 %, tanh 는 약 10 % 의 입력), 그대로면
+/// 옛 TypeScript 판과 D1 에 쓰는 E · v · r 이 비트까지 같지 않다. 계약(`tolerance`)으로는 둘 다 맞다.
+#[derive(Debug, Clone, Copy)]
+pub struct Math {
+    /// `pow(2, x)` (x ≤ 0)
+    pub pow: fn(f64, f64) -> f64,
+    pub tanh: fn(f64) -> f64,
+}
+
+impl Math {
+    pub const STD: Math = Math {
+        pow: f64::powf,
+        tanh: f64::tanh,
+    };
+}
+
 /// `now_ms` 시점 관측들의 근거량 `E` 와 값 `v`
 pub fn evidence(obs: &[Obs], now_ms: i64, track: &TrackParams, params: &Params) -> (f64, f64) {
+    evidence_in(&Math::STD, obs, now_ms, track, params)
+}
+
+/// [`evidence`] 를 주어진 초월 함수로
+pub fn evidence_in(math: &Math, obs: &[Obs], now_ms: i64, track: &TrackParams, params: &Params) -> (f64, f64) {
     let (mut e, mut s) = (0.0, 0.0);
     for o in obs {
         if o.sign == 0 {
             continue;
         }
         let age = (now_ms - o.at_ms).max(0) as f64;
-        let u = o.weight * o.credit * 2f64.powf(-age / track.half_life_ms);
+        let u = o.weight * o.credit * (math.pow)(2.0, -age / track.half_life_ms);
         e += u;
         s += u * o.sign as f64;
     }
@@ -271,12 +295,17 @@ pub struct Context<'a> {
 
 /// `E` 와 `v` 를 아는 항목의 등급 (피어를 다시 판정할 때 관측을 다시 읽지 않는다)
 pub fn judge(evidence: f64, value: f64, cx: &Context<'_>, params: &Params) -> Verdict {
+    judge_in(&Math::STD, evidence, value, cx, params)
+}
+
+/// [`judge`] 를 주어진 초월 함수로
+pub fn judge_in(math: &Math, evidence: f64, value: f64, cx: &Context<'_>, params: &Params) -> Verdict {
     let (e, v) = (evidence, value);
     let base = Level::ALL
         .into_iter()
         .find_map(|lv| cx.baselines.get(lv).filter(|b| b.n >= cx.track.min_obs.get(lv)).map(|b| (lv, b)));
     let level = base.map(|(lv, _)| lv);
-    let r = base.map(|(_, b)| ((v - b.mean) / (b.sd + params.eps)).tanh());
+    let r = base.map(|(_, b)| (math.tanh)((v - b.mean) / (b.sd + params.eps)));
     let (win, loss) = match cx.duel {
         Some(d) if d.wins + d.losses >= params.duel_min => {
             let meetings = (d.wins + d.losses) as f64;
@@ -484,6 +513,42 @@ mod tests {
         }
         assert_eq!(v["tier"], "premium");
         assert_eq!(v["level"], "secondary");
+    }
+
+    #[test]
+    fn the_math_hook_is_what_evidence_and_judge_use() {
+        let params = Params::v1();
+        let track = params.track("pd").unwrap();
+        let day = 86_400_000;
+        let obs: Vec<Obs> = (0..5)
+            .map(|i| Obs {
+                kind: "vote".into(),
+                sign: if i % 2 == 0 { 1 } else { -1 },
+                weight: 1.0,
+                credit: 1.0,
+                at_ms: -i * 7 * day,
+            })
+            .collect();
+        assert_eq!(evidence_in(&Math::STD, &obs, 0, track, &params), evidence(&obs, 0, track, &params));
+        // 2^x 를 1 로 두면 감쇠가 없다: E = 5, v = 1 / 7
+        let flat = Math { pow: |_, _| 1.0, tanh: f64::tanh };
+        assert_eq!(evidence_in(&flat, &obs, 0, track, &params), (5.0, 1.0 / 7.0));
+        let base = Baselines {
+            secondary: Some(Baseline { n: 9, mean: 0.0, sd: 1.0 }),
+            ..Baselines::default()
+        };
+        let cx = Context {
+            track,
+            baselines: &base,
+            prev: Prev { tier: Tier::Unrated, since_ms: 0 },
+            now_ms: 0,
+            duel: None,
+            superseded: false,
+        };
+        assert_eq!(judge_in(&Math::STD, 3.0, 0.2, &cx, &params), judge(3.0, 0.2, &cx, &params));
+        let steep = Math { pow: f64::powf, tanh: |_| 0.9 };
+        let v = judge_in(&steep, 3.0, 0.2, &cx, &params);
+        assert_eq!((v.tier, v.grade, v.rank), (Tier::Premium, Some(2), Some(0.9)));
     }
 
     #[test]

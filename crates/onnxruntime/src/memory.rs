@@ -19,11 +19,19 @@ impl MemoryInfo {
     pub fn new(allocator: AllocatorType, memory_type: MemType) -> Result<Self> {
         debug!("Creating new memory info.");
         let mut memory_info_ptr: *mut sys::OrtMemoryInfo = std::ptr::null_mut();
-        let status = unsafe { g_ort().CreateCpuMemoryInfo.unwrap()(allocator.into(), memory_type.into(), &mut memory_info_ptr) };
+        let status = unsafe {
+            g_ort().CreateCpuMemoryInfo.unwrap()(
+                allocator.into(),
+                memory_type.into(),
+                &mut memory_info_ptr,
+            )
+        };
         status_to_result(status).map_err(OrtError::CreateCpuMemoryInfo)?;
         assert_not_null_pointer(memory_info_ptr, "MemoryInfo")?;
 
-        Ok(Self { ptr: memory_info_ptr })
+        Ok(Self {
+            ptr: memory_info_ptr,
+        })
     }
 }
 
@@ -44,6 +52,7 @@ impl Drop for MemoryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_env_log::test;
 
     #[test]
     fn memory_info_constructor_destructor() {

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use premium_discount_mcp_protocol::{result_json, McpClient, ToolHandler};
 
 const ID: &str = "0190f0a0-0000-7000-8000-0000000000aa";
+const OTHER_ID: &str = "0190f0a0-0000-7000-8000-0000000000bb";
 
 /// premium-discount-app stand-in: records `(cmd, args)` and answers from a script.
 #[derive(Clone, Default)]
@@ -131,8 +132,15 @@ fn votes_and_verdicts_map_onto_the_app_commands() {
     assert_eq!(app.calls()[1], ("cmd_verdicts".to_string(), json!({"ids": [ID], "refresh": true})));
     assert_eq!(out["verdicts"][0]["tier"], "discount");
 
+    app.reply(Ok(json!({"old": ID, "new": OTHER_ID, "request_id": "sup-0"})));
+    let out = s.call("pd_supersede", &json!({"old": ID, "new": OTHER_ID})).unwrap();
+    assert_eq!(app.calls()[2], ("cmd_supersede".to_string(), json!({"old": ID, "new": OTHER_ID})));
+    assert_eq!(out["new"], OTHER_ID);
+
     let n = app.calls().len();
     for (tool, args) in [
+        ("pd_supersede", json!({"old": ID})),
+        ("pd_supersede", json!({"old": ID, "new": ID})),
         ("pd_vote", json!({"id": ID})),
         ("pd_vote", json!({"id": ID, "value": 2})),
         ("pd_vote", json!({"id": ID, "value": 1, "kind": "like"})),

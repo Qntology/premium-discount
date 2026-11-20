@@ -1,4 +1,4 @@
-//! Client for premium-discount-app's standard I/O protocol (`app/src/commands.rs::serve_lines`):
+//! Client for premium-discount-app's standard I/O protocol (`apps/core/src/commands.rs::serve_lines`):
 //! one JSON object per line, `{"id", "cmd", "args"}` in and `{"id", "ok": true, "result"}` or
 //! `{"id", "ok": false, "error": {"kind", "message"}}` out. The app answers requests one at a time, in order.
 //!

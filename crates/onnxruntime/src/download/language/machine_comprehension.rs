@@ -78,12 +78,8 @@ pub enum GPT2 {
 impl ModelUrl for MachineComprehension {
     fn fetch_url(&self) -> &'static str {
         match self {
-            MachineComprehension::BiDAF => {
-                "https://github.com/onnx/models/raw/master/text/machine_comprehension/bidirectional_attention_flow/model/bidaf-9.onnx"
-            }
-            MachineComprehension::BERTSquad => {
-                "https://github.com/onnx/models/raw/master/text/machine_comprehension/bert-squad/model/bertsquad-10.onnx"
-            }
+            MachineComprehension::BiDAF => "https://github.com/onnx/models/raw/master/text/machine_comprehension/bidirectional_attention_flow/model/bidaf-9.onnx",
+            MachineComprehension::BERTSquad => "https://github.com/onnx/models/raw/master/text/machine_comprehension/bert-squad/model/bertsquad-10.onnx",
             MachineComprehension::RoBERTa(variant) => variant.fetch_url(),
             MachineComprehension::GPT2(variant) => variant.fetch_url(),
         }
@@ -93,12 +89,8 @@ impl ModelUrl for MachineComprehension {
 impl ModelUrl for RoBERTa {
     fn fetch_url(&self) -> &'static str {
         match self {
-            RoBERTa::RoBERTaBase => {
-                "https://github.com/onnx/models/raw/master/text/machine_comprehension/roberta/model/roberta-base-11.onnx"
-            }
-            RoBERTa::RoBERTaSequenceClassification => {
-                "https://github.com/onnx/models/raw/master/text/machine_comprehension/roberta/model/roberta-sequence-classification-9.onnx"
-            }
+            RoBERTa::RoBERTaBase => "https://github.com/onnx/models/raw/master/text/machine_comprehension/roberta/model/roberta-base-11.onnx",
+            RoBERTa::RoBERTaSequenceClassification => "https://github.com/onnx/models/raw/master/text/machine_comprehension/roberta/model/roberta-sequence-classification-9.onnx",
         }
     }
 }
@@ -120,12 +112,16 @@ impl From<MachineComprehension> for AvailableOnnxModel {
 
 impl From<RoBERTa> for AvailableOnnxModel {
     fn from(model: RoBERTa) -> Self {
-        AvailableOnnxModel::Language(Language::MachineComprehension(MachineComprehension::RoBERTa(model)))
+        AvailableOnnxModel::Language(Language::MachineComprehension(
+            MachineComprehension::RoBERTa(model),
+        ))
     }
 }
 
 impl From<GPT2> for AvailableOnnxModel {
     fn from(model: GPT2) -> Self {
-        AvailableOnnxModel::Language(Language::MachineComprehension(MachineComprehension::GPT2(model)))
+        AvailableOnnxModel::Language(Language::MachineComprehension(MachineComprehension::GPT2(
+            model,
+        )))
     }
 }

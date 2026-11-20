@@ -1,6 +1,6 @@
-//! premium-discount-app 의 명령 계약: `serve_lines` · Tauri 셸 · 화면(`app/ui/commands.ts`)이 주고받는 인자와 결과,
-//! 오류 종류. 앱(`app/src/commands.rs`)은 이 타입을 다시 내보내고 그대로 쓰며, premium-discount-mcp 는 같은 이름과
-//! 오류 종류로 도구를 만든다. 명령 이름과 인자 모양의 기준은 `app/ui/fixtures/command_contract.json` 이고, 이 crate 의
+//! premium-discount-app 의 명령 계약: `serve_lines` · Tauri 셸 · 화면(`web/desktop/commands.ts`)이 주고받는 인자와 결과,
+//! 오류 종류. 앱(`apps/core/src/commands.rs`)은 이 타입을 다시 내보내고 그대로 쓰며, premium-discount-mcp 는 같은 이름과
+//! 오류 종류로 도구를 만든다. 명령 이름과 인자 모양의 기준은 `web/desktop/fixtures/command_contract.json` 이고, 이 crate 의
 //! 시험과 앱 · 화면의 시험이 같은 파일을 읽는다.
 //!
 //! 앱 안의 타입에 기대는 것(판정 캐시 행 `VerdictsResult`, 모델 상주 상태가 붙는 `AppStatus`, 모델 내려받기 · 초안
@@ -15,13 +15,14 @@ fn default_top_k() -> u32 {
     DEFAULT_TOP_K
 }
 
-/// UI는 "없음"을 빈 문자열로 들고 있다 (`app/ui/localdb.ts`). 빈 문자열과 공백은 "없음"으로 읽는다.
+/// UI는 "없음"을 빈 문자열로 들고 있다 (`web/desktop/localdb.ts`). 빈 문자열과 공백은 "없음"으로 읽는다.
 pub fn blank_to_none(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
-/// 앱이 여는 명령 이름. 코어(`AppCore::dispatch`) 13개, 셸이 모델 없이도 답하는 모델 명령 3개, 셸의 초안 엔진 1개.
-pub const COMMANDS: [&str; 17] = [
+/// 앱이 여는 명령 이름. 코어(`AppCore::dispatch`) 18개(웹 행동 분석 4개 · 신구 대체 보고 포함), 셸이 모델 없이도 답하는 모델 명령 3개,
+/// 셸의 초안 엔진 1개.
+pub const COMMANDS: [&str; 22] = [
     "cmd_submit_evaluation",
     "cmd_sync_cache",
     "cmd_search_local",
@@ -29,6 +30,7 @@ pub const COMMANDS: [&str; 17] = [
     "cmd_search_merged",
     "cmd_flush_outbox",
     "cmd_vote",
+    "cmd_supersede",
     "cmd_verdicts",
     "cmd_app_status",
     "cmd_session",
@@ -39,6 +41,10 @@ pub const COMMANDS: [&str; 17] = [
     "cmd_model_download",
     "cmd_model_download_cancel",
     "cmd_item_draft",
+    "cmd_analytic_site",
+    "cmd_analytic_sync",
+    "cmd_analytic_report",
+    "cmd_analytic_forget",
 ];
 
 /// [`CommandError::kind`] 의 값. 앞의 열 개는 앱 오류(`AppError`)에서, `not_ready` · `unknown_command` · `internal` 은
@@ -62,7 +68,7 @@ pub const ERROR_KINDS: [&str; 15] = [
     "unknown",
 ];
 
-// ---- 인자 · 결과 (app/src/commands.rs 에서 옮김) ----
+// ---- 인자 · 결과 (apps/core/src/commands.rs 에서 옮김) ----
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubmitArgs {
@@ -127,12 +133,67 @@ pub struct VoteArgs {
     pub kind: Option<String>,
 }
 
+/// `cmd_supersede`: 새 평가(`new`)가 옛 평가(`old`)를 대체한다는 보고 (premium-discount-relay `Relation::Supersedes` — 같은 장소 ·
+/// 대상에서 주장의 수치 · 단위 · 형용사만 바뀜). 서버는 둘의 cc · to 가 같고 new 가 더 늦은지, 보고자가 둘 중 하나의 작성자인지 본다.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupersedeArgs {
+    /// 대체된(더 이른) 평가의 서버 id
+    pub old: String,
+    /// 대체한(더 늦은) 평가의 서버 id
+    pub new: String,
+}
+
+/// `cmd_supersede` 결과: 서버가 받았고, 옛 평가의 판정 캐시는 discount(grade −2, 이유 superseded)로 바뀌었다
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SupersedeResult {
+    pub old: String,
+    pub new: String,
+    /// 쌍에서 정해지는 멱등 키 (같은 보고를 다시 보내도 서버에는 한 번)
+    pub request_id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct VerdictsArgs {
     pub ids: Vec<String>,
     /// true면 캐시가 새것이어도 서버에 묻는다
     #[serde(default)]
     pub refresh: bool,
+}
+
+/// 웹 행동 분석: 사이트 확인 (`cmd_analytic_site`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticSiteArgs {
+    /// 사이트 호스트 (`shop.example.com`, 주소를 넣어도 호스트만 쓴다)
+    pub host: String,
+}
+
+/// 웹 행동 분석: 원시 사건 받기 + 기기 구조화 (`cmd_analytic_sync`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticSyncArgs {
+    pub host: String,
+    /// 받을 쪽 수 상한 (한 쪽 최대 500행). 생략하면 앱의 기본값
+    #[serde(default)]
+    pub max_pages: Option<u32>,
+}
+
+/// 웹 행동 분석: 자연어 질의 리포트 (`cmd_analytic_report`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticReportArgs {
+    pub host: String,
+    /// "이번 달 결제 이탈 원인이 뭐야?" 같은 질의. 기간은 앱이 사용자 시계로 다시 계산한다
+    pub query: String,
+    /// 사용자 언어 (시간대 · 반구). 생략하면 ko
+    #[serde(default)]
+    pub lang: Option<String>,
+    /// 벡터 검색 결과 수
+    #[serde(default)]
+    pub top_k: Option<u32>,
+}
+
+/// 웹 행동 분석: 사건 지우기 (`cmd_analytic_forget`). 지운 id 는 다시 받지 않는다(묘비)
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticForgetArgs {
+    pub ids: Vec<String>,
 }
 
 /// 저장 결과. `status`로 구분한다.
@@ -292,7 +353,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const CONTRACT: &str = include_str!("../../../app/ui/fixtures/command_contract.json");
+    const CONTRACT: &str = include_str!("../../../web/desktop/fixtures/command_contract.json");
 
     fn contract() -> serde_json::Map<String, Value> {
         let v: Value = serde_json::from_str(CONTRACT).unwrap();
@@ -333,9 +394,19 @@ mod tests {
         }
         let v: VoteArgs = serde_json::from_value(args("cmd_vote")).unwrap();
         assert_eq!((v.value, v.kind.as_deref()), (1, Some("vote")));
+        let s: SupersedeArgs = serde_json::from_value(args("cmd_supersede")).unwrap();
+        assert_ne!(s.old, s.new);
         let d: VerdictsArgs = serde_json::from_value(args("cmd_verdicts")).unwrap();
         assert_eq!(d.ids.len(), 1);
         let _: SessionArgs = serde_json::from_value(args("cmd_session")).unwrap();
+        let s: AnalyticSiteArgs = serde_json::from_value(args("cmd_analytic_site")).unwrap();
+        assert_eq!(s.host, "shop.example.com");
+        let y: AnalyticSyncArgs = serde_json::from_value(args("cmd_analytic_sync")).unwrap();
+        assert_eq!(y.max_pages, Some(5));
+        let r: AnalyticReportArgs = serde_json::from_value(args("cmd_analytic_report")).unwrap();
+        assert_eq!((r.lang.as_deref(), r.top_k), (Some("ko"), Some(5)));
+        let f: AnalyticForgetArgs = serde_json::from_value(args("cmd_analytic_forget")).unwrap();
+        assert_eq!(f.ids.len(), 1);
         // 생략한 개수는 기본값
         let a: SearchArgs = serde_json::from_value(serde_json::json!({"query": "q"})).unwrap();
         assert_eq!(a.top_k, DEFAULT_TOP_K);

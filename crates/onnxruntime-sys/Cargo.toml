@@ -14,13 +14,15 @@ repository = "https://github.com/nbigaouette/onnxruntime-rs"
 categories = ["science"]
 keywords = ["neuralnetworks", "onnx", "bindings"]
 
-# Vendored: upstream unit tests and doc tests are not run here (zena-nlp's Stanza tests exercise the runtime).
+# premium-discount: logis-center 판 그대로 가져왔지만, 이 vendored crate 의 자체 시험 · 문서 시험은 돌리지 않습니다 (logis-center 도 안 돌림).
+# bindgen 레이아웃 시험이 Rust 1.99 에서 null 포인터 역참조 오류로 컴파일되지 않습니다. 런타임은 premium-discount-nlp 의 Stanza 시험이 확인합니다.
 [lib]
 test = false
 doctest = false
 
 [dependencies]
-libloading = "0.8"
+# premium-discount: `runtime-load` 기능일 때만 (실행할 때 ONNX Runtime 을 불러옴, lib.rs 의 dynload)
+libloading = { version = "0.8", optional = true }
 
 [build-dependencies]
 bindgen = { version = "0.59", optional = true }
@@ -35,6 +37,10 @@ tar = "0.4"
 
 [features]
 default = []
+
+# premium-discount: ONNX Runtime 을 링크하지 않고 실행할 때 불러옵니다 (`dynload`). 라이브러리가 없는 PC 에서도 바이너리가 뜨고,
+# 호출부는 `dynload::api_available()` 로 먼저 묻고 물러납니다. 끄면 logis-center 판 그대로(빌드 때 링크).
+runtime-load = ["dep:libloading"]
 
 # Disable build script, used to prevent issues with docs.rs
 disable-sys-build-script = []

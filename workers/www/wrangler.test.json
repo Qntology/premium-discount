@@ -1,0 +1,52 @@
+{
+	"compatibility_date": "2026-04-01",
+	"main": "build/index.js",
+	"build": {
+		"command": "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+	},
+	"name": "premium-discount-test",
+	"d1_databases": [
+		{
+			"binding": "apac1_premium_discount",
+			"database_id": "a8a16911-35a1-4dca-9b4c-95fbe82a7da1",
+			"database_name": "apac1_premium_discount"
+		},
+		{
+			"binding": "DB",
+			"database_id": "f7ec6d8c-4274-44e7-94e9-d25410026f4b",
+			"database_name": "premium_discount",
+			"migrations_dir": "../migrations"
+		}
+	],
+	"vectorize": [
+		{
+			"binding": "apac1-premium-discount",
+			"index_name": "apac1-premium-discount"
+		},
+		{
+			"binding": "premium-discount",
+			"index_name": "premium-discount"
+		},
+		{
+			"binding": "EVAL_VECTORIZE",
+			"index_name": "premium-discount-eval-test-768",
+			"remote": true
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
+	"observability": {
+		"enabled": true
+	},
+	"assets": {
+		"directory": "../../web/www/",
+		"binding": "ASSETS"
+	},
+	"r2_buckets": [
+		{
+			"binding": "CDN",
+			"bucket_name": "cdn"
+		}
+	]
+}

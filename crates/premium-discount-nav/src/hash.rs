@@ -99,7 +99,7 @@ pub fn region_hash(screen_hash: &str, anchor: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // 서버 프로젝트가 싣는 ethers 6.9.0 묶음(www/public/static/js/ethers.umd.min.js)으로 뽑은 값.
+    // 서버 프로젝트가 싣는 ethers 6.9.0 묶음(web/www/static/js/ethers.umd.min.js)으로 뽑은 값.
     // raon-zena premium-discount-mcp 의 address.rs 시험과 같은 기준값이다
     const REFERENCE: [(&str, &str, &str); 4] = [
         ("", "5f35dce98ba4fba25530a026ed80b2cecdaa31091ba4958b99b52ea1d068adad", "0x7404358246d491ed2f9dac694f7dea789037424c"),

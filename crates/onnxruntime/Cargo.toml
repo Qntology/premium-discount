@@ -14,10 +14,15 @@ repository = "https://github.com/nbigaouette/onnxruntime-rs"
 categories = ["science"]
 keywords = ["neuralnetworks", "onnx", "bindings"]
 
-# Vendored: upstream unit tests and doc tests are not run here (zena-nlp's Stanza tests exercise the runtime).
+# premium-discount: logis-center 판 그대로 가져왔지만, 이 vendored crate 의 자체 시험 · 문서 시험은 돌리지 않습니다 (logis-center 도 안 돌림).
+# bindgen 레이아웃 시험이 Rust 1.99 에서 null 포인터 역참조 오류로 컴파일되지 않습니다. 런타임은 premium-discount-nlp 의 Stanza 시험이 확인합니다.
 [lib]
 test = false
 doctest = false
+
+[[test]]
+name = "integration_tests"
+required-features = ["model-fetching"]
 
 [dependencies]
 onnxruntime-sys = { version = "0.0.14", path = "../onnxruntime-sys" }
@@ -30,9 +35,17 @@ tracing = "0.1"
 # Enabled with 'model-fetching' feature
 ureq = { version = "2.1", optional = true }
 
+[dev-dependencies]
+image = "0.23"
+test-env-log = { version = "0.2", default-features = false, features = ["trace"] }
+tracing-subscriber = "0.2"
+ureq = "2.1"
+
 [features]
 # Fetch model from ONNX Model Zoo (https://github.com/onnx/models)
 model-fetching = ["ureq"]
+# premium-discount: ONNX Runtime 을 실행할 때 불러옴 (onnxruntime-sys 의 같은 기능)
+runtime-load = ["onnxruntime-sys/runtime-load"]
 # Disable build script; used for https://docs.rs
 disable-sys-build-script = ["onnxruntime-sys/disable-sys-build-script"]
 generate-bindings = ["onnxruntime-sys/generate-bindings"]

@@ -9,11 +9,31 @@
 
 ## 1. 폴더 구성
 
+> **2026-11-19 갱신 (26절)**: logis-center 와 같은 배치로 옮겼습니다. 이 아래 2 ~ 25절은 그때의 경로(`app/` · `app/ui` · `app/src-tauri` ·
+> `www/` · `cron/` · `crates/` 따로 빌드)로 적은 기록이라 그대로 두었습니다. 옛 경로 → 새 경로는 26-1 의 표를 보세요.
+
+| 폴더 | 역할 | 기술 |
+|---|---|---|
+| `Cargo.toml` · `Cargo.lock` · `.cargo/config.toml` | 루트 작업 공간 하나 (`crates/*` + `apps/core` + `apps/desktop`), 산출물은 루트 `target/` | Rust |
+| `apps/core` | 헤드리스 코어 `premium-discount-app` (LanceDB 저장소 · 모델 · 동기화 · `serve_lines`, Tauri 없음) | Rust |
+| `apps/desktop` | 데스크톱 · 모바일 셸 `premium-discount-desktop` (Tauri v2, Android `gen/android`, 사이드카) | Rust + Tauri |
+| `crates/` | 공용 라이브러리 `premium-discount-*` 17개 + `onnxruntime` · `onnxruntime-sys` (raon-zena · logis-center 가 git 리비전으로 씀) | Rust |
+| `web/desktop` | 앱 웹뷰 화면 (esbuild, `npm test`) | TypeScript |
+| `web/www` | www Worker 가 싣는 정적 파일 (`assets`) | JS · CSS |
+| `workers/www` | 평가 확인 서비스 Worker (`wrangler.json` · `wrangler.test.json`) | Cloudflare Workers (TypeScript) |
+| `workers/cron` | 대기열 · 판정 · 지갑 기록 정리 cron Worker | Cloudflare Workers (TypeScript) |
+| `workers/migrations` | D1 마이그레이션 (www 의 `DB` 바인딩 `migrations_dir`, Node 시험의 가짜 D1 도 이것을 적용) | SQL |
+| `contracts/` · `test-support/` | 언어 사이 계약 사례 · Node 시험 도우미 | JSON · Python · JS |
+
+<details><summary>처음(2026-10) 폴더 구성</summary>
+
 | 폴더 | 역할 | 기술 | 상태 |
 |---|---|---|---|
 | `app/` | 평가 생성 클라이언트 (욕설 필터, 질문 입력) | Rust + Tauri | **비어 있음** (신규 개발 대상) |
 | `www/` | 평가 확인 서비스 (Worker, 웹 UI) | Cloudflare Workers (TypeScript) | 기존 items/pages/tasks 로직 존재, 평가 기능 미구현 |
 | `cron/` | 임시 스케줄러 Worker (1분마다 `tasks` 처리) | Cloudflare Workers (cron) | 임시 코드, **수정 대상 아님** |
+
+</details>
 
 ---
 
@@ -1326,7 +1346,7 @@ raon-zena 의 범용 엔진을 `crates/` 로 옮기고, Relay · 창 계산 crat
 
 | crate | 출처 | 한 일 |
 | --- | --- | --- |
-| `onnxruntime-sys` · `onnxruntime` | raon-zena (onnxruntime-rs 0.0.14 벤더 판) | 실행 시 라이브러리 찾는 곳에 `%LOCALAPPDATA%\premium.discount\models\onnxruntime` 을 더함. 오래된 시험 대상 오류 두 가지(`test_env_log` 가져오기, bindgen 배치 시험 261개의 null 역참조)와 libc 기호 경고 25개(`memcpy` 등 다시 선언)를 없앰 |
+| `onnxruntime-sys` · `onnxruntime` | logis-center `commerce/crates/onnxruntime(-sys)` (onnxruntime-rs 0.0.14 벤더 판, ORT 1.28.0). 2026-11-18 에 logis-center 판을 기준으로 다시 맞춤 (앞서는 raon-zena 판) | logis-center 판 그대로에, 기본 꺼진 기능 `runtime-load` 만 더함: ONNX Runtime 을 링크하지 않고 실행할 때 불러오고(`dynload`, 찾는 곳 `ORT_DYLIB_PATH` · 실행 파일 옆 · `%LOCALAPPDATA%\{premium.discount,RaonZena,logis-center}\models\onnxruntime` · 빌드가 준비한 라이브러리), 빌드는 라이브러리 준비에 실패해도(`ORT_STRATEGY=skip`, 내려받기 404) 계속함. nlp 의 `stanza` 기능이 켬. GitHub 배포판을 받지 못하면 같은 판을 NuGet `Microsoft.ML.OnnxRuntime` 에서 꺼냄(logis-center 판에 함께 넣은 예비 경로, 2026-11-18 github.com/microsoft/onnxruntime 404). 자체 시험은 돌리지 않음(`[lib] test = false`: bindgen 배치 시험이 Rust 1.99 에서 null 역참조 오류) |
 | `premium-discount-nlp` | raon-zena `zena-nlp` | 기능 `granite`(candle) · `stanza`(ONNX). 모델은 `PD_*` → `RAON_*` → `premium.discount` · `RaonZena` · `logis-center` 의 `models` 순서로 찾음 |
 | `premium-discount-nms` | raon-zena `nlp-nms-router` 의 중립 부분 | `DomainBank<M, E>`(항목 내용 `M` 은 부르는 쪽 타입, `DomainSpec` 으로 만듦), 호출어는 `set_wake_words` 로 정함(기본 없음) |
 | `premium-discount-sds` | raon-zena `zena-sds` 전체 | `Moments` 와 합침. 장부 recipe 그대로 |
@@ -1393,3 +1413,311 @@ raon-zena 의 범용 엔진을 `crates/` 로 옮기고, Relay · 창 계산 crat
   - 키 몇 개의 띠는 0.881 이라 아무것도 묶지 못했습니다.
 - Relay 의 포함률 하한(0.5)은 아직 고정값입니다. Relay 는 새로 만들었고 아직 부르는 곳이 없습니다(판정 cron 의 `superseded` 입력에 잇는 것은 다음 일).
 - `premium-discount-window` 의 누르기와 끌기 · 제자리 돌아가기 · 점 아래 창 찾기는 raon-zena 오버레이가 아직 쓰지 않습니다. `zena-core::window` 는 스타일 비트 · 알파 · 프레임 간격만 이 crate 로 계산합니다.
+
+## 24. 웹 행동 분석 이관: logis-center analytic · tracker-logis-center (2026-11-18)
+
+logis-center 의 웹 행동 분석(analytic) 파이프라인과 tracker-logis-center(사이트에 심는 수집 스크립트 + Cloudflare Worker)를 이 저장소로 옮겼습니다.
+- 수집: www Worker 의 `/analytic/*` 와 수집 스크립트 `www/public/static/js/tracker.js`
+- 해석 코어: `crates/premium-discount-analytic`
+- 기기 쪽 받기 · 구조화 · 리포트: 앱 `app/src/analytic.rs`
+
+같은 기획서의 raon-zena 쪽 일(대화 맥락 · 코스 · 투트랙 RAG 배선, 언어팩)은 그 저장소의 `docs/MASTER_PLAN_GLOBAL_LOCAL_COURSE_RAG.md` 입니다.
+
+| 원본 | 옮긴 곳 | 한 일 |
+| --- | --- | --- |
+| tracker-logis-center `tracker/tracker.js` (ethers · marked 묶음 포함 537 KB) | `www/public/static/js/tracker.js` (묶음 없음) | 누름 · 머묾 · 바꿈에 들어옴 · 스크롤 · 제출 · 뒤로 · 떠남을 더함. `outerHTML` 대신 속성 없는 PUG + 셀렉터용 조상 모양을 브라우저에서 만듦. 원본 결함 네 가지를 고침(24-5) |
+| tracker-logis-center `workers/src/index.ts` | `www/src/analytic.ts`, `www/migrations/0008_web_analytics.sql` | 사이트마다 쌓고 확인된 주인에게만 돌려줌. 방문자 쿠키 · S3 계정 · IP · 지역은 받지도 남기지도 않음 |
+| logis-center `analytic.rs` · `parsing.rs` · `ai_utils.rs` (`strip_pug_attributes`, `pug_line_parts`, `sanitize_llm_input`, HTML → PUG) | `premium-discount-analytic::pug` | 그대로 옮기되 입력값을 내지 않고, 숨은 글을 접지 않음 |
+| logis-center `utils/time_guide.rs` | `premium-discount-analytic::time` | `this_week` · `last_week` 를 더함. 날짜는 모델이 아니라 코드가 사용자 시계로 정함 |
+| logis-center `model/query_analytic.rs` 의 사전 단계 + `full_bias.json` 의 분석 항목 | `premium-discount-analytic::query`, `data/analytic_dictionary.json` | 사건 5 · 행동 4 · 페이지 10 · 기간 7(+2) · 계절 4 · 인사이트 3. 일치는 premium-discount-nms 도메인 은행 |
+| logis-center `runtime.ts` `decodeAnalyticBlob` | `www/src/blob.ts`, `premium-discount-analytic::blob` | BUG-RT-2 · 3 · 4 를 고침. 두 쪽이 `contracts/analytic_blob_v1.json` 을 함께 통과 |
+| logis-center `modes/analytic.ts` (받기 · DELTA GUARD), `commerce.ts` (TOMBSTONE GUARD) | `app/src/analytic.rs` | LanceDB `web_events_local` · `web_event_tombstones` |
+| (없음) | `premium-discount-analytic::funnel` | Track 1: 웹 체크포인트 · 선택 대조 · 마찰 에피소드 · 퍼널 (premium-discount-nav 규칙) |
+
+### 24-1. 흐름
+
+1. 사이트 주인이 사이트에 두 줄을 넣고 앱에서 사이트를 확인합니다(`cmd_analytic_site {host}`).
+   ```html
+   <meta name="premium-discount-site" content="<주인 주소>">
+   <script src="https://premium.discount/static/js/tracker.js" async></script>
+   ```
+   - 주인 주소는 QR 로그인 세션이면 `hashId(이메일)` 입니다(logis-center oauth 의 사이트 확인 meta 와 같은 식). 지갑 서명(`x-pd-*`)으로 확인할 수도 있습니다.
+   - Worker 가 `https://<host>/` 를 받아 meta 를 봅니다. 한 사이트에 주인이 여럿일 수 있습니다.
+2. 방문자의 브라우저가 사건을 모아 `POST /analytic/events` 로 보냅니다.
+   - `text/plain` JSON 이라 사전 요청이 없습니다.
+   - 5초마다 · 20개마다 보냅니다. 떠날 때는 keepalive 로 4개씩 보냅니다(keepalive 본문 한도 64 KB).
+3. Worker 가 모양을 검사하고 다시 다듬어(`sanitizeEvent`) D1 `web_events` 에 넣습니다.
+   - `cc = hashId(호스트)`, `session = hashId(cc + sid)`, `data = gzip(JSON)`, `updated_at = 0`(원시).
+   - 브라우저가 보낸 `Origin` 의 호스트와 사건 주소의 호스트가 다르면 403 입니다.
+4. 앱 `cmd_analytic_sync {host}` 이 사건을 받아 정리합니다.
+   - `GET /analytic/events?host&since&after_id` 를 (시각, id) 커서로 빠짐없이 받습니다.
+   - BLOB 을 풀어 LanceDB 에 넣습니다.
+   - 기기에서 구조화합니다(24-4).
+5. 앱 `cmd_analytic_report {host, query, lang}` 이 리포트를 냅니다.
+   - 질의 해석 → 기간 → 그 기간의 사건으로 퍼널 · 병목 · 선택 대조를 구합니다.
+   - 요약글을 벡터 검색합니다.
+   - 사람이 읽는 `lines` 몇 줄을 냅니다. raon-zena 가 `[참고]` 줄로도 쓸 수 있는 모양입니다.
+
+명령은 공용 계약(`premium-discount-schema` `COMMANDS`, 17 → 21)에 들어갔습니다. 함께 등록한 곳은 다음과 같습니다.
+- 앱 코어(`dispatch`)
+- Tauri 창
+- 화면(`ui/commands.ts`)
+- 계약 파일(`ui/fixtures/command_contract.json`)
+
+### 24-2. 보내는 것과 보내지 않는 것 (`web-event/1`)
+
+| tracker-logis-center | 여기 |
+| --- | --- |
+| `action`: 누른 요소의 `outerHTML` | `target`: 속성 없는 PUG(`{들여쓰기}{태그} \| {글}`) + 셀렉터용 조상 모양(태그 · id · class · `role`/`name`/`type`/시험용 속성 · 같은 태그 중 순서, 깊이 5) |
+| (없음) | `item`: 누른 요소가 목록 안에 있으면 그 목록 항목(형제와 같은 단위) |
+| `relate`: 같은 목록의 형제 `outerHTML` (그림 주소만 지움, 최대 100) | `related`: 같은 모양 (최대 100) |
+| 주소 전체(쿼리 포함) | 쿼리 · 문서 안 위치를 뺀 주소(해시 라우팅 `#/…` 만 남김) |
+| 쿠키의 `hash` · `token` (S3 에 방문자 계정을 만듦) | 탭마다 새로 만드는 무작위 `sid`. 서버에는 `hashId(cc + sid)` 만 남음 |
+
+- 보내지 않습니다.
+  - 입력값: 바꿈 사건은 칸의 종류(`text` · `select` …)만 보냅니다. 비밀번호 칸은 사건이 없습니다.
+  - PUG 의 `input` · `textarea` 값: 결제 화면에 미리 채운 이름 · 주소가 값으로 들어 있기 때문입니다.
+  - 속성(`href` · `src` · `value` · `style` …), 숨은 층(`position: fixed/absolute`), 스크립트, `data-pd-ignore` 영역.
+- 글의 이메일과, 숫자가 네 개 이상 든 낱말은 `#` 로 바꿉니다. 전화 · 카드 · 주문 번호를 막으려는 것이고, 1,000 이상의 가격도 함께 가려집니다. 브라우저 · Worker · Rust 가 같은 규칙으로 한 번씩 거릅니다.
+- GPC(`navigator.globalPrivacyControl`) · DNT 를 켠 방문자는 수집하지 않습니다.
+- 크기: tracker-logis-center 의 어림식(토큰 어림 × 5 > 7,000)을 그대로 씁니다. 다만 넘치면 형제를 반씩 줄이고, 그래도 크면 버립니다. 원본은 바로 버렸습니다.
+
+### 24-3. 고른 요소 vs 지나친 형제: 기획서와 다른 판정
+
+- 기획서의 규칙: "고른 TARGET 은 Premium, 같은 화면에서 비켜 간 RELATED 는 Discount 로 즉시 집계"하고, 등급 규칙(2/3)을 적용합니다.
+- 문제: 목록이 길수록 모든 후보가 Discount 가 됩니다. 시험 `the_plan_rule_marks_a_random_list_discount` 로 확인했습니다.
+
+| 경우 (상품 10개 목록) | 기획서 규칙 | 여기의 규칙 |
+| --- | --- | --- |
+| 아무 정보 없이 무작위로 2,000번 고름 | 10개 모두 Discount | 결정하지 않음(띠 2σ 를 넘은 것이 하나 이하) |
+| 상품 0 을 40 %, 상품 9 는 한 번도 안 고름 | 상품 0 도 Neutral(40 % < 2/3) | 상품 0 Premium, 상품 9 Discount |
+
+- 여기의 규칙은 선택 묶음의 크기를 n 이라 할 때, 아무 정보 없이 고를 확률 1/n 을 기댓값으로 씁니다.
+  - 후보마다 노출 · 뽑힘 · 기댓값 Σ1/n · 분산 Σ(1/n)(1−1/n)을 쌓습니다.
+  - z 가 ±2 를 넘고 노출이 5 이상일 때만 결정합니다.
+  - 기획서의 수(뽑힘 · 지나침)는 비교용으로 남겼습니다(`ChoiceTally::naive_tier`).
+- 같은 틀의 카드(상품 목록)는 셀렉터 틀이 같아 요소 해시도 같습니다. 셀렉터는 데이터 자리를 지우기 때문입니다. 그래서 선택 대조의 키는 요소 해시 + PUG 의 글입니다.
+- 기획서 4.2 의 쇼핑몰 시나리오를 그대로 시험에 넣었습니다. 세션 40개: 30개는 간편결제로 완료하고, 10개는 쿠폰 칸에서 스크롤을 뒤집고 광클하고 다시 고치다 떠납니다.
+  - 퍼널: 상세 → 장바구니 → 결제 → 완료가 40 · 40 · 40 · 30, 결제에서 10 세션이 빠집니다.
+  - 병목 1위: '쿠폰 적용' (마찰 discount).
+  - 선택 대조: 간편결제 Premium · 쿠폰 Discount (z = ±3.16).
+  - 앱 리포트("어제 결제 이탈 원인이 뭐야?")가 기간 · 인사이트(`conversion_insight`) · 퍼널 · 병목을 냅니다.
+
+### 24-4. 질의 해석과 기기 구조화
+
+- **질의**
+  - 사전은 logis-center `full_bias.json` 의 분석 항목입니다. 12개 언어의 정확 일치 글이 들어 있습니다.
+  - 일치는 premium-discount-nms 의 도메인 은행이 합니다. 띄어쓰기를 무시하고, 한국어 조사를 떼고, 교착어는 접두로 맞춥니다. 일본어 · 중국어처럼 띄어 쓰지 않는 글은 낱말 안에서 찾습니다(`昨日のページビュー` → 어제 · 유입).
+  - 같은 갈래에서 둘이 걸리면 더 긴 글이 이깁니다("결제 이탈" > "이탈" > "원인").
+- **날짜는 코드가 정합니다.**
+  - 해석은 기간 키(`last_week`) · 계절 키(`summer`)만 고르고, 범위는 사용자의 시계로 계산합니다. 시계는 언어에서 정합니다: 시간대 오프셋, 남반구면 계절을 여섯 달 어긋나게, ISO 주(월요일 시작).
+  - 계절은 이미 시작한 가장 최근 회차입니다. 11월의 "겨울"은 작년 겨울입니다.
+  - 평가 시각 고정은 `PD_EVAL_NOW_MS` 이고, 없으면 logis-center 의 `LOGIS_EVAL_NOW_MS` 를 읽습니다.
+- **구조화 (Track 2)**: logis-center 는 이 자리에서 Qwen3.5 2B 에 사건마다 한 번 물어 `action` · `summary` · `relate` 를 받았습니다. 여기서는 모델 없는 요약글을 embeddinggemma(768, 문서 프롬프트)로 임베딩하고 `updated_at` 을 찍습니다.
+  - 요약글 모양: `click | cart shop.example.com/order/cart | 간편결제 | not chosen: 쿠폰 적용`
+  - 기간 · 페이지 · 선택 대조 · 마찰은 Track 1 이 결정론적으로 내므로, 모델 요약은 그 위의 문장일 뿐입니다.
+  - 초안 모델(Qwen3.5-0.8B)은 이 PC 에 가중치가 없어 붙이지 않았습니다.
+- **가드**
+  - DELTA GUARD: 구조화된 행(`updated_at > 0`)은 서버의 원시 사건으로 덮지 않습니다. LanceDB merge 의 조건(`target.updated_at = 0`)으로도 막습니다.
+  - TOMBSTONE GUARD: 지운 사건 id 는 묘비 테이블에 남아 다음 받기에서 다시 들어오지 않습니다.
+
+### 24-5. 원본에서 고친 결함
+
+| 어디 | 결함 | 고친 것 |
+| --- | --- | --- |
+| tracker-logis-center Worker | `pageId = hashId(cookies.cc + pathname)` 를 `cookies.cc` 를 정하기 전에 계산해 `undefined/…` 로 해싱 | 세션 해시는 cc 를 정한 뒤에 계산 |
+| tracker-logis-center Worker | GET 이 `href` 만 바꾸면 누구의 사이트든 1,000건을 돌려줌 | 확인된 주인만, 커서로 |
+| tracker-logis-center `tracker.js` | 광클을 요소와 상관없이 셈(카드를 누르고 쿠폰을 두 번 누르면 광클) | 같은 요소를 700 ms 안에 세 번 |
+| tracker-logis-center `tracker.js` | 바꿈 디바운스가 하나라 600 ms 안에 다른 칸을 바꾸면 앞 칸의 사건이 사라짐 | 칸마다 디바운스 |
+| tracker-logis-center `tracker.js` | 카드 안의 링크를 누르면 링크와 카드의 모양이 달라 형제를 하나도 못 보냄 | `item` = 목록 항목, 형제는 항목의 형제 |
+| tracker-logis-center `tracker.js` | 페이지 배경(html)에 머물면 페이지 전체가 실려 나감(크기 상한에 걸려야 버려짐) | html · body 대상은 보내지 않음 |
+| logis-center `runtime.ts` | BUG-RT-2(50 바이트 이하 base64 gzip 을 풀지 않음) · BUG-RT-3(Uint8Array 조각을 밑의 버퍼 전체로 읽음) · BUG-RT-4(`"42"` · `"null"` 을 그대로 돌려줌) | 셋 다. 계약 사례 19개 |
+| logis-center PUG | 한 줄로 접을 때 숨은 층 · 고르지 않은 option 의 글까지 모음, 버려질 base64 아이콘 하나가 링크 글의 접기를 막음, 조각을 문서로 파싱해 `html` 부터 냄(B23) | 내보내지 않는 요소는 접기 · 데이터 판정에서도 뺌, 조각의 뿌리부터 |
+
+### 24-6. 기획서와 다른 점
+
+- 기획서의 이름이 실제 코드와 다릅니다.
+  - `structure_analytic_event` 는 없고 `run_analytic_structuring` 입니다.
+  - `strip_pug_attributes` 는 `ai_utils.rs` 가 아니라 `analytic.rs` 에 있습니다.
+  - `sales_insight` 는 없고 `conversion_insight` 입니다.
+  - logis-center 의 `insight` · `metrics` · `operators` 는 분석 파이프라인이 쓰지 않습니다(커머스 질의용). 여기서는 `insight` 만 옮겼습니다. 영어 문장뿐이라 한국어 · 일본어 · 중국어 정확 일치 글을 더했습니다(`pd_exact_match`).
+- `time_guide.rs` 에는 "이번 주"가 없습니다. `this_week` · `last_week` 를 더했습니다.
+- 기획서의 "TARGET Premium / RELATED Discount" 대신 기댓값 대비 z 로 결정합니다(24-3).
+- LLM 구조화(Qwen3.5 2B)는 옮기지 않았습니다(24-4).
+- README 10-3 의 레거시 발자국(`auth.js` · `content.js`)은 logis 콘솔 화면에서 온 코드라 수집 경로에 잇지 않았습니다. 수집은 새 Worker 경로뿐입니다.
+- 사이트 확인은 logis-center 의 `api.oauth.network` client_id/secret 대신 meta + 세션 · 지갑입니다.
+
+### 24-7. 배포와 남은 위험
+
+1. 마이그레이션: `npx wrangler d1 migrations apply DB --remote` (`0008_web_analytics.sql`).
+2. `wrangler.json` 에 요청 제한 `ANALYTIC_WRITE_LIMITER`(namespace 1003, IP 마다 분당 120)를 더했습니다. 없으면 평가 쓰기 제한을 함께 씁니다.
+3. 수집 스크립트는 `public/static/js/tracker.js` 로 함께 배포됩니다.
+
+남은 위험은 다음과 같습니다.
+- 누구나 남의 사이트 이름으로 가짜 사건을 보낼 수 있습니다. 브라우저는 Origin 으로 막지만 직접 보낸 요청은 막지 못하고, 요청 제한만 받습니다. 주인만 읽으므로 새는 것은 없지만 리포트가 오염될 수 있습니다.
+- 지갑 서명은 경로만 덮고 쿼리를 덮지 않습니다(평가 · 타임트라이얼과 같음). 5분 안에 서명을 가로챈 쪽이 같은 주인의 다른 사이트를 읽을 수 있습니다.
+- 보관 기한 cron 은 없습니다. 주인이 `DELETE /analytic/events?host&before` 로 지웁니다.
+
+### 24-8. 검증
+
+| 묶음 | 결과 |
+| --- | --- |
+| `cd crates && cargo test -p premium-discount-analytic` | 33 통과: 단위 24(시간 6 · BLOB 4 · 사건 3 · PUG 5 · 질의 6), 계약 2(BLOB 19 · PUG 13 사례), 퍼널 7(무작위 목록 · 우세한 선택 · 카드 안 링크 · 4.2 시나리오) |
+| www (`node --test www/tests/*.test.ts`) | 94 통과. 분석 10(다듬기 · 수집 · gzip · 다른 사이트 403 · 요청 제한 · meta 확인 · 세션 주인 · 커서 · BLOB 계약 · BUG-RT), 수집 스크립트 6(linkedom: PUG 계약 13 사례 · 조상 모양 · 목록 형제 · 거르기 · 크기) |
+| 실제 Chrome (headless, `playwright-core` + 설치된 Chrome) | 사건 13개(들어옴 · 카드 누름 · 쿠폰 3번 · 머묾 · 바꿈 3 · 스크롤 · 제출 · 떠남). 모두 `sanitizeEvent` 통과. 입력값 · 쿼리 · 비밀번호 · `data-pd-ignore` · 숨은 층 글 없음. 광클은 세 번째 쿠폰만, 떠남의 `dirty` 1. 원본 결함 네 가지(24-5)를 이 확인에서 찾음 |
+| 앱 `cargo test --release --lib` | 240 통과(기존 237 + 분석 3). 저장소 2(받기 · DELTA · TOMBSTONE · 구조화 · 검색, 어제 기간 리포트: 퍼널 40/40/40/30 · 병목 '쿠폰 적용' · 간편결제 premium), 명령 계층 1(사이트 · 커서대로 두 번 받기 · 리포트 · 지우기 · 저장소 없으면 not_ready). UI 계약 시험이 명령 21개를 모두 부름 |
+| `cd crates && cargo test --release --workspace` | 전부 통과, 경고 없음(새 analytic 33 포함, 실제 모델 granite · Stanza 시험 포함) |
+| 화면 (`app/ui`) · cron | 71 · 41 통과 |
+| `premium-discount-schema` | 8 통과 (명령 21개 = 계약 파일) |
+| src-tauri `cargo check` | 통과, 경고 없음 (분석 명령 4개 등록) |
+
+## 25. 신구 대체 연결 · 사이드카 검증 · 웹 분석과 내비게이션 (2026-11-18)
+
+### 25-1. 신구 대체(`Relation::Supersedes`) → PD-Verdict `superseded`
+
+같은 장소(cc) · 대상(to)의 새 평가가 옛 평가의 주장에서 수치 · 단위 · 형용사만 바꿨으면("피해 20% → 15%", "배송비 3,000원 → 무료") 옛 평가는
+근거와 상관없이 discount(grade −2, 이유 `superseded`)입니다. 판정 규칙(`premium-discount-verdict` · `cron/src/verdict.ts`)에는 입력이 이미
+있었고, 이번에 그 입력을 채우는 길을 이었습니다.
+
+```text
+Raon Zena 판정 보조 (Stanza · granite)                premium-discount-app / -mcp                      www · cron
+premium_discount_relay::supersessions ──pd_supersede──▶ cmd_supersede ──POST /evaluations/supersedes──▶ eval_supersedes (0009)
+  같은 cc · to 묶음, 시간순, 대체 쌍                    판정 캐시를 곧바로 discount −2                 → verdict_dirty → cron 판정 superseded
+```
+
+- **relay**: `supersessions(entries, embedder, cfg)` — 같은 cc · to 끼리 시간순(같으면 id 순)으로 놓고 평가마다 더 늦은 평가와 견줘, 한 옛 평가에
+  그것을 대체하는 가장 이른 새 평가 하나를 냅니다. 주장 규칙 세 가지를 고쳤습니다(실제 Stanza ko 로 "배송비 3,000원 → 무료" 가 Duplicate 로
+  나왔음): 숫자로 시작하는 수+단위(`3,000원`, `3,000원이다`)는 식별자 키가 아니라 값, 한국어 계사 서술어(`무료+이+다`)의 명사는 값, 주제어
+  (`dislocated`, 은/는)는 핵심어. 실제 모델(granite · Stanza ko)로 두 사례 모두 Supersedes.
+- **서버**: `POST /evaluations/supersedes {request_id, old, new}`. 비교는 Worker 에서 할 수 없어(모델 없음) 검증할 수 있는 것만 봅니다: 둘 다 저장이
+  끝난 평가, 같은 cc · to, new 가 더 늦음(400), 없는 평가(404), 확인된 로그인(게스트 401), 보고자는 두 평가 중 하나의 작성자(403 — 남의 평가를
+  마음대로 내리지 못하게). 같은 request_id 는 처음 답(200), 다른 쌍이면 409. 받으면 옛 평가를 `verdict_dirty` 에 표시하고, cron 은 판정 행을 읽을 때
+  `EXISTS (eval_supersedes …)` 를 함께 읽어 `judge(…, superseded)` 로 넘깁니다. 표가 하나도 없던 평가도 보고만으로 판정 행이 생겨 discount 가 됩니다.
+- **앱 · MCP**: 명령 `cmd_supersede {old, new}`(계약 22개째, Tauri 셸 · 화면 `supersede` 포함)와 도구 `pd_supersede`. request_id 는
+  `sup-` + sha256(old|new) 앞 48자라 다시 보내도 서버에는 한 번입니다. 서버가 받으면 판정 캐시를 곧바로 discount −2 로 바꾸고(다음 서버 판정도
+  같음), 연결이 없으면 `offline` 오류라 부른 쪽이 다음 동기화 때 다시 보냅니다. 서버의 4xx(408 · 429 빼고)는 `rejected`.
+- 바로잡은 것: `EvalBackend` 의 `Arc<T>` 위임에 새 메서드가 빠지면 기본 구현(지원 안 함)이 불립니다. 앱 시험이 이것을 잡았습니다.
+
+### 25-2. 사이드카(`externalBin`) 검증
+
+`sidecars.mjs` 를 시험할 수 있게 나눴습니다(`stage` · `stagedName` · `hostTriple`). `sidecars.test.mjs` 가 고정하는 약속: 빌드한 두 실행 파일을
+`binaries/<이름>-<삼중항>[.exe]` 로 옮김(Windows · 리눅스 · 교차 빌드 자리), 실행 파일이 없으면 그 경로를 알리고 멈춤, `tauri.sidecar.conf.json`
+의 `externalBin` 은 두 사이드카이고 빌드 전에 `sidecars.mjs` 를 부름, 기본 설정에는 사이드카가 없음, 설치 폴더(`productName` = `premium.discount`)와
+삼중항을 뗀 이름이 `find_pd_app` · `find_mcp_server` 가 찾는 것과 같음. 셸 `cargo check` 는 기본 설정, 사이드카 설정(`TAURI_CONFIG`)으로 모두 통과하고,
+`binaries/` 가 없으면 사이드카 설정은 "resource path … doesn't exist" 로 멈춥니다(그래서 기본 설정에서 뺀 것).
+
+### 25-3. 웹 분석과 접근성 내비게이션
+
+BLOB 코덱의 세 결함(50 바이트 이하 base64 gzip · `subarray` 오프셋 · `"42"`/`"null"` 원시값)과 DELTA GUARD 는 이미 시험(계약 19 사례 · www ·
+앱)으로 고정돼 있었습니다. 빠져 있던 것은 사건 → 내비게이션 코스의 끝에서 끝 시험이라 `crates/premium-discount-analytic/tests/funnel.rs` 에
+더했습니다: 고른 요소(TARGET)의 체크포인트가 nav 요소 해시(`page_hash` + `selector_template`)이고, 간편결제로 끝낸 30 · 쿠폰으로 늦게 끝낸 10 ·
+쿠폰 칸에서 떠난 10 세션에서 쿠폰 칸이 병목(discount)이며, 완주한 런들의 고스트 코스를 서버 규칙(`route_marks`)으로 견주면 간편결제 체크포인트가
+30 premium · 10 discount 라 결제 페이지에 막 들어온 방문자에게 nav `guide` 가 다음 단계로 간편결제를 premium 으로 권합니다.
+
+### 25-4. 검증
+
+| 묶음 | 결과 |
+| --- | --- |
+| `cd crates && cargo test --workspace` | 279 통과 · 0 실패 · 3 무시 (relay 단위 4 · 실제 모델 3 · 대체 → 판정 2, MCP 13, 분석 퍼널 8 포함) |
+| www · cron (`node --test www/tests/*.test.ts cron/test/*.test.ts`) | 139 통과 (대체 보고 4) |
+| 앱 `cargo test --lib` · 통합 | 241 통과 (`cmd_supersede` 1, UI 계약 22개 명령) |
+| 화면 `app/ui` 계약 · 사이드카 `node --test app/src-tauri/sidecars.test.mjs` | 4 · 4 통과 |
+| src-tauri `cargo check` | 기본 설정 · 사이드카 설정 통과 |
+
+## 26. 폴더 재배치: logis-center 와 같은 배치 (2026-11-19)
+
+자리와 연결만 바꿨습니다. 동작 · 계약 값 · 의존성 판(아래 26-3 의 통일 26개 빼고)은 그대로이고, TypeScript Worker 를 Rust 로 옮기는 일은 다음 단계입니다.
+파일은 `git mv` 로 옮겼고(첫 커밋은 옮기기만, 내용 그대로), 연결은 둘째 커밋에서 고쳤습니다.
+
+### 26-1. 옛 경로 → 새 경로
+
+| 옛 경로 | 새 경로 | 비고 |
+| --- | --- | --- |
+| `crates/Cargo.toml` · `app/Cargo.toml` · `app/src-tauri/Cargo.toml` (작업 공간 셋, `Cargo.lock` 셋) | 루트 `Cargo.toml` · `Cargo.lock` 하나 | 멤버: `crates/*` 19개 + `apps/core` + `apps/desktop` |
+| `app/src-tauri/.cargo/config.toml` (`target-dir = "../target"`) | 루트 `.cargo/config.toml` (`target-dir = "target"`) | 산출물은 루트 `target/` 하나 |
+| `app/` (`src` · `tests` · `examples` · `README.md`) | `apps/core` | `premium-discount-app` |
+| `app/src-tauri` | `apps/desktop` | `premium-discount-desktop`, `gen/android` 포함 |
+| `app/ui` | `web/desktop` | |
+| `www/public` | `web/www` | www Worker 의 `assets.directory` |
+| `www` | `workers/www` | `src` · `tests` · `package.json` · `wrangler*.json` · `tsconfig.json` · `worker-configuration.d.ts` |
+| `cron` | `workers/cron` | |
+| `www/migrations` | `workers/migrations` | www 의 `DB` 바인딩 `migrations_dir: "../migrations"`. cron 의 wrangler 는 마이그레이션을 쓰지 않아 그대로 |
+| `crates/` · `contracts/` · `test-support/` | 그대로 | |
+
+옛 빌드 폴더 `app/target`(14 GB) · `crates/target`(12 GB)은 지우지 않았습니다(무시되는 폴더). 새 빌드는 루트 `target/` 에 처음부터 생깁니다.
+
+### 26-2. 연결을 고친 곳
+
+- **Cargo**: `[workspace.dependencies]` 의 내부 crate 경로에 `crates/` 를 붙이고 `premium-discount-app = { path = "apps/core" }` 를 더했습니다. 코어의 내부 crate
+  의존 5개와 셸의 코어 의존은 `workspace = true` 로 바꿨고(같은 경로), 바깥 의존성의 판 · 기능은 각 매니페스트에 그대로 둡니다. 멤버는 글롭(`crates/*`) 대신
+  하나씩 적습니다: `crates/target` 처럼 `Cargo.toml` 없는 폴더가 있으면 글롭이 작업 공간을 깨뜨립니다.
+- **`[patch.crates-io]`**: 세 매니페스트의 candle 포크 줄(`ebaf93d`, candle-core · candle-nn)이 같은 값이라 루트 하나로 합쳤습니다.
+- **프로필**: 키가 겹치지 않아 합집합입니다. `[profile.dev] debug = 0` 과 `gemm-common` · `gemm-f16` opt 3(옛 app · src-tauri)이 이제 crates 의 디버그 빌드에도,
+  `candle-core` · `candle-nn` · `gemm` · `k256` · `elliptic-curve` · `crypto-bigint` · `tiny-keccak` opt 3(옛 crates)이 이제 앱의 디버그 빌드에도 걸립니다.
+- **Tauri**: `frontendDist` = `../../web/desktop/dist`. Tauri CLI 는 앞 명령(`beforeBuildCommand`)을 화면 폴더에서 돌리고, `apps/desktop` 아래에 `package.json` 이
+  없으면 그 폴더는 `tauri.conf.json` 폴더의 부모(`apps/`)라서 명령을 `npm --prefix ../web/desktop …` · `node desktop/sidecars.mjs` 로 적었습니다(전에는 `app/` 기준
+  `npm --prefix ui …` · `node src-tauri/sidecars.mjs`). `cargo tauri …` 는 전처럼 셸 폴더(`apps/desktop`)에서 부릅니다.
+- **사이드카(`sidecars.mjs`)**: 두 사이드카를 루트 `Cargo.toml` 로 빌드하고 루트 `target/[삼중항/]release` 에서 찾습니다(전에는 `app/target` · `crates/target`).
+  `sidecars.test.mjs` 는 가짜 빌드 자리를 작업 공간 하나로 바꾸고, 넘긴 매니페스트가 루트 `Cargo.toml` 인지도 봅니다.
+- **wrangler**: `assets.directory` = `../../web/www/`, `DB` 의 `migrations_dir` = `../migrations` (`wrangler.json` · `wrangler.test.json`).
+- **컴파일 시점 경로**: 코어의 `include_str!`(명령 계약 · 캐시 행 픽스처 → `../../../web/desktop/fixtures/…`), `premium-discount-schema` 계약 시험
+  (`../../../web/desktop/fixtures/command_contract.json`).
+- **Node 시험 · 스크립트**: `workers/{www,cron}` 시험의 `test-support` · `contracts` 경로(한 단계 더 위), `tracker.test.ts` 의 수집 스크립트(`web/www`),
+  `test-support/fakes.ts` 의 마이그레이션(`workers/migrations`), `gen_stage_cases.mjs` 의 `stage.ts`, 계약 생성기의 `workers/www/node_modules`,
+  화면 개발 브리지의 기본 실행 파일(`../../target/release`), E2E 스크립트의 `dev-server.mjs` · `jsQR` · `mock_server.py` 의 `contracts` 경로.
+- **문서 · 주석**: 저장소 루트 기준 경로(`app/…` · `www/…` · `cron/…`)를 새 경로로 바꿨습니다. 이 README 의 2 ~ 25절과 `apps/core/tests/SCENARIOS.md` 의 옛 기록은 두었습니다.
+- **바꾸지 않은 것**: `contracts/*.json`(raon-zena 가 `verdict_v1.json` 의 해시를 봅니다. `analytic_pug_v1.json` 의 note 는 옛 경로 `www/public/…` 그대로),
+  이미 적용된 `workers/migrations/*.sql` 의 주석, `web/desktop/fixtures/*.json`(Rust · 화면 시험이 함께 읽는 픽스처).
+
+### 26-3. Cargo.lock 합치기
+
+옛 세 잠금 파일의 항목을 합쳐 씨앗으로 두고 `cargo metadata` 로 정리했습니다. 새로 고른 판은 없고(모든 항목이 옛 잠금 셋 중 하나에 있음), 한 작업 공간에는
+semver 호환 판이 하나뿐이라 26개 이름이 한 판으로 모였습니다. 대부분 높은 쪽(옛 crates 쪽)이고, `crypto-common 0.1.7` 이 `generic-array =0.14.7` 을 고정해
+`generic-array` 만 낮은 쪽입니다.
+
+| 이름 | 옛 crates | 옛 app · src-tauri | 지금 |
+| --- | --- | --- | --- |
+| candle-kernels | 0.11.0 | 0.11.1 | 0.11.1 |
+| libloading (0.9) | 0.9.0 | app 0.9.0 · src-tauri 0.9.1 | 0.9.1 |
+| crypto-common | 0.1.6 | 0.1.7 | 0.1.7 |
+| generic-array | 0.14.9 | 0.14.7 | 0.14.7 |
+| cc · crc32fast · equivalent · errno · find-msvc-tools · flate2 · itoa · libc · log · memmap2 · rustls · rustls-pki-types · rustls-webpki · smallvec · syn(3) · typed-path · unicode-ident · unicode-width(0.2) · utf8_iter · webpki-roots(1) · zerocopy · zerocopy-derive | 높은 판 | 낮은 판 (예: cc 1.8.0, syn 3.0.7) | 옛 crates 의 판 (cc 1.11.2, syn 3.0.10 …) |
+
+그대로인 것: candle-core · candle-nn(포크 `ebaf93d`), candle-metal-kernels 0.11.1, lancedb 0.41.0, lance 14.0.2, arrow 58.4.1, datafusion 54.1.0, tauri 2.12.5,
+wry 0.57.2, tokenizers 0.22.2, safetensors 0.8.0 · 0.4.5, half 2.7.1, tokio 1.53.2, reqwest 0.12.28 · 0.13.5, onnxruntime · onnxruntime-sys 0.0.14(경로).
+
+### 26-4. 검증
+
+모두 옮기기 전(옛 배치)과 뒤(새 배치)에 같은 PC 에서 돌려 견줬습니다.
+
+| 묶음 | 옮기기 전 | 옮긴 뒤 |
+| --- | --- | --- |
+| www (`node --experimental-strip-types --import ./test-support/ts-resolve.mjs --test workers/www/tests/*.test.ts`) | 98 통과 | 98 통과 (시험 이름 같음) |
+| cron (같은 명령, `workers/cron/test/*.test.ts`) | 41 통과 | 41 통과 |
+| 화면 (`cd web/desktop && npm test`) | 71 통과 | 71 통과 |
+| 사이드카 (`node --test apps/desktop/sidecars.test.mjs`) | 4 통과 | 4 통과 |
+| 라이브러리 crate (`cargo test --workspace --exclude premium-discount-app --exclude premium-discount-desktop -j 2`, 전에는 `cd crates && cargo test --workspace -j 2`) | 279 통과 · 3 무시 (시험 실행 파일 49) | 279 통과 · 3 무시, 시험마다 결과 같음 |
+| `cargo metadata` | — | 성공, 멤버 21 |
+| `cargo check --workspace --all-targets --keep-going -j 2` | — | 실패 2건, 둘 다 옮기기와 무관한 기존 결함: `onnxruntime-sys` 의 lib test(`[lib] test = false` 인데 `--all-targets` 가 강제로 묶음, bindgen 레이아웃 시험의 `deref_nullptr`) · `apps/core/examples/quant_probe.rs`(`LoadOptions` 에 `tower_bits` 가 빠짐, 파일은 내용 그대로 옮김). 나머지 대상은 모두 통과 |
+| `cargo check -p premium-discount-desktop --all-targets -j 2` | — | 통과 (`frontendDist` 확인). `TAURI_CONFIG` 로 사이드카 설정을 넣어도 통과하고, tauri-build 가 `apps/desktop/binaries/*` 를 루트 `target/debug` 로 복사 |
+| `tsc` (workers/www · workers/cron) | www 96 오류(레거시 `index.ts` 등) · cron 0 | 같음 (경로만 다름) |
+| `wrangler deploy --dry-run` (www · www 시험 설정 · cron) | 정적 파일 15개, 묶음 1043.27 KiB | 정적 파일 15개(`web/www`), 묶인 `index.js` 세 개 모두 바이트 같음 |
+| `wrangler d1 migrations list DB --local` | 0001 ~ 0009 | 0001 ~ 0009 (`workers/migrations`) |
+| 생성기 (`gen_wallet_v1.mjs` · `gen_analytic_blob_v1.mjs` · `gen_stage_cases.mjs`) | — | 계약 파일 그대로, `stage_cases.json` 은 note 의 경로 한 줄만 다름 |
+
+앱 코어 단위 시험(`cargo test -p premium-discount-app --lib`)은 이번에 돌리지 않았습니다. 디스크 여유가 5 GB 이고 앱 디버그 시험 빌드는 7 GB 남짓이라서입니다
+(옛 `app/target` 14 GB · `crates/target` 12 GB 는 지우지 않음). 코어의 lib · 시험 · 예제(quant_probe 빼고)는 위 `cargo check` 로 컴파일을 확인했습니다.
+
+## 27. cron · www Worker 를 Rust(workers-rs)로 (2026-11-19)
+
+`workers/cron` 을 workers-rs 0.8.7 로 다시 썼습니다(logis-center 와 같은 방식). `workers/` 는 자기 Cargo 작업 공간(wasm32, 루트의 `exclude`)이고,
+공용 층 `workers/common`(premium-discount-worker-common)은 logis-center `workers/common`(370d67a3)에서 옮겨 와 이제 이 저장소가 주인입니다.
+판정은 `premium-discount-verdict` crate 를 그대로 씁니다(초월 함수 고리 `Math` · `evidence_in` · `judge_in` 를 더해 cron 은 JS 의 `Math` 를 넘김).
+원본 TS(0538044)와 Miniflare 차분 시험(`scripts/workers-diff`, `node cron.mjs`)으로 47개 시나리오가 같고, 원본 버그 둘
+(기다리지 않은 `return reject` · 프로토타입을 거치는 가중치 조회)을 고쳤습니다.
+
+`workers/www` 도 같은 방식으로 Rust 로 옮겼습니다(원본 35781c0): 1단계(뼈대 · 세션 · 인증 · 요청 제한 · 레거시 처리기)와 2단계(evaluations · navtrials ·
+graph · analytic). 원본 버그 일곱을 고쳤고, 보안 · 경합 고침 둘을 더했습니다 — 지갑 서명 한 번만 쓰기(서명 글에 쿼리가 없어 잡은 서명을 다른 쿼리로
+다시 보낼 수 있던 것, 새 표 `wallet_nonces` = migrations/0010)와 타임트라이얼의 조건 건 쓰기(동시 요청이 수를 잃거나 두 번 등록하던 것).
+고친 원본과 차분 시험 227개가 같습니다. 배포 전에 0010 을 D1 에 적용해야 합니다. TS 원본(`src/*.ts`)과 node 시험은 남겼습니다.
+구조 · 빌드 · 시험대 · 고친 버그 · 알려진 차이는 [`docs/workers-rs.md`](docs/workers-rs.md).

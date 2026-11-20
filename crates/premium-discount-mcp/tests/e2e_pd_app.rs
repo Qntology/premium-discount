@@ -1,5 +1,5 @@
 //! End to end with the real premium-discount-app (LanceDB outbox, embeddinggemma-2) against
-//! premium-discount's fake server (`app/tests/e2e/mock_server.py`). Opt-in: it needs the app binary, the model
+//! premium-discount's fake server (`apps/core/tests/e2e/mock_server.py`). Opt-in: it needs the app binary, the model
 //! and a running fake server, so it returns early unless all three are given:
 //!
 //! ```text

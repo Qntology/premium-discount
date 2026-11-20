@@ -1,6 +1,6 @@
 //! The `cc` (domain) of a premium.discount evaluation.
 //!
-//! The server accepts only a registrable domain (`www/src/evaluations.ts`:
+//! The server accepts only a registrable domain (`workers/www/src/evaluations.ts`:
 //! `^([a-z0-9-]{1,63}\.)+[a-z]{2,63}$`, at most 64 characters) and premium-discount-app is stricter (no label
 //! starting or ending with `-`). Raon Zena talks about three kinds of places, mapped as:
 //!

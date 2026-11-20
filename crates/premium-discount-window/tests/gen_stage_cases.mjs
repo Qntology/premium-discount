@@ -1,11 +1,11 @@
-// stage_cases.json 만들기: app/ui/stage.ts 의 지금 동작을 그대로 적는다.
-// Rust(tests/stage_cases.rs)와 TS(app/ui/stage.test.ts)가 이 표 하나를 읽어 같은 답을 내는지 본다.
+// stage_cases.json 만들기: web/desktop/stage.ts 의 지금 동작을 그대로 적는다.
+// Rust(tests/stage_cases.rs)와 TS(web/desktop/stage.test.ts)가 이 표 하나를 읽어 같은 답을 내는지 본다.
 // stage.ts 를 고쳤으면 다시 만들고, 바뀐 줄을 Rust 쪽(src/stage.rs)에도 옮긴다. 표를 손으로 고치지 않는다.
 //
 // 실행 (premium-discount 폴더에서): node --experimental-strip-types crates/premium-discount-window/tests/gen_stage_cases.mjs
 import { writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { DOCK_MARGIN, DRAG_THRESHOLD, STAGE_SIZE, classifyPointer, growsTo, nextStage, placeWindow } from '../../../app/ui/stage.ts'
+import { DOCK_MARGIN, DRAG_THRESHOLD, STAGE_SIZE, classifyPointer, growsTo, nextStage, placeWindow } from '../../../web/desktop/stage.ts'
 
 const stages = [0, 1, 2]
 const events = ['pill', 'feed-top', 'expand', 'escape', 'collapse']
@@ -94,7 +94,7 @@ const grows_to = []
 for (const from of stages) for (const to of stages) grows_to.push({ from, to, expected: growsTo(from, to) })
 
 const out = {
-	note: 'app/ui/stage.ts 의 동작을 tests/gen_stage_cases.mjs 로 적은 표. 손으로 고치지 말고 다시 만든다',
+	note: 'web/desktop/stage.ts 의 동작을 tests/gen_stage_cases.mjs 로 적은 표. 손으로 고치지 말고 다시 만든다',
 	constants: { stage_size: stages.map((s) => STAGE_SIZE[s]), dock_margin: DOCK_MARGIN, drag_threshold: DRAG_THRESHOLD },
 	place_window,
 	next_stage,

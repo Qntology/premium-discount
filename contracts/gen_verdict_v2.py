@@ -11,8 +11,8 @@
 #    스코프는 영역이면 secondary = cc + 화면 키, primary = cc 이고, 화면이면 secondary 없이 primary = cc 다
 #
 # v1 의 사례는 v2 에서도 결과가 같아야 한다 (그 사례가 쓰는 트랙 · 종류의 값이 같으므로). main()이 확인한다.
-# 서버(cron/src/verdict.ts)는 아직 v1 로 판정한다. TypeScript 구현은 이 파일의 params 를 넘겨 v2 사례를 통과한다
-# (cron/test/verdict_v2.test.ts). premium-discount 의 crates/premium-discount-verdict 는 Params::v2() 로 같은 사례를 통과한다.
+# 서버(workers/cron/src/verdict.ts)는 아직 v1 로 판정한다. TypeScript 구현은 이 파일의 params 를 넘겨 v2 사례를 통과한다
+# (workers/cron/test/verdict_v2.test.ts). premium-discount 의 crates/premium-discount-verdict 는 Params::v2() 로 같은 사례를 통과한다.
 
 import copy
 import json

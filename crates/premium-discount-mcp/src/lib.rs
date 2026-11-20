@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! raon-zena ──McpClient (stdio JSON-RPC 2.0)──▶ premium-discount-mcp ──serve_lines (stdio JSON lines)──▶ premium-discount-app
-//!   SyncLoop (coalesced, 10 s while work)          9 pd_* tools, cc / hashId,         LanceDB outbox (original text, votes),
+//!   SyncLoop (coalesced, 10 s while work)         10 pd_* tools, cc / hashId,         LanceDB outbox (original text, votes),
 //!                                                  GET /graph                         verdict cache, embeddinggemma-2, QR login
 //!                                                         │                                    │
 //!                                                         └──────────── HTTPS ─────────────────┴──▶ premium.discount
@@ -64,7 +64,7 @@ pub fn default_home() -> std::path::PathBuf {
 /// The file in `--home` that may name premium-discount-app: `{"pd_app": "C:\\...\\premium-discount-app.exe"}`.
 pub const PD_APP_CONFIG: &str = "pd-app.json";
 
-/// The installer's product name (premium-discount `app/src-tauri/tauri.conf.json` `productName`), which the
+/// The installer's product name (premium-discount `apps/desktop/tauri.conf.json` `productName`), which the
 /// Tauri installers use as the install folder.
 pub const PD_PRODUCT_NAME: &str = "premium.discount";
 
@@ -77,7 +77,7 @@ pub const PD_PRODUCT_NAME: &str = "premium.discount";
 /// 5. the bare name, so `PATH` decides.
 ///
 /// Steps 3 and 4 only return a file that exists. The desktop installer carries the core (and this server) as
-/// sidecars when it is built with `app/src-tauri/tauri.sidecar.conf.json`; a window-only build has neither, and
+/// sidecars when it is built with `apps/desktop/tauri.sidecar.conf.json`; a window-only build has neither, and
 /// step 5 applies.
 pub fn find_pd_app() -> std::path::PathBuf {
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
