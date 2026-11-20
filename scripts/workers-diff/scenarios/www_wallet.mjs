@@ -1,7 +1,7 @@
 // fix-wallet-replay — 지갑 서명 한 번만 쓰기 (auth.rs verify_wallet_request_once · fixes/www_security.mjs). 지갑 서명을 받는 경로는
 // /nav/trials(GET · POST · DELETE)와 /analytic/sites · /analytic/events 의 주인 쪽이다. 서명 글에는 경로만 있고 쿼리가 없어
 // (contracts/wallet_v1.json), 원본은 잡은 서명을 5분 안에 다른 쿼리로 다시 보내도 받았다. 고친 판은 서명한 글의 SHA-256 을
-// wallet_nonces 에 서명 시각 + 5분까지 기억해 다시 쓰면 401 (틀린 서명과 같은 답).
+// wallet_nonces 에 서명 시각 + 5분 + 60초(시계 차이 여유)까지 기억해 다시 쓰면 401 (틀린 서명과 같은 답).
 // 모든 시나리오가 ORIGINAL=raw 에서 달라야 한다 (원본은 다시 쓴 서명을 받고 wallet_nonces 를 쓰지 않는다). 모양은 www_common.mjs 머리말.
 import { createHmac } from "node:crypto";
 import { ethers } from "ethers";
@@ -11,6 +11,8 @@ const M = "wallet";
 const FIX = ["fix-wallet-replay"];
 const MINUTE = 60_000;
 const SKEW = 5 * MINUTE;
+// 키를 서명 창 뒤로 더 두는 여유 (auth.rs WALLET_NONCE_GRACE_MS) — 지우기에만 쓴다
+const GRACE = MINUTE;
 const APP = "0x39206c971297059b89e4e6fc35844ee87feb0407";
 const APP2 = "0x" + "9".repeat(40);
 const PHRASE = WALLET_PHRASES[0];
@@ -83,12 +85,15 @@ export default [
     name: "www_wallet_replay_after_window", module: M, fixes: FIX, bindings: SECRETS,
     covers: [],
     // 서명 시각 + 5분(경계 포함)까지는 키가 남아 다시 쓰기를 막고, 그 뒤로는 시각 검사가 먼저 막는다(D1 에 닿지 않음).
-    // 그 뒤의 새 서명이 기한 지난 키를 지운다 (끝 상태에는 새 키 하나)
+    // 키는 60초 여유(GRACE)까지 남는다: 5분 + 1 ms 의 새 서명은 옛 키를 지우지 못하고, 5분 + 60초 + 1 ms 의 새 서명이 지운다
+    // (끝 상태에는 새 키 둘)
     requests: [
       { ...getMine, at: T0 },
       replay(getMine, { at: T0 + SKEW }),
       replay(getMine, { at: T0 + SKEW + 1 }),
       await signed("GET", "/nav/trials", { query: `?app=${APP}`, time: T0 + SKEW + 1, at: T0 + SKEW + 1 }),
+      replay(getMine, { at: T0 + SKEW + GRACE }),
+      await signed("GET", "/nav/trials", { query: `?app=${APP}`, time: T0 + SKEW + GRACE + 1, at: T0 + SKEW + GRACE + 1 }),
     ],
   },
   {
@@ -105,7 +110,7 @@ export default [
     name: "www_wallet_replay_race", module: M, fixes: FIX, bindings: SECRETS,
     covers: [],
     // 같은 요청 둘이 동시에: 다른 하나가 우리 키 잡기 바로 앞에 같은 키를 잡는다 → 우리는 바뀐 행 0 → 401. 둘 중 하나만 통과한다 (끝 상태에 키 하나)
-    race: { match: "INSERT INTO wallet_nonces", op: "batch", before: [{ sql: NONCE_INSERT, args: [nonceOf("GET", "/nav/trials"), T0 + SKEW] }] },
+    race: { match: "INSERT INTO wallet_nonces", op: "batch", before: [{ sql: NONCE_INSERT, args: [nonceOf("GET", "/nav/trials"), T0 + SKEW + GRACE] }] },
     requests: [getMine],
   },
   {

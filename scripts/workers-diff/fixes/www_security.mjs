@@ -2,7 +2,7 @@
 // 모양은 fixes/www.mjs 와 같다 ({ id, worker: "www", file, find, replace, count? }). find 가 정규식이면 그대로 맞춘다.
 //
 // fix-wallet-replay: 지갑 서명 글에는 경로만 있고 쿼리가 없어(contracts/wallet_v1.json), 잡은 DELETE /nav/trials?app=X 를 5분 안에
-//   DELETE /nav/trials 로 다시 보내면 콜렉션 전부가 지워졌다. 서명한 글의 SHA-256 을 서명 시각 + 5분까지 wallet_nonces(0010)에 기억해
+//   DELETE /nav/trials 로 다시 보내면 콜렉션 전부가 지워졌다. 서명한 글의 SHA-256 을 서명 시각 + 5분 + 60초까지 wallet_nonces(0010)에 기억해
 //   다시 쓰면 틀린 서명과 같이 null(→ 401). 기한 지난 키 지우기(10개까지)와 키 잡기(INSERT … ON CONFLICT DO NOTHING)는 batch 하나.
 // fix-nav-lost-update: storeRuns 가 읽은 값으로 계산한 절대값을 upsert 해(excluded."runs" · "sums" …) 동시에 들어온 요청의 수를 잃었고,
 //   같은 사용자의 동시 요청 둘이 모두 처음 등록으로 셌다. 등록은 batch 앞에서 잡고(바뀐 행 1 = 처음), 수는 상대 갱신, 읽은 값에서
@@ -366,12 +366,12 @@ export default [
       "\treturn address",
       "}",
       "",
-      "// 받은 서명(서명한 글의 SHA-256)을 서명 시각 + 5분까지 기억한다. 바뀐 행이 1 이면 처음 쓰는 서명이다. 기한 지난 키는 요청마다 10개까지 지운다",
+      "// 받은 서명(서명한 글의 SHA-256)을 서명 시각 + 5분 + 60초(시계 차이 여유, 지우기에만 씀)까지 기억한다. 바뀐 행이 1 이면 처음 쓰는 서명이다. 기한 지난 키는 요청마다 10개까지 지운다",
       "async function claimWalletNonce(db: D1Database, message: string, timeMs: number, nowMs: number): Promise<boolean> {",
       "\tconst nonce = await sha256Hex(new TextEncoder().encode(message))",
       "\tconst out = await db.batch([",
       "\t\tdb.prepare('DELETE FROM wallet_nonces WHERE \"nonce\" IN (SELECT \"nonce\" FROM wallet_nonces WHERE \"expires_at\" < ?1 LIMIT 10)').bind(nowMs),",
-      "\t\tdb.prepare('INSERT INTO wallet_nonces (\"nonce\", \"expires_at\") VALUES (?1, ?2) ON CONFLICT DO NOTHING').bind(nonce, timeMs + WALLET_MAX_SKEW_MS),",
+      "\t\tdb.prepare('INSERT INTO wallet_nonces (\"nonce\", \"expires_at\") VALUES (?1, ?2) ON CONFLICT DO NOTHING').bind(nonce, timeMs + WALLET_MAX_SKEW_MS + 60_000),",
       "\t])",
       "\treturn Number(out[1]?.meta?.changes ?? 0) === 1",
       "}",

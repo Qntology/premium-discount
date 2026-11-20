@@ -8,7 +8,7 @@
 
 use premium_discount_worker_common::jsv::{from_json, stringify, V};
 use premium_discount_worker_common::web::Req;
-use premium_discount_worker_www::auth::{verify_message, verify_wallet_request, verify_wallet_signature, wallet_request_message, WALLET_MAX_SKEW_MS};
+use premium_discount_worker_www::auth::{verify_message, verify_wallet_request, verify_wallet_signature, wallet_request_message, WALLET_MAX_SKEW_MS, WALLET_NONCE_GRACE_MS};
 use premium_discount_worker_www::blob::decode_blob;
 use premium_discount_worker_www::render::render_html;
 use serde_json::Value;
@@ -102,9 +102,11 @@ fn wallet_replay_key_is_the_signed_message() {
         let s = verify_wallet_signature(&req, &body, t).expect("계약 서명");
         let want: String = Sha256::digest(r["message"].as_str().unwrap().as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(s.nonce, want, "키 = 서명한 글의 SHA-256");
-        assert_eq!(s.expires_at, t + WALLET_MAX_SKEW_MS, "기한 = 서명 시각 + 5분 (시각 검사가 받는 마지막 때)");
-        assert_eq!(verify_wallet_signature(&req, &body, s.expires_at).map(|x| x.nonce), Some(want.clone()), "기한까지는 시각 검사를 지난다");
-        assert_eq!(verify_wallet_signature(&req, &body, s.expires_at + 1.0), None, "기한 뒤로는 시각 검사가 막는다");
+        assert_eq!(WALLET_NONCE_GRACE_MS, 60_000.0);
+        assert_eq!(s.expires_at, t + WALLET_MAX_SKEW_MS + WALLET_NONCE_GRACE_MS, "지우는 때 = 서명 시각 + 5분 + 60초 여유");
+        let last = t + WALLET_MAX_SKEW_MS;
+        assert_eq!(verify_wallet_signature(&req, &body, last).map(|x| x.nonce), Some(want.clone()), "서명 시각 + 5분까지는 시각 검사를 지난다");
+        assert_eq!(verify_wallet_signature(&req, &body, last + 1.0), None, "그 뒤로는(여유 안이라도) 시각 검사가 막는다");
         // 쿼리만 바꾼 다시 보내기는 같은 글 → 같은 키 (fix-wallet-replay 가 막는 꼴)
         let path = format!("{}?app=0x{}", r["path"].as_str().unwrap(), "9".repeat(40));
         let (q, _) = signed(r, None, Some(&path), &[]);

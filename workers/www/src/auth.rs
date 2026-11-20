@@ -251,8 +251,8 @@ mod wasm {
     ///
     /// 고침(fix-wallet-replay): 원본 `verifyWalletRequest`(auth.ts 209)는 같은 서명을 다시 보내는 것을 막지 않았다. 서명 글에는 경로만 있고
     /// 쿼리가 없어(contracts/wallet_v1.json), 잡은 `DELETE /nav/trials?app=X` 를 5분 안에 `DELETE /nav/trials` 로 다시 보내면 콜렉션 전부가
-    /// 지워졌다. 계약은 그대로 두고, 받은 서명(서명한 글의 SHA-256)을 시각 검사가 받는 동안(서명 시각 + 5분) D1 wallet_nonces 에 기억해
-    /// 다시 쓰면 서명이 틀린 것과 같이(None → 각 경로의 401) 막는다. 서명 확인을 먼저 해 틀린 서명은 D1 에 닿지 않는다.
+    /// 지워졌다. 계약은 그대로 두고, 받은 서명(서명한 글의 SHA-256)을 시각 검사가 받는 동안(서명 시각 + 5분)과 60초 여유까지 D1 wallet_nonces 에 기억해
+    /// 다시 쓰면 서명이 틀린 것과 같이(None → 각 경로의 401) 막는다 (60초 여유는 지우기에만 쓴다 — isolate 사이 시계 차이). 서명 확인을 먼저 해 틀린 서명은 D1 에 닿지 않는다.
     /// 기한 지난 키 지우기와 키 잡기는 batch 하나(한 번 오감)이고, 잡기는 `INSERT … ON CONFLICT DO NOTHING` 의 바뀐 행 수로 본다 —
     /// 같은 요청 둘이 동시에 와도 하나만 1 을 받는다. D1 이 던지면 그대로 샌다(각 경로의 try 안이라 500)
     pub async fn verify_wallet_request_once(req: &Req, env: &Env, body: &[u8], now_ms: f64) -> R<Option<String>> {
@@ -270,6 +270,9 @@ mod wasm {
 
 pub const WALLET_REQUEST_VERSION: &str = "premium.discount request v1";
 pub const WALLET_MAX_SKEW_MS: f64 = 300_000.0;
+/// 고침(fix-wallet-replay): 한 번만 쓰기 키를 서명 창(서명 시각 + 5분) 뒤로도 더 두는 여유. 받는지는 시각 검사(±5분)만 정하고,
+/// 이 여유는 지우기에만 쓴다 — 시계가 조금 늦은 다른 isolate 가 막 지운 키의 서명을 받는 틈을 막는다
+pub const WALLET_NONCE_GRACE_MS: f64 = 60_000.0;
 
 /// `walletRequestMessage(address, timeMs, method, path, body)`
 pub fn wallet_request_message(address: &str, time_ms: f64, method: &str, path: &str, body: &[u8]) -> String {
@@ -339,7 +342,8 @@ pub struct WalletSignature {
     /// 한 번만 쓰기의 키: 서명한 글의 SHA-256 hex. 서명 바이트가 아니라 글이라, 같은 글의 다른 서명 꼴(v 27 ↔ 0 · 35 이상, n − s,
     /// 16진 대소문자 — 모두 [`verify_message`] 가 받는다)도 같은 키다
     pub nonce: String,
-    /// 이 서명을 시각 검사가 받는 마지막 때 (ms) = 서명 시각 + [`WALLET_MAX_SKEW_MS`]. 그 뒤로는 시각 검사가 먼저 막는다
+    /// 키를 지워도 되는 때 (ms) = 서명 시각 + [`WALLET_MAX_SKEW_MS`] + [`WALLET_NONCE_GRACE_MS`]. 시각 검사는 서명 시각 + 5분 뒤로 이미 막으므로
+    /// 60초는 isolate 사이 시계 차이를 위한 여유다 (받는지는 이 값이 아니라 시각 검사가 정한다)
     pub expires_at: f64,
 }
 
@@ -361,7 +365,7 @@ pub fn verify_wallet_signature(req: &Req, body: &[u8], now_ms: f64) -> Option<Wa
     if verify_message(&message, &signature)? != address {
         return None;
     }
-    Some(WalletSignature { address, nonce: hex(&Sha256::digest(message.as_bytes())), expires_at: time_ms + WALLET_MAX_SKEW_MS })
+    Some(WalletSignature { address, nonce: hex(&Sha256::digest(message.as_bytes())), expires_at: time_ms + WALLET_MAX_SKEW_MS + WALLET_NONCE_GRACE_MS })
 }
 
 /// `verifyWalletRequest(request, body, nowMs)` 의 서명 확인만 — 지갑 서명이 맞으면 그 주소(소문자), 아니면 None.
