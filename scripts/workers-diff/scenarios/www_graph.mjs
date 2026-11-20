@@ -127,6 +127,31 @@ const BIG_SEED = Array.from({ length: 205 }, (_, i) =>
   i === 0 ? evaluation({ id: BIG_ROOT, cc: "big.example", created_at: 100 }) : evaluation({ id: bigId(i), cc: "big.example", ref: bigId(i % 3), root: BIG_ROOT, created_at: 100 + i, from: `0x${String(i % 4).padStart(40, "0")}` })
 );
 
+// fix-graph-local-window 의 스레드들
+// DEEP: 뿌리 DEEP(0) ← 사슬 DEEP(1..30)(각각 앞 것의 답글, 가장 오래됨) + 뿌리에 단 답글 F(1..220)(더 새것, 두 건씩 같은 시각) = 251건
+const deepId = (i) => `0190f0a4-0000-7000-8000-${String(i).padStart(12, "0")}`;
+const fillId = (j) => `0190f0a4-0000-7000-8001-${String(j).padStart(12, "0")}`;
+const DEEP_SEED = [
+  ...Array.from({ length: 31 }, (_, i) =>
+    evaluation({ id: deepId(i), cc: "deep.example", ref: i ? deepId(i - 1) : null, root: deepId(0), created_at: 1_000 + i, from: `0x${String(i % 3).padStart(40, "0")}` })),
+  ...Array.from({ length: 220 }, (_, k) =>
+    evaluation({ id: fillId(k + 1), cc: "deep.example", ref: deepId(0), root: deepId(0), created_at: 2_000 + Math.floor((k + 1) / 2), from: `0x${String(k % 5).padStart(40, "0")}` })),
+  verdict({ eval_id: deepId(30), cc: "deep.example", tier: "premium", grade: 2 }),
+  verdict({ eval_id: deepId(0), cc: "deep.example", tier: "discount", grade: -1 }),
+];
+// LINE: 한 줄로 이어진 205건 (LINE(i) 는 LINE(i-1) 의 답글) — 사슬이 200보다 길다
+const lineId = (i) => `0190f0a5-0000-7000-8000-${String(i).padStart(12, "0")}`;
+const LINE_SEED = Array.from({ length: 205 }, (_, i) =>
+  evaluation({ id: lineId(i), cc: "line.example", ref: i ? lineId(i - 1) : null, root: lineId(0), created_at: 5_000 + i }));
+// 경계: 200건 스레드와 201건 스레드, 시각이 모두 같다(같은 시각의 차례가 원본과 같은지 — 200건은 원본 그대로여야 한다)
+const edgeId = (t, i) => `0190f0a6-0000-7000-800${t}-${String(i).padStart(12, "0")}`;
+const EDGE_SEED = [200, 201].flatMap((n, t) =>
+  Array.from({ length: n }, (_, i) => evaluation({ id: edgeId(t, i), cc: "edge.example", ref: i ? edgeId(t, (i - 1) % 7) : null, root: edgeId(t, 0), created_at: 9_000 })));
+
+// fix-graph-similar-phantom: D1 에 행이 없는 결과 둘(하나는 판정 행만 남은 고아)
+const GHOST = "0190f0a0-0000-7000-8000-0000000000e1";
+const GHOST_RATED = "0190f0a0-0000-7000-8000-0000000000e2";
+
 export default [
   // ---- graph.test.ts ----
   {
@@ -152,12 +177,14 @@ export default [
   },
   {
     name: "graph_local_thread", module: M,
+    fixes: ["fix-graph-local-window"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["graph.test.ts: /graph/local: 스레드의 평가만 센다", "SCENARIOS GR-07"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH,
     requests: [get(`/graph/local?id=${B}`), get(`/graph/local?id=${LONE}`)],
   },
   {
     name: "graph_similar_tiers", module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["graph.test.ts: /graph/similar: 유사 노드에도 tier·grade가 붙고 summary는 유사 노드만 센다 · 자기 자신(A)은 빠진다 · 엣지 차례 LONE, ROOT, B"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH,
     vectors: { [A]: { values: unitVector(2) } },
@@ -184,12 +211,14 @@ export default [
   },
   {
     name: "graph_mcp_local", module: M,
+    fixes: ["fix-graph-local-window"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["premium-discount-mcp: mode local → GET /graph/local?id=<소문자 UUID> (가운데 평가 · 답글의 답글)"],
     bindings: SECRET, limits: READ, sql: MCP_SEED,
     requests: [mcp(`/graph/local?id=${MCP_IDS[2]}`), mcp(`/graph/local?id=${MCP_IDS[3]}`)],
   },
   {
     name: "graph_mcp_similar", module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["premium-discount-mcp: mode similar → GET /graph/similar?id=…&topK=5 · top_k 없으면 10 · 1 · 49 (서버와 같은 검사 범위)"],
     bindings: SECRET, limits: READ, sql: MCP_SEED, vectors: MCP_VECTORS, vec: vecStore(),
     requests: [mcp(`/graph/similar?id=${MCP_IDS[0]}&topK=5`), mcp(`/graph/similar?id=${MCP_IDS[0]}&topK=10`), mcp(`/graph/similar?id=${MCP_IDS[3]}&topK=1`), mcp(`/graph/similar?id=${MCP_IDS[3]}&topK=49`)],
@@ -204,6 +233,7 @@ export default [
   // ---- 가장자리 ----
   {
     name: "graph_bad_params", module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS GR-02 (cc 형식 오류 400) · GR-09 (id 형식 오류 400) · GR-11 (topK 0 · 50 → 400, 최대 49)"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
     requests: [
@@ -217,6 +247,7 @@ export default [
   },
   {
     name: "graph_query_decoding", module: M,
+    fixes: ["fix-graph-local-window", "fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // searchParams.get: + 는 공백 · %xx 풀기 · 처음 것. parseDomain 은 trim · 소문자, parseUuid 는 대문자 UUID 를 소문자로
     bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
     requests: [
@@ -244,6 +275,7 @@ export default [
   },
   {
     name: "graph_similar_cosine", module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS GR-10 (유사 그래프: 자기 자신 제외, 같은 cc) · topK 기본 10 → query topK 11 · topK 2 → 3 · 49 → 50"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
     requests: [get(`/graph/similar?id=${A}`), get(`/graph/similar?id=${A}&topK=2`), get(`/graph/similar?id=${A}&topK=49`), get(`/graph/similar?id=${C}&topK=1`)],
@@ -259,7 +291,9 @@ export default [
   },
   {
     name: "graph_similar_phantom", module: M,
-    covers: ["SCENARIOS GR-13 (벡터는 있는데 D1 행이 없음 → 노드로 나옴, D1 을 확인하지 않음 · 판정 없음 unrated)"],
+    fixes: ["fix-graph-similar-phantom"],
+    // 원본은 D1 행 없는 벡터(MISSING)를 판정 없는(unrated) 노드로 냈다 — 고친 판은 그 결과를 빼고 남은 둘만
+    covers: ["SCENARIOS GR-13 (벡터는 있는데 D1 행이 없음 → 고친 판은 노드에서 뺀다)"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH,
     vectors: { ...SMALL_VECTORS, [MISSING]: { values: v4(0.95, 0.05, 0, 0), metadata: { cc: "example.com" } } },
     vec: vecStore(),
@@ -268,6 +302,8 @@ export default [
   {
     name: "graph_similar_empty", module: M,
     // 자기 자신만 나오면 빈 그래프이고 판정 조회(IN)를 하지 않는다 · 같은 id 가 여러 번 · 대문자 id 는 자기 자신이 아니다
+    // (fix-graph-similar-phantom 뒤로 대문자 id 는 D1 에 그 글의 행이 없어 빠진다)
+    fixes: ["fix-graph-similar-phantom"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH,
     vectors: { [A]: { values: v4(1, 0, 0, 0), metadata: { cc: "example.com" } } },
     vec: vecStore({
@@ -280,6 +316,7 @@ export default [
   },
   {
     name: "graph_secret_missing", module: M,
+    fixes: ["fix-graph-local-window", "fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS GR-14 · CF-05 (AUTHOR_KEY_SECRET 없음 → 500 internal error, 행이 없으면 200 · similar 는 비밀을 쓰지 않음)"],
     bindings: { AUTHOR_KEY_SECRET: undefined }, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
     requests: [get("/graph?cc=example.com"), get(`/graph/local?id=${A}`), get("/graph?cc=nobody.example"), get(`/graph/similar?id=${A}&topK=2`)],
@@ -291,7 +328,9 @@ export default [
   },
   {
     name: "graph_limit_200", module: M,
-    covers: ["SCENARIOS GR-03 (200건 초과 → 최신 200건만, DESC) · GR-06 (부모가 응답에 없으면 reply 없음) · 스레드는 오래된 200건(ASC)"],
+    // 원본의 스레드는 오래된 200건(ASC)이라 고른 bigId(204) 가 응답에 없었다 — 고친 판은 그것과 뿌리(부모) + 가장 새 198건
+    fixes: ["fix-graph-local-window"],
+    covers: ["SCENARIOS GR-03 (200건 초과 → 최신 200건만, DESC) · GR-06 (부모가 응답에 없으면 reply 없음) · 스레드는 고른 평가 · 조상 + 가장 새 것"],
     bindings: SECRET, limits: READ, sql: BIG_SEED,
     requests: [get("/graph?cc=big.example"), get(`/graph/local?id=${bigId(204)}`)],
   },
@@ -310,6 +349,7 @@ export default [
   },
   {
     name: "graph_d1_faults", module: M,
+    fixes: ["fix-graph-local-window", "fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // D1 이 던지면 catch 가 잡아 console 'graph error <err>' · 500
     bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
     faults: [
@@ -317,7 +357,8 @@ export default [
       { match: `SELECT "root" FROM evaluations`, nth: 1 },
       { match: "LEFT JOIN eval_verdicts", nth: 2, message: "D1_ERROR: thread read failed" },
       { match: `SELECT "cc" FROM evaluations`, nth: 1 },
-      { match: `FROM eval_verdicts WHERE "eval_id" IN`, nth: 1 },
+      // 판정 요약 문장 (원본 · fix-graph-similar-phantom 뒤 모두에 있는 글)
+      { match: `"grade", "rank", "evidence" FROM `, nth: 1 },
     ],
     requests: [
       get("/graph?cc=example.com"), get(`/graph/local?id=${B}`), get(`/graph/local?id=${B}`), get(`/graph/similar?id=${A}&topK=2`), get(`/graph/similar?id=${A}&topK=2`),
@@ -326,6 +367,7 @@ export default [
   },
   {
     name: "graph_vectorize_faults", module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // getByIds · query 가 던지거나 이상한 모양을 돌려줄 때 — 모두 try 안이라 500 (console 에 원본의 TypeError 글)
     bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS,
     vec: (() => {
@@ -367,6 +409,7 @@ export default [
   },
   {
     name: "graph_verdict_join", module: M,
+    fixes: ["fix-graph-local-window"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // LEFT JOIN: 판정 행이 있으나 grade 가 NULL(unrated) · 판정 행이 다른 cc 의 사본이어도 평가의 cc 로 묶인다 · 같은 작성자의 대소문자
     bindings: SECRET, limits: READ,
     sql: [
@@ -377,5 +420,43 @@ export default [
       verdict({ eval_id: A, cc: "elsewhere.com", tier: "neutral", grade: 0, rank: 0.1 }),
     ],
     requests: [get("/graph?cc=example.com"), get(`/graph/local?id=${A}`)],
+  },
+
+  // ---- fix-graph-local-window: 200건 넘는 스레드 ----
+  {
+    name: "graph_local_window_deep", module: M,
+    fixes: ["fix-graph-local-window"],
+    // 251건 스레드. DEEP(30): 사슬 31건(가장 오래된 것들)이 모두 들고 남은 169칸은 가장 새 답글 · F(220): 새것 199 + 뿌리 ·
+    // F(1)(가장 오래된 답글): 그것 · 뿌리 + 가장 새 198 · 뿌리: 그것 + 가장 새 199. 같은 시각의 두 답글이 경계에 걸리면 id 가 큰 것이 먼저(DESC)
+    bindings: SECRET, limits: READ, sql: DEEP_SEED,
+    requests: [get(`/graph/local?id=${deepId(30)}`), get(`/graph/local?id=${fillId(220)}`), get(`/graph/local?id=${fillId(1)}`), get(`/graph/local?id=${deepId(0)}`), get(`/graph/local?id=${deepId(15)}`)],
+  },
+  {
+    name: "graph_local_window_long_chain", module: M,
+    fixes: ["fix-graph-local-window"],
+    // 한 줄 205건: LINE(204) 의 사슬은 205건이라 고른 것에 가까운 200건(LINE(5..204), 뿌리는 빠진다) · LINE(100): 사슬 101 + 가장 새 99 ·
+    // LINE(0): 뿌리 + 가장 새 199
+    bindings: SECRET, limits: READ, sql: LINE_SEED,
+    requests: [get(`/graph/local?id=${lineId(204)}`), get(`/graph/local?id=${lineId(100)}`), get(`/graph/local?id=${lineId(0)}`)],
+  },
+  {
+    name: "graph_local_window_boundary", module: M,
+    fixes: ["fix-graph-local-window"],
+    // 모든 시각이 같은 200건 · 201건 스레드. 200건은 원본과 같은 행 · 같은 차례(raw 와는 SQL 글만 다르다), 201건은 고른 평가 · 조상 + 가장 새 것(id DESC)
+    bindings: SECRET, limits: READ, sql: EDGE_SEED,
+    requests: [get(`/graph/local?id=${edgeId(0, 199)}`), get(`/graph/local?id=${edgeId(1, 200)}`), get(`/graph/local?id=${edgeId(1, 3)}`)],
+  },
+
+  // ---- fix-graph-similar-phantom ----
+  {
+    name: "graph_similar_phantom_mixed", module: M,
+    fixes: ["fix-graph-similar-phantom"],
+    // 유령 둘(하나는 판정 행만 남음)이 저장된 결과 사이에 끼어 있다: 남은 것의 차례 · score · summary 가 맞고, 고아 판정은 되살아나지 않는다.
+    // topK 로 자른 뒤에 빼므로 결과가 topK 보다 적을 수 있다 (topK 3 → 둘)
+    bindings: SECRET, limits: READ,
+    sql: [...SEED_GRAPH, verdict({ eval_id: GHOST_RATED, tier: "premium", grade: 2 })],
+    vectors: { [A]: { values: unitVector(2) } },
+    vec: vecStore({ query: fixedMatches([A, GHOST, LONE, GHOST_RATED, B, C, ROOT].map((id, i) => ({ id, score: 1 - i / 10 }))) }),
+    requests: [get(`/graph/similar?id=${A}&topK=3`), get(`/graph/similar?id=${A}`), get(`/graph/similar?id=${A}&topK=1`)],
   },
 ];

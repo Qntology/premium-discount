@@ -5,7 +5,7 @@
 같은 예외 경계(무엇을 잡고 무엇이 새는지). 원본의 버그까지 그대로 옮겨 같음을 확인한 뒤(커밋 56705a3) 버그를 고쳤습니다(아래 "고친 버그").
 원본은 커밋 `0538044` 의 `workers/cron/src/*.ts` 입니다. www 워커도 두 단계로 옮겼습니다: 1단계(뼈대 · 세션 · 인증 · 요청 제한 ·
 레거시 처리기 · 차분 시험대)와 2단계(큰 모듈 넷: evaluations · navtrials · graph · analytic). 그 뒤 www 에 보안 · 경합 고침 둘(지갑 서명 한 번만 쓰기 ·
-타임트라이얼의 조건 건 쓰기)을 더했습니다 (아래 "www" 절 · "고친 버그").
+타임트라이얼의 조건 건 쓰기)과 동작 고침 셋(스레드 그래프의 창 · 유령 결과 빼기 · 다시 보내기의 내용 비교)을 더했습니다 (아래 "www" 절 · "고친 버그").
 
 ## 구조
 
@@ -111,7 +111,9 @@ JSON 아닌 본문 · 429 · 서버 오류 · fetch 거부 · 키 없음 · 주�
 원본은 커밋 `35781c0` 의 `workers/www/src/*.ts` 와 그것이 가져다 쓰는 `workers/cron/src/verdict.ts` · `navtrials.ts` 입니다. 두 단계로 옮겼습니다:
 1단계는 crate 뼈대 · 처리기 차례 · 작은 모듈 · 레거시 처리기 · 차분 시험대이고, 2단계는 큰 모듈 넷(evaluations · navtrials · graph · analytic)을
 파일 하나씩 갈아 끼운 것입니다. 옮기면서 찾은 원본 버그 일곱(1단계 하나 · evaluations 하나 · analytic 다섯)을 고쳤고, 그 뒤 보안 · 경합 고침 둘
-(fix-wallet-replay · fix-nav-lost-update)을 더했습니다. 이 둘은 D1 호출 자체가 원본과 다릅니다(새 표 `wallet_nonces` · 조건 건 쓰기). 아래 "고친 버그".
+(fix-wallet-replay · fix-nav-lost-update)을 더했습니다. 이 둘은 D1 호출 자체가 원본과 다릅니다(새 표 `wallet_nonces` · 조건 건 쓰기).
+그 뒤 남겨 두었던 동작 결정 셋(fix-graph-local-window · fix-graph-similar-phantom · fix-eval-replay-mismatch)을 고쳤습니다. 이 셋도 D1 문장의 글이
+원본과 다릅니다(재귀 CTE · LEFT JOIN · 더 읽는 칸 — 왕복 수는 같다). 아래 "고친 버그".
 
 ### 구조 (`workers/www`, premium-discount-worker-www)
 
@@ -122,10 +124,10 @@ JSON 아닌 본문 · 429 · 서버 오류 · fetch 거부 · 키 없음 · 주�
 | `legacy.rs` | index.ts 405~1128 | 늘 418 (아래) |
 | `session.rs` · `ratelimit.rs` · `projection.rs` · `blob.rs` · `render.rs` | session · ratelimit · projection · blob · renderHtml | 옮김 (1단계) |
 | `auth.rs` | auth.ts | 세션 확인(S3 hash 객체) · 앱 세션 발급 · 지갑 서명 확인(EIP-191, k256 로 복원). 지갑 서명을 받는 경로는 모두 `verify_wallet_request_once`(서명 확인 + 한 번만 쓰기, fix-wallet-replay)를 쓴다 |
-| `util.rs` | evaluations.ts 의 `corsHeaders` · `ValidationError` · `parseDomain` · `parseUuid` · `verdictSummaries` | 여러 모듈이 같이 쓰는 것 (CORS · JSON 응답 · IP · pathname · D1 의 바뀐 행 수, 그리고 graph.ts 가 evaluations.ts 에서 가져다 쓰던 검사 · 판정 요약 — evaluations.rs 와 graph.rs 가 서로의 파일을 건드리지 않게) |
+| `util.rs` | evaluations.ts 의 `corsHeaders` · `ValidationError` · `parseDomain` · `parseUuid` · `verdictSummaries` | 여러 모듈이 같이 쓰는 것 (CORS · JSON 응답 · IP · pathname · D1 의 바뀐 행 수, 그리고 graph.ts 가 evaluations.ts 에서 가져다 쓰던 검사 · 판정 요약 — evaluations.rs 와 graph.rs 가 서로의 파일을 건드리지 않게). 판정 요약은 fix-graph-similar-phantom 뒤로 `stored_verdicts`(평가 행이 있는지 + 판정, 같은 IN 한 번) |
 | `evaluations.rs` | evaluations.ts | 저장(대기열) · 검색(앱 · 공개, tier) · status · 투표 · 대체 보고 · 판정 조회. RECIPE 는 premium-discount-verdict 의 RECIPE_V1 (2단계) |
 | `navtrials.rs` | navtrials.ts | /nav/trials (GET · POST · DELETE, 세션 또는 지갑). cron 의 navtrials.ts 에서 가져다 쓰던 상수 · dayOf · walletOldestDay · tier 는 사본. 쓰기는 조건 건 쓰기(fix-nav-lost-update, 파일 머리말) (2단계) |
-| `graph.rs` · `graph/view.rs` | graph.ts | /graph · /graph/local · /graph/similar · /graph/view (VIEW_HTML 은 원본 처리기로 뽑은 원시 문자열) (2단계) |
+| `graph.rs` · `graph/view.rs` | graph.ts | /graph · /graph/local · /graph/similar · /graph/view (VIEW_HTML 은 원본 처리기로 뽑은 원시 문자열) (2단계). /graph/local 의 창은 `local_thread_sql`(fix-graph-local-window), similar 의 유령 빼기는 `stored_matches`(fix-graph-similar-phantom) |
 | `analytic.rs` · `analytic/event.rs` · `json.rs` · `inflate.rs` | analytic.ts | /analytic/events (수집 batch · 주인 읽기 · 지우기) · /analytic/sites (지갑 · 세션 주인, 첫 화면 meta 확인). 받은 본문은 JS 의 JSON.parse · pako ungzip 과 같이 받아들인다 (2단계) |
 
 **이음매**: 네 모듈은 모두 `#[cfg(target_arch = "wasm32")] pub async fn handle(req: &Req, env: &Env) -> R<Option<Resp>>` 하나를 낸다.
@@ -145,7 +147,7 @@ PUT · POST(update_from_rust · 링크 등록) · GET(목록 · renderHtml) · O
 **wrangler**: `workers/www/wrangler.json` 은 `main: build/index.js` · worker-build 0.8.7 빌드 명령으로 바꿨고, 바인딩(D1 둘 · Vectorize · AI · 요청 제한 셋 ·
 R2 · assets `../../web/www/`) · `migrations_dir: "../migrations"` · vars 는 그대로다. TS 번들에만 뜻이 있는 `upload_source_maps` · `rules`(*.html 을 글로)는 뺐다.
 `wrangler.test.json`(시험 배포 premium-discount-test, 원격 Vectorize)도 같은 방식으로 Rust 빌드를 가리키게 했고 바인딩은 그대로다.
-TS 원본(`src/*.ts`)은 남겼다: 시험대가 이력에서 원본을 꺼내고 node 시험 98개가 그대로 돈다(TS 원본을 시험하므로 이번 고침 둘은 들어가지 않는다).
+TS 원본(`src/*.ts`)은 남겼다: 시험대가 이력에서 원본을 꺼내고 node 시험 98개가 그대로 돈다(TS 원본을 시험하므로 뒤의 고침들은 들어가지 않는다).
 **배포 전에 D1 에 `0010_wallet_nonces.sql` 을 적용한다**(`wrangler d1 migrations apply`): 표가 없으면 지갑 서명 요청이 D1 오류로 500 이 된다.
 `wrangler deploy --dry-run` 은 1단계 때 1709.87 KiB (gzip 598.96 KiB), 바인딩 확인 통과였다(2단계 뒤로는 다시 재지 않았다).
 
@@ -160,7 +162,7 @@ MODULE=wallet ORIGINAL=raw node www.mjs       # 고치지 않은 원본 vs Rust 
 ```
 
 - 원본: `git show 35781c0:<경로>` 로 www 의 .ts 11개와 cron 의 verdict.ts · navtrials.ts 를 `out/www-src/` 에 같은 나무 모양으로 꺼내(esbuild 가 `../../cron/src/…` 를
-  따라가게) `fixes/www*.mjs`(www · www_analytic · www_evaluations · www_graph(빈 목록) · www_security)를 덧대고 묶는다. ethers · pako · aws4fetch 는 시험대의 node_modules 에서.
+  따라가게) `fixes/www*.mjs`(www · www_analytic · www_behaviour · www_evaluations · www_graph(빈 목록) · www_security)를 덧대고 묶는다. ethers · pako · aws4fetch 는 시험대의 node_modules 에서.
 - 같은 조건: D1 `DB`(migrations 0001~0010 을 이름순으로) · `apac1_premium_discount`(빈 DB), 씨앗 행(`sql`), 정적 파일 `web/www`(assets, 워커 앞에서 답함),
   변수 · 비밀(`bindings`), 요청마다 가상 시계(`x-harness-clock` 머리글 — 진입 모듈이 시계를 맞추고 지운다), 씨앗 있는 `Math.random`(prelude) ·
   `crypto.getRandomValues` · `crypto.randomUUID`(www_mocks_src.mjs; Rust 의 getrandom 도 부를 때마다 `globalThis.crypto.getRandomValues` 를 찾는다).
@@ -185,9 +187,9 @@ MODULE=wallet ORIGINAL=raw node www.mjs       # 고치지 않은 원본 vs Rust 
 | session | 23 | session.test.ts (마지막 단언 "로그인한 앱이 저장하면 from 이…" 은 evaluations 에서) |
 | auth | 14 | auth.test.ts — verifiedAddress 의 단언을 GET /session 으로 |
 | legacy | 10 | 레거시 처리기(418 의 차례 · console) · assets. tracker.test.ts 의 tracker.js 는 워커 앞의 assets 가 그대로 낸다(`legacy_assets_first`) |
-| evaluations | 73 | evaluations · votes · supersedes(www 쪽) 시험과 session.test.ts 마지막 단언, SCENARIOS.md 의 R · V · GA · ID · PR · SR · RL, 가장자리(BOM · 잘못된 UTF-8 · 중복 키 · -0 표 · Vectorize 장애 · D1 장애 · 경합) |
+| evaluations | 76 | evaluations · votes · supersedes(www 쪽) 시험과 session.test.ts 마지막 단언, SCENARIOS.md 의 R · V · GA · ID · PR · SR · RL, 가장자리(BOM · 잘못된 UTF-8 · 중복 키 · -0 표 · Vectorize 장애 · D1 장애 · 경합), fix-eval-replay-mismatch 2 (`save_replay_content` · `save_race_different_text`) · fix-graph-similar-phantom 1 (`search_phantom`) |
 | navtrials | 45 | navtrials.test.ts 의 단언 전부와 가장자리 38, fix-nav-lost-update 의 경합 · 장애 7 (`race_*` · `batch_fault_releases_registration`) |
-| graph | 28 | graph.test.ts, SCENARIOS GR-01~16 · R-06~08 · RL-04 · RL-05, premium-discount-mcp 의 GET /graph* 요청 그대로 |
+| graph | 32 | graph.test.ts, SCENARIOS GR-01~16 · R-06~08 · RL-04 · RL-05, premium-discount-mcp 의 GET /graph* 요청 그대로, fix-graph-local-window 3 (`graph_local_window_*`: 깊은 사슬 · 200 넘는 사슬 · 200/201 경계) · fix-graph-similar-phantom 1 (`graph_similar_phantom_mixed`) |
 | analytic | 26 | analytic.test.ts, tracker.js 의 실제 요청, 가장자리(본문 형식 · gzip · 크기 · 요청 제한 · CORS · 메서드 · 주인 인증 · 커서 · D1 장애), 고친 버그 6 |
 | wallet | 8 | fix-wallet-replay: 같은 요청 · 다른 쿼리 · 새 서명 · 기한 경계 · 다른 서명 꼴 · 동시 둘 · 기한 지난 키 지우기 · D1 장애 (navtrials · analytic 의 지갑 경로) |
 
@@ -203,11 +205,12 @@ wallet.test.ts(계약 · 위조 · 5분)는 `workers/www/tests/contracts.rs` 가
 
 | 무엇 | 결과 |
 | --- | --- |
-| 고친 원본 vs Rust (`node www.mjs`) | 227/227 동일 (session 23 · auth 14 · legacy 10 · evaluations 73 · navtrials 45 · graph 28 · analytic 26 · wallet 8) |
-| 고치지 않은 원본 vs Rust (`ORIGINAL=raw`) | 165 동일 · 62 다름 — 다른 것은 모두 fixes 칸이 있는 시나리오(예상 밖 0). 앞 고침들의 10 (session_web_email_padded · session_states · save_address_forms · search_to_forms · analytic `fix_*` 6)에 fix-wallet-replay 28(새 8 + 지갑 서명을 받는 navtrials 13 · analytic 7) · fix-nav-lost-update 35(새 7 + navtrials 28)가 더해졌다(둘 다인 것 · 앞 고침과 겹치는 것이 있다) |
-| 위 62 중 이번 고침 둘만 닿는 기존 시나리오 37 (10 + 새 15 + 37 = 62) | 원본과 응답(상태 · 머리글 · 본문) · console · D1 끝 상태(wallet_nonces 빼고)가 모두 같다 — 다른 것은 D1 호출뿐이다. 하나만 끝 상태가 다르다: `stored_rows_odd`(D1 에 직접 넣은 premium `'x'` 를 원본 JS 는 "x1", 고친 판은 SQL 산술로 1) |
+| 고친 원본 vs Rust (`node www.mjs`) | 234/234 동일 (session 23 · auth 14 · legacy 10 · evaluations 76 · navtrials 45 · graph 32 · analytic 26 · wallet 8) |
+| 고치지 않은 원본 vs Rust (`ORIGINAL=raw`) | 126 동일 · 108 다름 — 다른 것은 모두 fixes 칸이 있는 시나리오(예상 밖 0). 앞의 62 에 동작 고침 셋의 46 이 더해졌다: 새 시나리오 7, 동작이 바뀌는 기존 셋(`graph_limit_200` · `graph_similar_phantom` · `graph_similar_empty`), D1 문장 글만 다른 기존 36 (findReplay 까지 가는 저장 20 · 검색 5 · graph 11). 그 전(동작 고침 셋 앞): 165 동일 · 62 다름 — 다른 것은 모두 fixes 칸이 있는 시나리오(예상 밖 0). 앞 고침들의 10 (session_web_email_padded · session_states · save_address_forms · search_to_forms · analytic `fix_*` 6)에 fix-wallet-replay 28(새 8 + 지갑 서명을 받는 navtrials 13 · analytic 7) · fix-nav-lost-update 35(새 7 + navtrials 28)가 더해졌다(둘 다인 것 · 앞 고침과 겹치는 것이 있다) |
+| 동작 고침 셋의 기존 36 | D1 문장 글 · 묶은 값 · all 의 행 수를 빼면 응답 · console · 호출 차례 · 끝 상태가 원본과 같다 (200건 이하 스레드의 /graph/local 행 차례 · 같은 시각의 차례 포함 — `graph_local_window_boundary` 의 200건 요청도 같다). 기존 시나리오의 씨앗 · 장애 칸을 바꾼 것: 검색 씨앗 `SEARCH_SQL` 에 평가 행(D · X · A · C · B, 없으면 모두 유령), `save_replay_queue_states` 의 processing 항목 · `save_race_same_request` 의 경합 항목을 같은 내용(같은 글의 해시 · bcc 없음)으로, `search_verdicts_fail` · `graph_d1_faults` 의 판정 요약 장애 글을 두 문장에 다 있는 `"grade", "rank", "evidence" FROM ` 으로 |
+| 위 62 중 앞 고침 둘만 닿는 기존 시나리오 37 (10 + 새 15 + 37 = 62) | 원본과 응답(상태 · 머리글 · 본문) · console · D1 끝 상태(wallet_nonces 빼고)가 모두 같다 — 다른 것은 D1 호출뿐이다. 하나만 끝 상태가 다르다: `stored_rows_odd`(D1 에 직접 넣은 premium `'x'` 를 원본 JS 는 "x1", 고친 판은 SQL 산술로 1) |
 | cron 시험대 (`node cron.mjs`, mocks 에 before · batch after 를 더한 뒤) | 47/47 동일 |
-| `cargo test -j 2` (workers) | common 12 + aws_eth 5 + pako_array 1, cron 12, www 단위 41 + contracts 8 (한 번만 쓰기 키 시험 더함) |
+| `cargo test -j 2` (workers) | common 12 + aws_eth 5 + pako_array 1, cron 12, www 단위 44 + contracts 8 (한 번만 쓰기 키 · 스레드 창 SQL · 유령 빼기 · 다시 보내기 비교 시험 더함) |
 | `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
 | node 시험 (www · cron, TS 원본) | 98 · 41 통과 (그대로) |
 
@@ -220,9 +223,6 @@ wallet.test.ts(계약 · 위조 · 5분)는 `workers/www/tests/contracts.rs` 가
   S3 를 11번 부르고 가상 시계로 약 37초 걸린다. 세션 확인을 쓰는 모든 요청(평가 · 투표 · 타임트라이얼)이 S3 장애 때 그만큼 늦어진다.
   동작 설계의 문제라 고치지 않고 원본 그대로 두었다(바꾼다면 `retries` 를 줄이는 것).
 - wasm 이 cron(329 KiB)보다 크다(지금 2.03 MiB, gzip 약 739 KiB — 1단계 때 1.7 MiB): k256(서명 복원) · url(idna) 과 2단계 모듈 때문이다. 무료 요금제 한도(압축 3 MB) 안이다.
-- graph `/graph/local` 은 스레드의 가장 오래된 200건(ASC)만 준다: 200건 넘는 스레드에서 새 평가를 고르면 그 평가가 응답에 없을 수 있다(`graph_limit_200`). 동작 결정이 필요해 원본 그대로.
-- graph `/graph/similar` 는 D1 을 확인하지 않아, D1 행이 없는 벡터도 판정 없는(unrated) 노드로 나온다(SCENARIOS GR-13, `graph_similar_phantom`). 원본 그대로.
-- evaluations 의 같은 `request_id` 다시 보내기는 cc · ref 만 견준다: 글이 다르면 첫 항목으로 200 을 돌려준다(주석은 409 라고 한다). 원본 그대로.
 - www 의 navtrials 상수(NAV_FIRST_DAY · NAV_RECIPE · TRIAL_POLICY · TRIAL_SCHEMA · dayOf · walletOldestDay · tier)는 cron 의 navtrials 에서 가져다 쓰던 것의 사본이다
   (cron crate 를 의존하면 그 `scheduled` 내보내기가 www 에 들어온다). 두 곳을 같이 고쳐야 한다.
 - analytic 의 gzip 바이트는 pako 와 다르다(Rust 는 flate2): 같은 글을 다른 바이트로 압축한다. 시험대는 풀어서 견준다. 받는 쪽(앱 · crates/premium-discount-analytic)은 풀어 읽으므로 상관없다.
@@ -238,6 +238,13 @@ wallet.test.ts(계약 · 위조 · 5분)는 `workers/www/tests/contracts.rs` 가
   duplicate 라 합계에는 그 런이 끝내 들어가지 않는다(`race_retry_exhausted`). 등록 되돌리기는 batch 가 던졌을 때 하므로, D1 이 batch 를 실제로는 쓰고
   답만 잃은 경우에는 되돌리기가 틀린다(그 사용자의 다음 런이 한 번 더 셀 수 있다). 밀어내기를 다시 할 때는 이 요청이 쓴 행을 빼고 가장 오래된 것을 고른다.
   D1 에 직접 넣은 숫자 아닌 수(`premium = 'x'`)는 이제 SQL 산술이다(원본 JS 는 `"x" + 1` = "x1", 고친 판은 1 — `stored_rows_odd`).
+- **동작 고침 셋의 결과**: fix-graph-local-window — 조상 사슬이 200보다 길면 고른 평가에 가까운 200개만 넣어 뿌리가 빠진다(`graph_local_window_long_chain`).
+  200건 넘는 스레드에서는 가장 새 것들의 부모가 응답에 없으면 reply 엣지가 없다(원본의 GR-06 과 같은 규칙). 뷰(`graph/view.rs` 의 "같은 스레드 보기")는
+  nodes · edges 만 그리고 엣지는 응답 안의 노드끼리라 그대로 돈다. fix-graph-similar-phantom — 유령은 topK 로 자른 뒤에 빼므로 결과가 topK 보다
+  적을 수 있다(더 받아 채우지 않는다, 검색의 tier 조건도 세 배 안에서). fix-eval-replay-mismatch — 저장(evaluations)으로 옮겨진 평가는 원문 · 해시를
+  남기지 않아 글을 직접 견줄 수 없다: bcc(콘텐츠 해시 주소)를 보낸 저장만 글이 다른 것을 409 로 가르고, bcc 가 없으면 cc · ref · to 만 본다.
+  거부 · 실패한 항목은 cron 이 해시를 덮고 bcc 를 지워 cc · ref · to 만 보고 그 상태로 200 이다. from 은 견주지 않는다(재시도 사이에 세션이 바뀔 수 있다).
+  to 가 다른 다시 보내기도 이제 409 다.
 
 ## 고친 버그
 
@@ -255,9 +262,15 @@ wallet.test.ts(계약 · 위조 · 5분)는 `workers/www/tests/contracts.rs` 가
 | fix-wallet-replay | **www** auth.ts 209 (`verifyWalletRequest`) · navtrials.ts 623 · analytic.ts 393 | 지갑 서명 글(contracts/wallet_v1.json)에는 경로만 있고 쿼리가 없는데 같은 서명을 다시 쓰는 것을 막지 않아, 잡은 서명을 5분 안에 다른 쿼리로 다시 보낼 수 있었다: `DELETE /nav/trials?app=X` 를 `DELETE /nav/trials` 로 보내면 **콜렉션 전부**가 지워지고, GET 은 쿼리만 바꿔 다른 앱의 내 콜렉션 · analytic 주인 읽기를 할 수 있었다 → 계약은 그대로 두고 서버가 받은 서명을 기억한다(`verify_wallet_request_once`): 서명 확인이 맞으면 서명한 글의 SHA-256 을 서명 시각 + 5분(시각 검사가 받는 마지막 때) + 60초(isolate 사이 시계 차이 여유, 지우기에만 씀)까지 D1 `wallet_nonces`(migrations/0010)에 `INSERT … ON CONFLICT DO NOTHING` 으로 잡고, 바뀐 행이 0 이면(이미 쓴 서명 — 동시에 온 같은 요청 둘도 하나만 1) 틀린 서명과 같은 401. 같은 batch 에서 기한 지난 키를 10개까지 지운다(요청 하나가 하나를 넣으므로 표는 최근 약 11분의 지갑 요청 수로 묶인다). 키가 서명 바이트가 아니라 글이라 같은 글의 다른 서명 꼴(v 0 · 1, 대문자)도 막힌다. 닿는 경로: /nav/trials GET · POST · DELETE, /analytic/sites GET · POST · DELETE, /analytic/events 주인 GET · DELETE | `www_wallet_*` 8개 · 지갑 서명을 받는 navtrials 13 · analytic 7 시나리오(D1 호출 · wallet_nonces 만 다름) |
 | fix-nav-lost-update | **www** navtrials.ts 412~533 (`storeRuns`) | nav_trials · nav_courses 를 읽은 값으로 계산한 절대값으로 upsert(`"runs" = excluded."runs"`, `"sums" = excluded."sums"` …)해, 같은 코스의 첫 등록 둘이 동시에 오면 runs 가 1 이 되고(하나를 잃음) 있는 코스 · 내 콜렉션의 동시 갱신도 하나를 잃었다. 같은 사용자의 같은 요청 둘은 등록을 SELECT 로 미리 봐 둘 다 처음 등록으로 세어 합계 · 판정 수(nav_counts)에 두 번 들어갔고, 밀어내기는 그 사이 다시 달린 코스를 지웠다 → 낙관적 동시성: 등록은 batch 앞에서 `INSERT … ON CONFLICT DO NOTHING`(바뀐 행 1 = 처음, 뒤에서 실패하면 되돌림), 수는 상대 갱신(`"runs" = "runs" + ?`) · last_day 는 `MAX`, 읽은 값에서 계산한 JSON(best · record · sums)과 밀어내기는 읽은 값(글 · touched)에 조건을 건 UPDATE · DELETE 로 batch 에 두고, 처음 넣는 행은 `ON CONFLICT DO NOTHING`. batch 결과에서 바뀐 행이 0 인 것만 다시 읽어 계산해 3번까지 다시 쓰고(첫 등록이 졌으면 갱신 갈래로, created 는 false), 다 쓰면 500 | `race_first_registration` · `race_existing_course_update` · `race_same_user_identical_runs` · `race_retry_exhausted` · `race_trial_row_update` · `race_eviction_retouched` · `batch_fault_releases_registration` · POST 가 쓰기까지 가는 navtrials 시나리오 28개(D1 호출만 다름, `stored_rows_odd` 는 끝 상태도) |
 
-수정마다 Rust 와 `scripts/workers-diff/fixes/*.mjs`(cron · www · www_analytic · www_evaluations · www_security)의 글 패치(같은 id, 공백 무시 · 정해진 횟수만큼
+| fix-graph-local-window | **www** graph.ts 127 (`localGraph`) | 스레드를 `ORDER BY created_at ASC LIMIT 200` 으로 읽어 200건 넘는 스레드에서는 가장 오래된 200건만 나왔다 — 새 평가를 고르면 그 평가와 그 뒤의 답글이 응답에 없었다(뷰의 "같은 스레드 보기"가 고른 노드를 잃음) → 문장 하나(`local_thread_sql`, 묶음 ?1 root · ?2 200 · ?3 고른 id): 재귀 CTE `chain` 이 고른 평가에서 `ref` 를 따라 root 까지(같은 root 의 행만, 깊이 200까지), `newest` 가 사슬에 없는 스레드 평가를 `created_at DESC, id DESC` 로 남은 칸(200 − 사슬 수)만큼, 바깥 SELECT 는 스레드가 200건 이하면 원본처럼 전부, 넘으면 사슬 ∪ newest 를 원본과 같은 `created_at ASC LIMIT 200` 으로. 200건 이하 스레드는 행 · 차례(같은 시각의 차례까지)와 응답 모양이 원본 그대로다 | `graph_limit_200` · `graph_local_window_deep` · `graph_local_window_long_chain` · `graph_local_window_boundary` · /graph/local 을 부르는 기존 시나리오(문장 글만 다름) |
+| fix-graph-similar-phantom | **www** graph.ts 152 (`similarGraph`) · evaluations.ts 504 (`searchEvaluations`) · 544 (`verdictSummaries`) | Vectorize 결과의 판정 요약만 읽고(`FROM eval_verdicts WHERE "eval_id" IN …`) 평가 행이 있는지는 보지 않아, D1 에 행이 없는 벡터(유령 — cron 의 되돌리기 사이 · 지운 평가)가 /graph/similar 의 unrated 노드와 검색 결과로 나왔다(판정 행만 남은 고아는 판정까지 붙어) → 같은 IN 한 번을 `SELECT e."id", "eval_id", "tier", "grade", "rank", "evidence" FROM evaluations e LEFT JOIN eval_verdicts ON "eval_id" = e."id" WHERE e."id" IN (…)` 로 바꿔(왕복 그대로) 행이 있는 결과만 그 차례대로 남긴다. 검색은 tier 조건보다 먼저 뺀다. summary · 엣지는 남은 노드로. 유령이 없으면 응답은 원본과 바이트까지 같다 | `graph_similar_phantom` · `graph_similar_empty`(대문자 id) · `graph_similar_phantom_mixed` · `www_evaluations_search_phantom` · similar · 검색이 D1 까지 가는 기존 시나리오(문장 글 · 행 수만 다름) |
+| fix-eval-replay-mismatch | **www** evaluations.ts 200 (`findReplay`) | 같은 request_id 의 다시 보내기를 cc · ref 로만 견줘 글이 다른 평가도 처음 항목으로 200 이었다(주석은 "다른 내용이면 409") → 같은 SELECT 에 `"to", "bcc"`(대기열은 `"text_hash"` 도)를 더 읽어 찾은 행이 아직 쥔 내용을 모두 견준다: cc · ref · to 는 늘, bcc 는 저장된 평가와 pending · processing 대기열, text_hash 는 pending · processing 대기열(cron 이 rejected · failed 에서 해시를 `MASKED_HASH` 로 덮고 bcc 를 지운다). 다르면 다른 409 들과 같은 `{ error: 'request_id was already used for a different evaluation' }` 409. 경합(INSERT 가 유니크 제약에 걸린 뒤) 갈래도 같다 | `www_evaluations_save_replay_content` · `www_evaluations_save_race_different_text` · findReplay 까지 가는 저장 시나리오(문장 글만 다름) |
+
+수정마다 Rust 와 `scripts/workers-diff/fixes/*.mjs`(cron · www · www_analytic · www_behaviour · www_evaluations · www_security)의 글 패치(같은 id, 공백 무시 · 정해진 횟수만큼
 맞아야 적용, 정규식이면 그대로)가 짝입니다. www 의 마지막 둘(fix-wallet-replay · fix-nav-lost-update)은 원본에 없는 D1 호출을 더하므로 `ORIGINAL=raw` 에서
 지갑 서명을 받거나 타임트라이얼을 쓰는 시나리오가 모두 다르다(D1 호출만 — 응답 · 끝 상태는 "www · 결과" 의 확인대로 같다, `stored_rows_odd` 하나만 빼고).
+동작 고침 셋(fix-graph-local-window · fix-graph-similar-phantom · fix-eval-replay-mismatch, `fixes/www_behaviour.mjs`)도 문장 글을 바꾸므로 /graph/local ·
+판정 요약(similar · 검색) · findReplay 까지 가는 시나리오는 `ORIGINAL=raw` 에서 모두 다르다 — 동작이 바뀌는 것 밖에는 문장 글 · 묶은 값 · 행 수만 다르다.
 
 ## 알려진 차이 (관찰되지 않거나 www 가 막는 것)
 

@@ -17,7 +17,7 @@
 //!
 //! 요청 본문은 원본 `request.json()` 처럼 UTF-8 로 풀고(BOM 하나 버림, 잘못된 바이트는 U+FFFD) **JS 의 `JSON.parse`** 로 읽는다
 //! (수 · 중복 키 · 오류가 V8 과 같게). 판정 행의 `reasons` 도 JS 의 `JSON.parse` 로 읽어 깨진 행의 SyntaxError 글까지 같다.
-//! graph.rs 가 쓰는 검사 · 판정 요약(`parse_domain` · `parse_uuid` · `binds` · `verdict_summaries`)은 util.rs 에 있다.
+//! graph.rs 가 쓰는 검사 · 판정 요약(`parse_domain` · `parse_uuid` · `binds` · `stored_verdicts` · `stored_verdicts_sql`)은 util.rs 에 있다.
 //! 검색의 판정 요약은 Vectorize 가 준 id 를 **값 그대로** 묶어야 해서(원본은 `m.id` 를 그대로 bind) 여기 따로 둔다(`summaries`).
 
 use premium_discount_worker_common::jsv::{js_trim, to_lower};
@@ -113,6 +113,42 @@ pub fn parse_text_hash(value: &V) -> R<String> {
     }
 }
 
+/// 저장 요청이 보낸 내용 가운데 같은 request_id 의 다시 보내기가 같아야 하는 것 (고침 fix-eval-replay-mismatch).
+/// from 은 넣지 않는다: 재시도 사이에 세션이 바뀌면(로그인 · 만료) from 이 달라지는 것이 정상이다 (투표의 투표자와 같은 이유)
+pub struct Submitted<'a> {
+    pub cc: &'a str,
+    /// 부모 id 또는 null
+    pub ref_: &'a V,
+    /// 정규화한 주소 또는 null
+    pub to: &'a V,
+    /// 콘텐츠 해시 주소(0x+40) 또는 null
+    pub bcc: &'a V,
+    /// 원문의 SHA-256 (원문과 맞는 것을 확인한 뒤)
+    pub text_hash: &'a str,
+}
+
+/// 고침(fix-eval-replay-mismatch): 원본 `findReplay` 는 cc · ref 만 견줘, 같은 request_id 로 글이 다른 평가를 보내도 처음 항목으로
+/// 200 을 돌려줬다 (주석은 "다른 내용이면 409"). 이제 찾은 행이 아직 쥐고 있는 내용을 모두 견준다:
+///
+/// - cc · ref · to: 늘 (평가 · 대기열 행 모두 그대로 남는다)
+/// - text_hash: 대기열 행이 `pending` · `processing` 일 때 (cron 이 rejected · failed 로 끝내면 `MASKED_HASH` 로 덮고, 저장(evaluations)으로
+///   옮기면 원문 · 해시를 남기지 않는다)
+/// - bcc(앱이 원문으로 만든 콘텐츠 해시 주소): 저장된 평가와 `pending` · `processing` 대기열 행일 때 (rejected · failed 는 cron 이 NULL 로 지운다)
+///
+/// 그래서 저장이 끝난 평가는 글을 직접 견줄 수 없고 bcc 로만 본다 (bcc 를 보내지 않은 저장은 cc · ref · to 만). 거부 · 실패한 항목은 원본처럼
+/// 그 상태로 답한다
+pub fn same_evaluation(found: &V, s: &Submitted<'_>) -> bool {
+    use premium_discount_worker_common::strict_eq;
+    let status = found.get("status");
+    let live_queue = matches!(status.as_str(), Some("pending") | Some("processing"));
+    let holds_bcc = live_queue || status.as_str() == Some("stored");
+    strict_eq(&found.get("cc"), &V::from(s.cc))
+        && strict_eq(&found.get("ref"), s.ref_)
+        && strict_eq(&found.get("to"), s.to)
+        && (!holds_bcc || strict_eq(&found.get("bcc"), s.bcc))
+        && (!live_queue || strict_eq(&found.get("text_hash"), &V::from(s.text_hash)))
+}
+
 /// `sha256Hex(text)` (UTF-8)
 pub fn sha256_hex(text: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -206,7 +242,7 @@ mod wasm {
     use super::*;
     use crate::auth::verified_address;
     use crate::ratelimit::{is_rate_limited, RETRY_AFTER_SECONDS};
-    use crate::util::{binds, cors_headers, empty_response, header_opt, header_or_empty, hv, is_validation, json_response, parse_domain, parse_uuid, pathname};
+    use crate::util::{binds, cors_headers, empty_response, header_opt, header_or_empty, hv, is_validation, json_response, parse_domain, parse_uuid, pathname, stored_verdicts_sql};
 
     /// `new ConflictError(message)`
     fn conflict(message: &str) -> Throw {
@@ -298,18 +334,20 @@ mod wasm {
 
     // ───────────── POST /evaluations ─────────────
 
-    /// `findReplay(env, requestId, cc, ref)` — 같은 request_id 가 이미 저장되었거나 대기 중인지. cc · ref 가 다르면 409
-    async fn find_replay(env: &Env, request_id: &str, cc: &str, ref_: &V) -> R<Option<V>> {
-        let stored = d1_first(env, r#"SELECT "id", "root", "ref", "from", "cc" FROM evaluations WHERE "request_id" = ?1"#, &[V::from(request_id)]).await?;
+    /// `findReplay(env, requestId, content)` — 같은 request_id 가 이미 저장되었거나 대기 중인지. 다른 내용이면 409.
+    /// 고침(fix-eval-replay-mismatch): 원본은 cc · ref 만 견줘, 글이 다른 다시 보내기도 처음 항목으로 200 이었다. 이제 같은 SELECT 에
+    /// 내용 칸(to · bcc, 대기열은 text_hash 도)을 더해 읽고 [`same_evaluation`] 으로 견준다 (왕복 수는 그대로)
+    async fn find_replay(env: &Env, request_id: &str, content: &Submitted<'_>) -> R<Option<V>> {
+        let stored = d1_first(env, r#"SELECT "id", "root", "ref", "from", "cc", "to", "bcc" FROM evaluations WHERE "request_id" = ?1"#, &[V::from(request_id)]).await?;
         let found = if stored.truthy() {
             spread_with(&stored, "status", "stored")
         } else {
-            d1_first(env, r#"SELECT "id", "root", "ref", "from", "cc", "state" AS "status" FROM eval_queue WHERE "request_id" = ?1"#, &[V::from(request_id)]).await?
+            d1_first(env, r#"SELECT "id", "root", "ref", "from", "cc", "state" AS "status", "to", "bcc", "text_hash" FROM eval_queue WHERE "request_id" = ?1"#, &[V::from(request_id)]).await?
         };
         if !found.truthy() {
             return Ok(None);
         }
-        if !strict_eq(&found.get("cc"), &V::from(cc)) || !strict_eq(&found.get("ref"), ref_) {
+        if !same_evaluation(&found, content) {
             return Err(conflict("request_id was already used for a different evaluation"));
         }
         Ok(Some(found))
@@ -353,8 +391,9 @@ mod wasm {
         let raw_ref = body.get("ref");
         let ref_ = if raw_ref.is_nullish() { V::Null } else { V::from(parse_uuid(&raw_ref, "ref")?) };
 
-        // 같은 request_id: 이미 저장되었거나 대기 중이면 처음 결과를 돌려준다 (앱의 재시도)
-        if let Some(replay) = find_replay(env, &request_id, &cc, &ref_).await? {
+        // 같은 request_id: 이미 저장되었거나 대기 중이면 처음 결과를 돌려준다 (앱의 재시도). 내용이 다르면 409
+        let content = Submitted { cc: &cc, ref_: &ref_, to: &to, bcc: &bcc, text_hash: &text_hash };
+        if let Some(replay) = find_replay(env, &request_id, &content).await? {
             return Ok(json(replay_body(&replay), 200, origin));
         }
 
@@ -388,21 +427,21 @@ mod wasm {
                 V::from(id.as_str()),
                 V::from(request_id.as_str()),
                 V::from(from.as_str()),
-                to,
+                to.clone(),
                 V::from(cc.as_str()),
                 ref_.clone(),
                 root.clone(),
                 V::from(text),
-                V::from(text_hash),
+                V::from(text_hash.as_str()),
                 V::bytes(float32_bytes(&vector)),
                 V::Num(now),
-                bcc,
+                bcc.clone(),
             ],
         )
         .await;
         if let Err(err) = inserted {
             // 같은 request_id 가 거의 동시에 들어와 유니크 제약에 걸렸다면, 먼저 들어간 항목을 돌려준다
-            if let Some(again) = find_replay(env, &request_id, &cc, &ref_).await? {
+            if let Some(again) = find_replay(env, &request_id, &content).await? {
                 return Ok(json(replay_body(&again), 200, origin));
             }
             return Err(err);
@@ -584,24 +623,32 @@ mod wasm {
         map.iter().find(|(k, _)| same_value_zero(k, key)).map(|(_, v)| v.clone())
     }
 
-    /// `verdictSummaries(env, ids)` — util::verdict_summaries 와 같은 SQL 이지만 ids 를 받은 값 그대로 묶고 키도 값 그대로 둔다
-    /// (원본은 Vectorize 의 `m.id` 를 그대로 bind 하고 `Map` 의 키로 쓴다)
-    async fn summaries(env: &Env, ids: &[V]) -> R<Vec<(V, V)>> {
+    /// `storedVerdicts(env, ids)` (고침 fix-graph-similar-phantom, 원본 `verdictSummaries`) — util::stored_verdicts 와 같은 SQL 이지만
+    /// ids 를 받은 값 그대로 묶고 키도 값 그대로 둔다 (원본은 Vectorize 의 `m.id` 를 그대로 bind 하고 `Set` · `Map` 의 키로 쓴다).
+    /// 돌려주는 것: D1 에 행이 있는 평가 id 들(`Set`)과 판정 요약(`Map`, 판정 행이 있는 것만)
+    async fn summaries(env: &Env, ids: &[V]) -> R<(Vec<V>, Vec<(V, V)>)> {
+        let mut stored: Vec<V> = Vec::new();
         let mut out: Vec<(V, V)> = Vec::new();
         if ids.is_empty() {
-            return Ok(out);
+            return Ok((stored, out));
         }
-        let sql = format!("SELECT \"eval_id\", \"tier\", \"grade\", \"rank\", \"evidence\" FROM eval_verdicts WHERE \"eval_id\" IN ({})", binds(ids.len()));
-        let rs = d1_all(env, &sql, ids).await?;
+        let rs = d1_all(env, &stored_verdicts_sql(ids.len()), ids).await?;
         for r in rs.g("results")?.items() {
+            let id = r.get("id");
+            if !stored.iter().any(|k| same_value_zero(k, &id)) {
+                stored.push(id);
+            }
             let key = r.get("eval_id");
+            if key.is_nullish() {
+                continue;
+            }
             let value = obj! { "tier" => r.get("tier"), "grade" => r.get("grade"), "rank" => r.get("rank"), "evidence" => r.get("evidence") };
             match out.iter_mut().find(|(k, _)| same_value_zero(k, &key)) {
                 Some(slot) => slot.1 = value,
                 None => out.push((key, value)),
             }
         }
-        Ok(out)
+        Ok((stored, out))
     }
 
     /// `result.matches` 를 `.map` · `.filter` 로 쓸 때 (배열이 아니면 원본과 같은 TypeError)
@@ -662,16 +709,18 @@ mod wasm {
         for m in match_list(&result)? {
             ids.push(m.g("id")?);
         }
-        let verdicts = summaries(env, &ids).await?;
+        let (stored, verdicts) = summaries(env, &ids).await?;
+        // 고침(fix-graph-similar-phantom): D1 에 평가 행이 없는 결과(유령)는 등급 조건보다 먼저 뺀다 (남은 것의 차례는 그대로)
+        let found: Vec<V> = match_list(&result)?.into_iter().filter(|m| stored.iter().any(|k| same_value_zero(k, &m.get("id")))).collect();
         let matches = match &tiers {
-            Some(t) => match_list(&result)?
+            Some(t) => found
                 .into_iter()
                 .filter(|m| {
                     let tier = map_get(&verdicts, &m.get("id")).map(|v| v.get("tier")).filter(|x| !x.is_nullish()).unwrap_or_else(|| V::from("unrated"));
                     tier.as_str().is_some_and(|s| t.contains(&s))
                 })
                 .collect(),
-            None => match_list(&result)?,
+            None => found,
         };
 
         let null_if = |v: V| if v.is_nullish() { V::Null } else { v };
@@ -837,6 +886,31 @@ mod tests {
 
     fn unit(n: usize) -> V {
         V::from((0..n).map(|i| V::Num(if i == 0 { 1.0 } else { 0.0 })).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn replay_compares_the_content_the_found_row_still_holds() {
+        let hash = "a".repeat(64);
+        let other = "b".repeat(64);
+        let bcc = V::from(format!("0x{}", "c".repeat(40)));
+        let to = V::from(format!("0x{}", "d".repeat(40)));
+        let parent = V::from("0190f0a0-0000-7000-8000-000000000001");
+        let s = Submitted { cc: "example.com", ref_: &parent, to: &to, bcc: &bcc, text_hash: &hash };
+        let row = |status: &str, text_hash: &str| obj! { "cc" => "example.com", "ref" => parent.clone(), "status" => status, "to" => to.clone(), "bcc" => bcc.clone(), "text_hash" => text_hash };
+        for status in ["pending", "processing"] {
+            assert!(same_evaluation(&row(status, &hash), &s));
+            assert!(!same_evaluation(&row(status, &other), &s), "다른 글은 409");
+        }
+        // 저장된 평가에는 text_hash 가 없다: bcc 로 본다
+        let stored = obj! { "cc" => "example.com", "ref" => parent.clone(), "to" => to.clone(), "bcc" => bcc.clone(), "status" => "stored" };
+        assert!(same_evaluation(&stored, &s));
+        assert!(!same_evaluation(&stored, &Submitted { bcc: &V::Null, ..s }));
+        // 거부 · 실패: cron 이 해시를 덮고 bcc 를 지웠다 — cc · ref · to 만
+        let masked = obj! { "cc" => "example.com", "ref" => parent.clone(), "status" => "rejected", "to" => to.clone(), "bcc" => V::Null, "text_hash" => "0".repeat(64) };
+        assert!(same_evaluation(&masked, &s));
+        assert!(!same_evaluation(&masked, &Submitted { to: &V::Null, ..s }));
+        assert!(!same_evaluation(&masked, &Submitted { cc: "other.com", ..s }));
+        assert!(!same_evaluation(&masked, &Submitted { ref_: &V::Null, ..s }));
     }
 
     #[test]

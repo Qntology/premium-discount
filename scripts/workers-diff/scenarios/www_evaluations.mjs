@@ -28,14 +28,14 @@ const get = (path, headers = {}) => ({ path, headers: app(headers) });
 /** cf-connecting-ip 없이 */
 const postNoIp = (path, body, headers = {}) => ({ method: "POST", path, headers: { "Content-Type": "application/json", Origin: ORIGIN, ...headers }, body });
 
-/** seedQueue (fakes.ts) — 대기열 행 (벡터는 NULL: www 는 읽지 않는다) */
+/** seedQueue (fakes.ts) — 대기열 행 (벡터는 NULL: www 는 읽지 않는다). text_hash 기본 "a"×64, bcc 기본 0xbb…(칸을 주면 null 도 그대로) */
 function queue(s) {
   const created = s.created_at ?? 1_000;
   return [
     `INSERT INTO eval_queue ("id", "request_id", "from", "to", "cc", "ref", "root", "text", "text_hash", "vector", "state", "attempts", "lease_until", "created_at", "updated_at", "bcc", "last_error")
      VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, NULL, ?9, 0, NULL, ?10, ?10, ?11, ?12)`,
     s.id, s.request_id ?? "req-" + s.id, s.from ?? "0x00000000000000000000000000000000000000ab", s.cc ?? "example.com", s.ref ?? null, s.root ?? s.ref ?? s.id,
-    s.text ?? "대기 중인 글", "a".repeat(64), s.state ?? "pending", created, s.bcc ?? "0x" + "b".repeat(40), s.last_error ?? null,
+    s.text ?? "대기 중인 글", s.text_hash ?? "a".repeat(64), s.state ?? "pending", created, "bcc" in s ? s.bcc : "0x" + "b".repeat(40), s.last_error ?? null,
   ];
 }
 /** seedVerdict (fakes.ts) — 판정 행. reasonsRaw 는 reasons 칸의 글 그대로 */
@@ -60,7 +60,9 @@ const B = "0190f0a0-0000-7000-8000-00000000000b";
 const C = "0190f0a0-0000-7000-8000-00000000000c";
 const D = "0190f0a0-0000-7000-8000-00000000000d";
 const X = "0190f0a0-0000-7000-8000-0000000000ff";
+// 검색 결과의 평가 행 (fix-graph-similar-phantom 뒤로 D1 에 행이 없는 결과는 빠지므로 fakes.ts 와 달리 평가 행도 심는다 — X 는 판정 행 없음)
 const SEARCH_SQL = [
+  ...[D, X, A, C, B].map((id, i) => evaluation({ id, to: "0x" + "2".repeat(40), created_at: 1_000 + i })),
   verdict({ eval_id: A, tier: "premium", grade: 1, rank: 0.7, evidence: 3 }),
   verdict({ eval_id: B, tier: "discount", grade: -2, rank: -0.9, evidence: 4 }),
   verdict({ eval_id: C, tier: "neutral", grade: 0, rank: 0.1, evidence: 2.5 }),
@@ -145,36 +147,42 @@ export default [
   // ───────────── 저장 (POST /evaluations) ─────────────
   {
     name: N("save_guest_bcc"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["evaluations.test.ts: 저장: 202로 접수하고 bcc를 대기열에 남긴다 (세션이 없으면 클라이언트 값을 쓴다)", "SCENARIOS V-20 · V-21(지금은 202 pending)"],
     bindings: SECRETS, limits: BOTH_LIMITERS,
     requests: [post("/evaluations", postBody({ bcc: "0x" + "AB".repeat(20), from: CLIENT_FROM }))],
   },
   {
     name: N("save_session_ignores_from"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["evaluations.test.ts: 검증된 세션이면 클라이언트가 보낸 from을 무시하고 세션 주소로 저장한다", "SCENARIOS AU-06"],
     bindings: SECRETS, s3: web("user@example.com"),
     requests: [post("/evaluations", postBody({ from: CLIENT_FROM }), loggedIn)],
   },
   {
     name: N("save_session_token_mismatch"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["evaluations.test.ts: 세션 검증에 실패하면(token 불일치) 세션 주소를 쓰지 않는다"],
     bindings: SECRETS, s3: () => s3json({ token: "ee".repeat(32), email: "user@example.com" }),
     requests: [post("/evaluations", postBody({ from: CLIENT_FROM }), loggedIn)],
   },
   {
     name: N("save_session_ignores_invalid_from"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // 세션이 확인되면 body.from 은 검사하지도 않는다 (?? 의 단락) — 잘못된 from 도 400 이 아니다
     bindings: SECRETS, s3: web("user@example.com"),
     requests: [post("/evaluations", postBody({ from: "0x12" }), loggedIn), post("/evaluations", postBody({ request_id: "req-invalid-from-0001", from: "0x12" }))],
   },
   {
     name: N("save_no_s3_guest"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["evaluations.test.ts: S3 설정이 없으면 세션 헤더가 있어도 기존처럼 동작한다 (S3 호출 없음, 게스트 주소)"],
     bindings: NO_S3, s3: web("user@example.com"),
     requests: [post("/evaluations", postBody(), loggedIn)],
   },
   {
     name: N("save_app_session_login"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["session.test.ts: 로그인한 앱이 저장하면 from이 로그인한 이메일에서 만든 주소다 (클라이언트 값은 무시)", "SCENARIOS SS-09"],
     bindings: SECRETS,
     s3: () => s3json({ email: "app@e.com" }),
@@ -207,18 +215,21 @@ export default [
   },
   {
     name: N("limiter_absent"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["evaluations.test.ts: 제한기가 없거나 … 요청은 처리된다 (제한기 없음)", "SCENARIOS RL-05"],
     bindings: SECRETS,
     requests: [post("/evaluations", postBody())],
   },
   {
     name: N("limiter_no_ip"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["evaluations.test.ts: 제한기가 없거나, IP를 알 수 없거나 … 요청은 처리된다 (IP 없음: 제한기를 부르지 않는다)"],
     bindings: SECRETS, limits: { EVAL_WRITE_LIMITER: false },
     requests: [postNoIp("/evaluations", postBody({ from: CLIENT_FROM }))],
   },
   {
     name: N("limiter_broken"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["evaluations.test.ts: … 제한기가 고장 나도 요청은 처리된다"],
     bindings: SECRETS, limits: { EVAL_WRITE_LIMITER: "throw", EVAL_READ_LIMITER: { success: 0 } },
     requests: [post("/evaluations", postBody()), search("/evaluations/search")],
@@ -280,6 +291,7 @@ export default [
   },
   {
     name: N("save_accepts_edges"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS V-06 (cc 대문자 · 공백 → 소문자) · V-10 (노름 1.005 통과) · V-16 (from 대문자 → 소문자) · V-15 (from 제로 → 게스트) · V-18 (to 제로 → NULL)"],
     bindings: NO_S3,
     requests: [
@@ -317,6 +329,7 @@ export default [
   },
   {
     name: N("save_invalid_utf8_body"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // 잘못된 UTF-8 바이트는 U+FFFD 로 풀린다 (request.json()). 해시도 그 글로 맞춘다
     bindings: NO_S3,
     requests: [
@@ -325,6 +338,7 @@ export default [
   },
   {
     name: N("save_replay"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS ID-01 (같은 request_id · 같은 cc · ref → 200 같은 id, 행 1개) · ID-02 (cc 다름 409) · ID-03 (ref 다름 409)", "evaluations.ts findReplay: 저장된 평가면 status stored"],
     bindings: NO_S3,
     sql: [evaluation({ id: EVAL }), evaluation({ id: OTHER, ref: EVAL, root: EVAL })],
@@ -341,13 +355,19 @@ export default [
   },
   {
     name: N("save_replay_queue_states"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // 대기열에서 거부 · 실패한 항목도 같은 request_id 면 그 상태로 답한다
     bindings: NO_S3,
-    sql: [queue({ id: PARENT, request_id: "req-rejected-00000001", state: "rejected", last_error: "profanity" }), queue({ id: OTHER, request_id: "req-processing-000001", state: "processing" })],
+    // processing 항목은 같은 내용(text_hash · bcc)의 다시 보내기다 — 다른 내용은 save_replay_content (fix-eval-replay-mismatch)
+    sql: [
+      queue({ id: PARENT, request_id: "req-rejected-00000001", state: "rejected", last_error: "profanity" }),
+      queue({ id: OTHER, request_id: "req-processing-000001", state: "processing", text: TEXT, text_hash: sha(TEXT), bcc: null }),
+    ],
     requests: [post("/evaluations", postBody({ request_id: "req-rejected-00000001" })), post("/evaluations", postBody({ request_id: "req-processing-000001" }))],
   },
   {
     name: N("save_reply_rules"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS PR-01 (부모 없음 400) · PR-02 (cc 다름 400) · PR-03 (답글 root = 부모 root) · PR-04 (답글의 답글) · PR-05 (대문자 ref → 소문자)", "evaluations.ts: 대기열에서 거부되었거나 실패한 부모에는 답글을 달 수 없다"],
     bindings: NO_S3,
     sql: [
@@ -371,6 +391,7 @@ export default [
   },
   {
     name: N("save_guest_address"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS GA-01 (IP 없음 · from 없음 → 500, 로그) · GA-03 (같은 IP 같은 주소) · GA-04 (다른 IP 다른 주소) · GA-05 (from 이 있으면 IP 없이도)", "evaluations.ts guestAddress: cf-connecting-ip ?? X-Real-IP, trim"],
     bindings: NO_S3,
     requests: [
@@ -386,6 +407,7 @@ export default [
   },
   {
     name: N("save_no_guest_salt"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS GA-02 · CF-05 (GUEST_SALT 미설정 → 500, from 이 있으면 저장)"],
     bindings: { ...NO_S3, GUEST_SALT: undefined },
     requests: [post("/evaluations", postBody()), post("/evaluations", postBody({ request_id: "req-salt-000000000002", from: CLIENT_FROM }))],
@@ -397,6 +419,7 @@ export default [
   },
   {
     name: N("save_insert_fails"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS RB-01 (D1 INSERT 실패 → 다시 찾아도 없으면 500)"],
     bindings: NO_S3,
     faults: [{ match: "INSERT INTO eval_queue" }],
@@ -404,6 +427,7 @@ export default [
   },
   {
     name: N("save_lookup_fails"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // findReplay · findParent 의 D1 장애는 500 (console 에 오류)
     bindings: NO_S3,
     sql: [evaluation({ id: EVAL })],
@@ -412,28 +436,69 @@ export default [
   },
   {
     name: N("save_race_same_request"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS ID-07 (같은 request_id 가 동시에: INSERT 가 유니크 제약에 걸리면 먼저 들어간 항목으로 200)"],
     bindings: NO_S3,
-    race: { match: `FROM eval_queue WHERE "request_id"`, op: "first", after: [{ sql: queue({ id: PARENT, request_id: "req-0123456789abcdef" })[0], args: queue({ id: PARENT, request_id: "req-0123456789abcdef" }).slice(1) }] },
+    // 먼저 들어간 항목은 같은 내용(같은 글의 해시 · bcc 없음)이다
+    race: { match: `FROM eval_queue WHERE "request_id"`, op: "first", after: [{ sql: queue({ id: PARENT })[0], args: queue({ id: PARENT, request_id: "req-0123456789abcdef", text: TEXT, text_hash: sha(TEXT), bcc: null }).slice(1) }] },
     requests: [post("/evaluations", postBody())],
   },
   {
     name: N("save_race_conflict"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     // 경합으로 들어간 항목의 cc 가 다르면 catch 안의 findReplay 가 409
     bindings: NO_S3,
     race: { match: `FROM eval_queue WHERE "request_id"`, op: "first", after: [{ sql: queue({ id: PARENT })[0], args: queue({ id: PARENT, request_id: "req-0123456789abcdef", cc: "other.com" }).slice(1) }] },
+    requests: [post("/evaluations", postBody())],
+  },
+  {
+    name: N("save_replay_content"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],
+    covers: ["evaluations.ts findReplay 주석: 같은 request_id 로 다른 내용이면 409 — 원본은 cc · ref 만 견줘 글이 다른 평가도 처음 항목으로 200 이었다"],
+    // 대기 중(pending) 항목: 같은 내용 200 · 글 · to · bcc 가 다르거나 bcc 를 빼면 409 · from 만 다르면 200(처음 항목의 from).
+    // 저장된 평가(원문 · 해시 없음): bcc 가 같으면 글이 달라도 200(알 수 없음) · bcc 가 다르면 409.
+    // 거부된 항목(cron 이 해시를 덮고 bcc 를 지움): 글이 달라도 원본처럼 그 상태로 200. 응답 본문의 모양은 처음 409 들과 같다
+    bindings: NO_S3,
+    sql: [
+      evaluation({ id: EVAL }),
+      [`UPDATE evaluations SET "bcc" = ?1 WHERE "id" = ?2`, "0x" + "ee".repeat(20), EVAL],
+      queue({ id: PARENT, request_id: "req-masked-0000000001", state: "rejected", text_hash: "0".repeat(64), bcc: null, last_error: "profanity" }),
+    ],
+    requests: [
+      post("/evaluations", postBody({ request_id: "req-content-00000001", to: TO, bcc: "0x" + "dd".repeat(20) })),
+      post("/evaluations", postBody({ request_id: "req-content-00000001", to: TO, bcc: "0x" + "dd".repeat(20) })),
+      post("/evaluations", postBody({ request_id: "req-content-00000001", to: TO, bcc: "0x" + "dd".repeat(20), text: "다른 글", text_hash: sha("다른 글") })),
+      post("/evaluations", postBody({ request_id: "req-content-00000001", to: "0x" + "c1".repeat(20), bcc: "0x" + "dd".repeat(20) })),
+      post("/evaluations", postBody({ request_id: "req-content-00000001", bcc: "0x" + "dd".repeat(20) })),
+      post("/evaluations", postBody({ request_id: "req-content-00000001", to: TO, bcc: "0x" + "d1".repeat(20) })),
+      post("/evaluations", postBody({ request_id: "req-content-00000001", to: TO })),
+      post("/evaluations", postBody({ request_id: "req-content-00000001", to: TO.toUpperCase().replace("0X", "0x"), bcc: "0x" + "DD".repeat(20), from: CLIENT_FROM })),
+      post("/evaluations", postBody({ request_id: "req-" + EVAL, bcc: "0x" + "ee".repeat(20), text: "다른 글", text_hash: sha("다른 글") })),
+      post("/evaluations", postBody({ request_id: "req-" + EVAL })),
+      post("/evaluations", postBody({ request_id: "req-masked-0000000001", text: "다른 글", text_hash: sha("다른 글") })),
+      get("/evaluations/status?request_id=req-content-00000001"),
+    ],
+  },
+  {
+    name: N("save_race_different_text"), module: M,
+    fixes: ["fix-eval-replay-mismatch"],
+    // 같은 request_id 가 거의 동시에 다른 글로 들어와 먼저 자리를 잡았다: catch 안의 findReplay 가 409 (원본은 cc · ref 가 같아 200 · 남의 항목)
+    bindings: NO_S3,
+    race: { match: `FROM eval_queue WHERE "request_id"`, op: "first", after: [{ sql: queue({ id: PARENT })[0], args: queue({ id: PARENT, request_id: "req-0123456789abcdef", text: "먼저 온 글", text_hash: sha("먼저 온 글"), bcc: null }).slice(1) }] },
     requests: [post("/evaluations", postBody())],
   },
 
   // ───────────── 검색 ─────────────
   {
     name: N("search_verdicts"), module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["votes.test.ts: 검색 결과마다 verdict(tier, grade, rank, evidence)가 붙고, 판정 행이 없으면 null이다 (앱 검색은 to 를 그대로, 등급 조건이 없으면 topK 그대로)", "SCENARIOS SR-01 · SR-06 · SR-14"],
     bindings: SECRETS, sql: SEARCH_SQL, vec: fakeQuery(SEARCH_MATCHES),
     requests: [search("/evaluations/search")],
   },
   {
     name: N("search_tier"), module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["votes.test.ts: 검색의 tier 조건: 세 배(최대 50)를 받아 와 D1 판정으로 거르고 topK로 자른다"],
     bindings: SECRETS, sql: SEARCH_SQL, vec: fakeQuery(SEARCH_MATCHES),
     requests: [
@@ -446,6 +511,7 @@ export default [
   },
   {
     name: N("search_public"), module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["votes.test.ts: 공개 검색도 verdict와 tier 조건을 받고, to는 내보내지 않는다", "SCENARIOS SR-02"],
     bindings: SECRETS, sql: SEARCH_SQL, vec: fakeQuery(SEARCH_MATCHES),
     requests: [search("/public/evaluations/search", { tier: "premium" }), search("/public/evaluations/search")],
@@ -482,6 +548,7 @@ export default [
   },
   {
     name: N("search_filters"), module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS SR-07 · SR-08 · SR-09 (cc · root · ref · to 조건이 Vectorize filter 로, 그 차례) · SR-12 (결과 0건)"],
     bindings: SECRETS, sql: SEARCH_SQL,
     vec: { query: (body) => (body.options.topK === 7 ? { matches: [], count: 0 } : { matches: SEARCH_MATCHES.slice(0, 2), count: 2 }) },
@@ -532,9 +599,26 @@ export default [
   },
   {
     name: N("search_verdicts_fail"), module: M,
+    fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     bindings: SECRETS, sql: SEARCH_SQL, vec: fakeQuery(SEARCH_MATCHES),
-    faults: [{ match: "FROM eval_verdicts" }],
+    // 판정 요약 문장 (원본 · fix-graph-similar-phantom 뒤 모두에 있는 글)
+    faults: [{ match: `"grade", "rank", "evidence" FROM ` }],
     requests: [search("/evaluations/search")],
+  },
+  {
+    name: N("search_phantom"), module: M,
+    fixes: ["fix-graph-similar-phantom"],
+    // D1 에 평가 행이 없는 결과(유령) 둘이 끼어 있다 — 하나는 판정 행만 남은 고아. 원본은 그대로 냈다(고아는 판정까지 붙여서).
+    // 고친 판: 등급 조건보다 먼저 빼고 남은 것의 차례 · score · verdict 는 그대로. topK 로 받은 뒤에 빼므로 topK 보다 적을 수 있다
+    bindings: SECRETS, sql: [...SEARCH_SQL, verdict({ eval_id: "0190f0a0-0000-7000-8000-0000000000e2", tier: "premium", grade: 2, rank: 0.99, evidence: 9 })],
+    vec: fakeQuery([D, "0190f0a0-0000-7000-8000-0000000000e1", X, A, "0190f0a0-0000-7000-8000-0000000000e2", C, B].map((id, i) => ({ id, score: 1 - i / 10, metadata: { cc: "example.com", root: id } }))),
+    requests: [
+      search("/evaluations/search"),
+      search("/evaluations/search", { topK: 7 }),
+      search("/evaluations/search", { tier: "premium", topK: 1 }),
+      search("/evaluations/search", { tier: "rated", topK: 2 }),
+      search("/public/evaluations/search", { topK: 3 }),
+    ],
   },
 
   // ───────────── 상태 ─────────────

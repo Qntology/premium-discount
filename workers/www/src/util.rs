@@ -1,7 +1,7 @@
 //! 여러 모듈이 같이 쓰는 작은 것들: CORS 머리글(원본 `evaluations.ts` 의 `corsHeaders`), JSON 응답, 요청에서 읽는 값.
 //!
 //! 원본에서 `corsHeaders` 는 evaluations.ts 에 있고 session.ts · navtrials.ts 가 가져다 쓴다. graph.ts 는 evaluations.ts 의
-//! ValidationError · parseDomain · parseUuid · verdictSummaries 를 가져다 쓴다. 2단계에서 evaluations.rs · graph.rs · navtrials.rs 를
+//! ValidationError · parseDomain · parseUuid · verdictSummaries(고친 판은 storedVerdicts)를 가져다 쓴다. 2단계에서 evaluations.rs · graph.rs · navtrials.rs 를
 //! 따로 갈아 끼워도 서로 흔들리지 않게 그것들을 여기 둔다 (evaluations.rs 도 자기 것을 새로 만들지 말고 이것을 쓴다).
 
 use premium_discount_worker_common::web::{Body, Req, Resp};
@@ -73,7 +73,7 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ───────────── evaluations.ts 의 export 가운데 graph.ts 도 쓰는 것 (ValidationError · parseDomain · parseUuid · verdictSummaries) ─────────────
+// ───────────── evaluations.ts 의 export 가운데 graph.ts 도 쓰는 것 (ValidationError · parseDomain · parseUuid · verdictSummaries → storedVerdicts) ─────────────
 // 2단계에서 evaluations.rs 와 graph.rs 를 따로 옮겨도 서로의 파일을 건드리지 않게 여기 둔다.
 
 /// `class ValidationError extends Error {}` 를 가르는 이름. 원본의 처리기는 `instanceof ValidationError` 면 400 `{ error: err.message }` 로 답한다.
@@ -141,22 +141,39 @@ pub fn binds(n: usize) -> String {
     (1..=n).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ")
 }
 
-/// `verdictSummaries(env, ids)` — 검색 결과와 그래프 노드에 붙이는 판정 요약 (`eval_id` → `{ tier, grade, rank, evidence }`, 그 키 차례).
+/// 검색(evaluations.rs)과 그래프 similar 가 Vectorize 결과의 id 로 D1 을 한 번 읽는 문장 (`n` 은 묶는 id 수).
+/// 고침(fix-graph-similar-phantom): 원본 `verdictSummaries` 는 `SELECT "eval_id", "tier", "grade", "rank", "evidence" FROM eval_verdicts WHERE "eval_id" IN (…)`
+/// 라 평가 행이 있는지 몰랐다. 이제 같은 IN 을 평가(evaluations)에서 시작해 판정을 LEFT JOIN 한다: 결과 행 = D1 에 있는 평가,
+/// `eval_id` 가 NULL 이 아니면 판정 행이 있다. 판정 칸 이름(eval_id · tier · grade · rank · evidence)은 eval_verdicts 에만 있어 따로 가리지 않는다.
+/// 왕복은 원본과 같은 한 번이다
+pub fn stored_verdicts_sql(n: usize) -> String {
+    format!("SELECT e.\"id\", \"eval_id\", \"tier\", \"grade\", \"rank\", \"evidence\" FROM evaluations e LEFT JOIN eval_verdicts ON \"eval_id\" = e.\"id\" WHERE e.\"id\" IN ({})", binds(n))
+}
+
+/// `storedVerdicts(env, ids)` (고침 fix-graph-similar-phantom, 원본 `verdictSummaries` 를 바꾼 것) — D1 에 행이 있는 평가 id 들과
+/// 그 가운데 판정이 있는 것의 요약(`eval_id` → `{ tier, grade, rank, evidence }`, 그 키 차례). 판정 행이 없으면 요약에 없다(원본과 같이 unrated).
 /// ids 가 비었으면 D1 을 부르지 않는다. ids 는 50개 이하로만 부른다 (D1 은 문장당 바인딩이 100개까지)
 #[cfg(target_arch = "wasm32")]
-pub async fn verdict_summaries(env: &premium_discount_worker_common::js::Env, ids: &[String]) -> premium_discount_worker_common::R<indexmap::IndexMap<String, V>> {
+pub async fn stored_verdicts(
+    env: &premium_discount_worker_common::js::Env,
+    ids: &[String],
+) -> premium_discount_worker_common::R<(std::collections::HashSet<String>, indexmap::IndexMap<String, V>)> {
     use premium_discount_worker_common::{js, obj};
+    let mut stored = std::collections::HashSet::new();
     let mut out = indexmap::IndexMap::new();
     if ids.is_empty() {
-        return Ok(out);
+        return Ok((stored, out));
     }
-    let sql = format!("SELECT \"eval_id\", \"tier\", \"grade\", \"rank\", \"evidence\" FROM eval_verdicts WHERE \"eval_id\" IN ({})", binds(ids.len()));
     let args: Vec<V> = ids.iter().map(|s| V::from(s.as_str())).collect();
-    let rs = js::all(&js::bind_exact(&env.prepare("DB", &sql)?, &args)?).await?;
+    let rs = js::all(&js::bind_exact(&env.prepare("DB", &stored_verdicts_sql(ids.len()))?, &args)?).await?;
     for r in rs.g("results")?.items() {
-        out.insert(r.get("eval_id").to_key(), obj! { "tier" => r.get("tier"), "grade" => r.get("grade"), "rank" => r.get("rank"), "evidence" => r.get("evidence") });
+        stored.insert(r.get("id").to_key());
+        let eval_id = r.get("eval_id");
+        if !eval_id.is_nullish() {
+            out.insert(eval_id.to_key(), obj! { "tier" => r.get("tier"), "grade" => r.get("grade"), "rank" => r.get("rank"), "evidence" => r.get("evidence") });
+        }
     }
-    Ok(out)
+    Ok((stored, out))
 }
 
 #[cfg(test)]
@@ -177,6 +194,10 @@ mod tests {
         assert_eq!(parse_uuid(&V::from("0190f0a0-0000-7000-8000-0000000000a"), "id").unwrap_err().message, "id must be a UUID");
         assert_eq!(parse_uuid(&V::Num(1.0), "ids").unwrap_err().message, "ids must be a UUID");
         assert_eq!(binds(3), "?1, ?2, ?3");
+        assert_eq!(
+            stored_verdicts_sql(2),
+            r#"SELECT e."id", "eval_id", "tier", "grade", "rank", "evidence" FROM evaluations e LEFT JOIN eval_verdicts ON "eval_id" = e."id" WHERE e."id" IN (?1, ?2)"#
+        );
         assert_eq!(plain_error(&validation_error("x")).to_string(), "Error: x");
     }
 

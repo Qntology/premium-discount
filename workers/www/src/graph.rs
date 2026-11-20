@@ -1,8 +1,10 @@
 //! 원본 `graph.ts` (463줄) — 그래프 API (공개). 경로: /graph, /graph/local, /graph/similar, /graph/view
 //!
 //! - `GET /graph?cc=example.com` : 도메인 범위 그래프 (최신 200건, created_at DESC)
-//! - `GET /graph/local?id=…` : 선택한 평가가 속한 스레드(같은 root) 그래프 (200건, created_at ASC)
-//! - `GET /graph/similar?id=…&topK=10` : 선택한 평가와 벡터가 비슷한 평가 (같은 cc 안에서, Vectorize getByIds → query)
+//! - `GET /graph/local?id=…` : 선택한 평가가 속한 스레드(같은 root) 그래프 (200건, created_at ASC). 200건 넘는 스레드는 고른 평가와
+//!   그 조상 사슬 + 가장 새 평가들 (고침 fix-graph-local-window, [`local_thread_sql`])
+//! - `GET /graph/similar?id=…&topK=10` : 선택한 평가와 벡터가 비슷한 평가 (같은 cc 안에서, Vectorize getByIds → query).
+//!   D1 에 행이 없는 벡터(유령)는 뺀다 (고침 fix-graph-similar-phantom, [`stored_matches`])
 //! - `GET /graph/view` : 옵시디언식 그래프 뷰 페이지 ([`view::VIEW_HTML`], 요청 제한 대상이 아니다)
 //!
 //! 인증은 없고, JSON 셋은 읽기 제한기(EVAL_READ_LIMITER, IP 기준)를 쓴다. 응답에는 원문과 주소(from, to 원값)가 들어가지 않는다.
@@ -37,6 +39,21 @@ pub const SELECT_COLS: &str = r#"e."id", e."from", e."cc", e."ref", e."root", e.
 pub const FROM_JOINED: &str = r#"evaluations e LEFT JOIN eval_verdicts v ON v."eval_id" = e."id""#;
 /// `GRAPH_PATHS`
 pub const GRAPH_PATHS: [&str; 4] = ["/graph", "/graph/local", "/graph/similar", "/graph/view"];
+
+/// `/graph/local` 의 스레드 읽기. 고침(fix-graph-local-window): 원본은 `WHERE e."root" = ?1 ORDER BY e."created_at" ASC LIMIT ?2` 라
+/// 200건 넘는 스레드에서는 가장 오래된 200건만 나와, 고른 평가와 그 뒤의 답글이 빠질 수 있었다. 이제 묶음은 `?1` root · `?2` 상한(200) ·
+/// `?3` 고른 평가의 id 이고 한 문장으로:
+///
+/// - `chain`: 고른 평가에서 `ref` 를 따라 root 까지 올라가는 조상 사슬 (재귀 CTE, 같은 스레드의 행만, 깊이 `?2` 까지 — 사슬이 200보다 길면
+///   고른 평가에 가까운 200개)
+/// - `newest`: 사슬에 없는 스레드 평가 가운데 가장 새 것(`created_at DESC, id DESC`) 을 남은 칸(`?2` − 사슬 수)만큼
+/// - 바깥 SELECT: 스레드가 `?2` 건 이하이면 원본과 같이 스레드 전부, 넘으면 사슬 ∪ newest. 어느 쪽이든 원본과 같은 `root` 색인 ·
+///   `created_at ASC` 정렬 · `LIMIT ?2` 라 200건 이하 스레드의 행과 그 차례(같은 시각의 차례까지)는 원본 그대로다
+pub fn local_thread_sql() -> String {
+    format!(
+        r#"WITH RECURSIVE "chain"("id", "depth") AS (SELECT ?3, 1 UNION SELECT p."id", c."depth" + 1 FROM "chain" c JOIN evaluations x ON x."id" = c."id" JOIN evaluations p ON p."id" = x."ref" AND p."root" = ?1 WHERE c."depth" < ?2), "newest"("id") AS (SELECT "id" FROM evaluations WHERE "root" = ?1 AND "id" NOT IN (SELECT "id" FROM "chain") ORDER BY "created_at" DESC, "id" DESC LIMIT max(0, ?2 - (SELECT COUNT(DISTINCT "id") FROM "chain"))) SELECT {SELECT_COLS} FROM {FROM_JOINED} WHERE e."root" = ?1 AND ((SELECT COUNT(*) FROM evaluations WHERE "root" = ?1) <= ?2 OR e."id" IN (SELECT "id" FROM "chain") OR e."id" IN (SELECT "id" FROM "newest")) ORDER BY e."created_at" ASC LIMIT ?2"#
+    )
+}
 
 /// `url.searchParams.get(name)` — 처음 것 (form-urlencoded 풀이: `+` 는 공백, 잘못된 UTF-8 은 U+FFFD), 없으면 null
 pub fn search_param(url: &url::Url, name: &str) -> V {
@@ -208,6 +225,12 @@ pub fn other_matches(res: &V, id: &str, top_k: f64) -> R<Vec<V>> {
     Ok(out)
 }
 
+/// 고침(fix-graph-similar-phantom): Vectorize 결과 가운데 D1 에 평가 행이 있는 것만, 그 차례대로 (`matches.filter((m) => stored.has(m.id))`).
+/// 원본은 D1 을 확인하지 않아 행 없는 벡터(유령)도 판정 없는(unrated) 노드로 냈다
+pub fn stored_matches(matches: &[V], stored: &std::collections::HashSet<String>) -> Vec<V> {
+    matches.iter().filter(|m| stored.contains(&m.get("id").to_key())).cloned().collect()
+}
+
 /// `similarGraph` 의 응답 본문 — 유사 노드(같은 cc)와 `similar` 엣지(score), summary 는 유사 노드만 센다
 pub fn similar_body(id: &str, cc: &V, matches: &[V], verdicts: &IndexMap<String, V>) -> R<V> {
     let mut nodes = Vec::new();
@@ -244,7 +267,7 @@ mod wasm {
 
     use super::*;
     use crate::ratelimit::{is_rate_limited, RETRY_AFTER_SECONDS};
-    use crate::util::{hv, is_validation, json_response, parse_domain, parse_uuid, verdict_summaries};
+    use crate::util::{hv, is_validation, json_response, parse_domain, parse_uuid, stored_verdicts};
 
     /// `json(body, status)` — Content-Type · Cache-Control
     fn json(body: V, status: u16) -> Resp {
@@ -278,12 +301,12 @@ mod wasm {
     /// GET /graph/local?id=... : 선택한 평가가 속한 스레드(같은 root) 그래프
     async fn local_graph(url: &url::Url, env: &Env) -> R<Resp> {
         let id = parse_uuid(&search_param(url, "id"), "id")?;
-        let base = js::first(&stmt(env, r#"SELECT "root" FROM evaluations WHERE "id" = ?1"#, &[V::from(id)])?).await?;
+        let base = js::first(&stmt(env, r#"SELECT "root" FROM evaluations WHERE "id" = ?1"#, &[V::from(id.as_str())])?).await?;
         if !base.truthy() {
             return Ok(not_found("not found"));
         }
-        let sql = format!(r#"SELECT {SELECT_COLS} FROM {FROM_JOINED} WHERE e."root" = ?1 ORDER BY e."created_at" ASC LIMIT ?2"#);
-        let rs = js::all(&stmt(env, &sql, &[base.g("root")?, V::Num(GRAPH_NODE_LIMIT_TEMP)])?).await?;
+        // 고침(fix-graph-local-window): 200건 넘는 스레드는 고른 평가 · 조상 사슬 + 가장 새 평가들 ([`local_thread_sql`])
+        let rs = js::all(&stmt(env, &local_thread_sql(), &[base.g("root")?, V::Num(GRAPH_NODE_LIMIT_TEMP), V::from(id)])?).await?;
         build(&rs.g("results")?, env)
     }
 
@@ -306,9 +329,11 @@ mod wasm {
         let options = obj! { "topK" => top_k + 1.0, "filter" => obj! { "cc" => cc.clone() } };
         let res = js::call_async(&index, "query", &[js::to_js(&array_from(&values)), js::to_js(&options)]).await?;
         let matches = other_matches(&res, &id, top_k)?;
-        // 최대 49건이라 IN 한 번으로 읽는다. 알려진 차이: id 가 글이 아니면(Vectorize 는 늘 글) 원본은 값 그대로 묶는다
+        // 최대 49건이라 IN 한 번으로 읽는다. 알려진 차이: id 가 글이 아니면(Vectorize 는 늘 글) 원본은 값 그대로 묶는다.
+        // 고침(fix-graph-similar-phantom): 같은 문장이 평가 행이 있는지도 알려 주어, 행 없는 결과(유령)를 뺀다
         let ids: Vec<String> = matches.iter().map(|m| m.get("id").to_str()).collect();
-        let verdicts = verdict_summaries(env, &ids).await?;
+        let (stored, verdicts) = stored_verdicts(env, &ids).await?;
+        let matches = stored_matches(&matches, &stored);
         Ok(json(similar_body(&id, &cc, &matches, &verdicts)?, 200))
     }
 
@@ -450,6 +475,24 @@ mod tests {
         assert_eq!(stringify_str(&array_from(&V::from("a😀"))), r#"["a","😀"]"#);
         assert_eq!(stringify_str(&array_from(&obj! { "length" => 2.0, "0" => 1.0 })), "[1,null]");
         assert_eq!(stringify_str(&array_from(&V::Num(3.0))), "[]");
+    }
+
+    #[test]
+    fn local_thread_sql_binds_root_limit_and_selected_id() {
+        let sql = local_thread_sql();
+        assert!(sql.starts_with(r#"WITH RECURSIVE "chain"("id", "depth") AS (SELECT ?3, 1 UNION "#), "{sql}");
+        assert!(sql.ends_with(r#"ORDER BY e."created_at" ASC LIMIT ?2"#), "{sql}");
+        assert!(sql.contains(&format!("SELECT {SELECT_COLS} FROM {FROM_JOINED} WHERE e.\"root\" = ?1 AND ")));
+        assert!(!sql.contains('\n') && !sql.contains("?4"));
+    }
+
+    #[test]
+    fn similar_drops_matches_without_a_stored_row_and_keeps_the_order() {
+        let m = |id: &str, s: f64| obj! { "id" => id, "score" => s };
+        let stored: std::collections::HashSet<String> = ["c", "a"].iter().map(|s| s.to_string()).collect();
+        let out = stored_matches(&[m("a", 0.9), m("ghost", 0.8), m("c", 0.7), m("a", 0.6)], &stored);
+        assert_eq!(out.iter().map(|x| stringify_str(x)).collect::<Vec<_>>(), [r#"{"id":"a","score":0.9}"#, r#"{"id":"c","score":0.7}"#, r#"{"id":"a","score":0.6}"#]);
+        assert!(stored_matches(&[m("ghost", 1.0)], &stored).is_empty());
     }
 
     #[test]
