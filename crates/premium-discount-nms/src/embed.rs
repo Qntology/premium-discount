@@ -87,7 +87,7 @@ impl TextEmbedder for GraniteEmbedder {
         self.embed_batch(&[text]).pop().unwrap_or_default()
     }
     fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let missing: Vec<&str> = {
             let mut seen = std::collections::HashSet::new();
             texts
@@ -120,12 +120,9 @@ impl TextEmbedder for GraniteEmbedder {
 }
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let (mut d, mut na, mut nb) = (0f32, 0f32, 0f32);
-    for (x, y) in a.iter().zip(b) {
-        d += x * y;
-        na += x * x;
-        nb += y * y;
-    }
+    let d = premium_discount_cpu_kernels::dot_f32_simd(a, b);
+    let na = premium_discount_cpu_kernels::dot_f32_simd(a, a);
+    let nb = premium_discount_cpu_kernels::dot_f32_simd(b, b);
     if na == 0.0 || nb == 0.0 {
         0.0
     } else {

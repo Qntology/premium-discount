@@ -50,15 +50,17 @@ fn rope_tables(theta: f64, head_dim: usize, seq: usize, dev: &Device) -> Result<
     let inv: Vec<f32> = (0..half)
         .map(|i| (1.0 / theta.powf((2 * i) as f64 / head_dim as f64)) as f32)
         .collect();
-    let mut cos = Vec::with_capacity(seq * head_dim);
-    let mut sin = Vec::with_capacity(seq * head_dim);
+    let mut cos = vec![0f32; seq * head_dim];
+    let mut sin = vec![0f32; seq * head_dim];
     for t in 0..seq {
-        let freqs: Vec<f32> = inv.iter().map(|f| t as f32 * f).collect();
-        for _ in 0..2 {
-            for f in &freqs {
-                cos.push(f.cos());
-                sin.push(f.sin());
-            }
+        let base = t * head_dim;
+        let tf = t as f32;
+        for (i, &f) in inv.iter().enumerate() {
+            let (s, c) = (tf * f).sin_cos();
+            cos[base + i] = c;
+            cos[base + half + i] = c;
+            sin[base + i] = s;
+            sin[base + half + i] = s;
         }
     }
     Ok((
@@ -129,16 +131,40 @@ struct SelfAttention {
 }
 
 impl SelfAttention {
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (b, t, _) = x.dims3()?;
         let q = self.q_proj.forward(x)?.reshape((b, t, self.heads, self.head_dim))?;
-        let q = apply_rope(&self.q_norm.forward(&q)?, cos, sin)?.transpose(1, 2)?.contiguous()?;
+        let q = apply_rope(&self.q_norm.forward(&q)?, cos, sin)?;
 
         let k = self.k_proj.forward(x)?.reshape((b, t, self.kv_heads, self.head_dim))?;
-        let k = apply_rope(&self.k_norm.forward(&k)?, cos, sin)?.transpose(1, 2)?.contiguous()?;
+        let k = apply_rope(&self.k_norm.forward(&k)?, cos, sin)?;
 
         let v = self.v_proj.forward(x)?.reshape((b, t, self.kv_heads, self.head_dim))?;
-        let v = self.v_norm.forward(&v)?.transpose(1, 2)?.contiguous()?;
+        let v = self.v_norm.forward(&v)?;
+
+        // When unmasked on CPU F32 (e.g. bidirectional full/short-window attention), stream directly in SHD layout
+        // without materializing a [B, H, T, T] score matrix or repeating KV heads.
+        if mask.is_none() && b == 1 && x.device().is_cpu() && x.dtype() == DType::F32 {
+            let q_vec = q.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let k_vec = k.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let v_vec = v.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let mut out = vec![0.0f32; t * self.heads * self.head_dim];
+            let cfg = premium_discount_cpu_kernels::CpuStreamAttnCfg {
+                num_heads: self.heads,
+                num_kv_heads: self.kv_heads,
+                head_dim: self.head_dim,
+                scale: 1.0,
+                causal: false,
+                past_offset: 0,
+            };
+            premium_discount_cpu_kernels::stream_attention_f32(&q_vec, &k_vec, &v_vec, t, t, &cfg, &mut out);
+            let out = Tensor::from_vec(out, (1, t, self.heads * self.head_dim), x.device())?;
+            return self.o_proj.forward(&out);
+        }
+
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
 
         let reps = self.heads / self.kv_heads;
         let k = repeat_kv(k, reps)?;
@@ -146,7 +172,10 @@ impl SelfAttention {
 
         // 점수 배율은 1.0 (config의 query_pre_attn_scalar 대신 q_norm/k_norm을 쓴다)
         let scores = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
-        let scores = scores.broadcast_add(mask)?;
+        let scores = match mask {
+            Some(m) => scores.broadcast_add(m)?,
+            None => scores,
+        };
         let probs = ops::softmax_last_dim(&scores)?;
         let out = probs.matmul(&v)?;
         let out = out.transpose(1, 2)?.reshape((b, t, self.heads * self.head_dim))?;
@@ -171,7 +200,7 @@ struct Layer {
 }
 
 impl Layer {
-    fn forward(&self, h: &Tensor, ple: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, h: &Tensor, ple: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.input_norm.forward(h)?;
         let x = self.attn.forward(&x, cos, sin, mask)?;
         let x = self.post_attn_norm.forward(&x)?;
@@ -400,14 +429,22 @@ impl TextModel {
 
         let (cos_s, sin_s) = rope_tables(ROPE_THETA_SLIDING, TEXT_HEAD_DIM, t, dev)?;
         let (cos_f, sin_f) = rope_tables(ROPE_THETA_FULL, TEXT_GLOBAL_HEAD_DIM, t, dev)?;
-        let mask_sliding = attention_mask(t, true, self.bidirectional, dev)?;
-        let mask_full = attention_mask(t, false, self.bidirectional, dev)?;
+        let mask_sliding = if self.bidirectional && t <= BIDIRECTIONAL_SLIDING_WINDOW + 1 {
+            None
+        } else {
+            Some(attention_mask(t, true, self.bidirectional, dev)?)
+        };
+        let mask_full = if self.bidirectional {
+            None
+        } else {
+            Some(attention_mask(t, false, false, dev)?)
+        };
 
         for (i, layer) in self.layers.iter().enumerate() {
             let ple_i = ple.i((.., .., i, ..))?;
             h = match layer.kind {
-                Attention::Full => layer.forward(&h, &ple_i, &cos_f, &sin_f, &mask_full)?,
-                Attention::Sliding => layer.forward(&h, &ple_i, &cos_s, &sin_s, &mask_sliding)?,
+                Attention::Full => layer.forward(&h, &ple_i, &cos_f, &sin_f, mask_full.as_ref())?,
+                Attention::Sliding => layer.forward(&h, &ple_i, &cos_s, &sin_s, mask_sliding.as_ref())?,
             };
         }
         self.norm.forward(&h)
@@ -418,10 +455,12 @@ impl TextModel {
         self.embed_hidden(&self.forward(ids)?)
     }
 
-    /// 최종 hidden (1 x t x 512) -> 768차원 벡터. 풀링은 전체 토큰 평균(1_Pooling mean), 이후 L2 정규화(2_Normalize)
+    /// 최종 hidden (1 x t x 512) -> 768차원 벡터.
+    /// `self.projection` is bias-free linear, so mean-pooling before the 512->768 projection is mathematically
+    /// identical to projecting every token and averaging, while reducing projection work by `t`x.
     pub fn embed_hidden(&self, hidden: &Tensor) -> Result<Vec<f32>> {
-        let projected = self.projection.forward(hidden)?;
-        let pooled = projected.mean_keepdim(1)?.squeeze(1)?;
+        let pooled_hidden = hidden.mean(1)?;
+        let pooled = self.projection.forward(&pooled_hidden)?;
         let norm = pooled.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
         pooled.broadcast_div(&norm)?.squeeze(0)?.to_vec1::<f32>()
     }

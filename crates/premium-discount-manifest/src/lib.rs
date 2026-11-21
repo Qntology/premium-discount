@@ -83,10 +83,32 @@ pub fn promote(part: &Path, target: &Path, size: u64, sha256: &str) -> std::io::
     if !got.eq_ignore_ascii_case(sha256) {
         return fail(format!("{}: SHA-256 {got} 이 고정값 {sha256} 과 다릅니다", target.display()));
     }
-    if target.exists() {
-        std::fs::remove_file(target)?;
+    replace_atomically(part, target)
+}
+
+/// 크래시나 잠금 시 기존 파일이 사라지지 않도록 백업 스왑으로 원자적 교체한다.
+fn replace_atomically(src: &Path, target: &Path) -> std::io::Result<()> {
+    match std::fs::rename(src, target) {
+        Ok(()) => Ok(()),
+        Err(_) if target.exists() => {
+            let mut bak_os = target.as_os_str().to_os_string();
+            bak_os.push(format!(".bak.{}", std::process::id()));
+            let bak = PathBuf::from(bak_os);
+            let _ = std::fs::remove_file(&bak);
+            std::fs::rename(target, &bak)?;
+            match std::fs::rename(src, target) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&bak);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::rename(&bak, target);
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => Err(e),
     }
-    std::fs::rename(part, target)
 }
 
 /// 목록이 적은 경로가 폴더 안의 평범한 상대 경로인지 (`..`, 루트, 드라이브, 역슬래시, 빈 문자열은 안 된다)

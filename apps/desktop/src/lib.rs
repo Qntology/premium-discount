@@ -368,6 +368,21 @@ pub fn run() {
             cmd_analytic_report,
             cmd_analytic_forget,
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri 앱을 실행하지 못했습니다");
+        .build(tauri::generate_context!())
+        .expect("Tauri 앱을 초기화하지 못했습니다")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(shell) = app_handle.try_state::<Shell>() {
+                    if let Ok(mut guard) = shell.core.try_lock() {
+                        *guard = CoreState::Empty;
+                    }
+                    if let Some(draft) = &shell.draft {
+                        let _ = draft.try_release();
+                    }
+                    shell.filter.set(Arc::new(premium_discount_app::filter::LocalFilter::default()), "dictionary");
+                }
+                let _ = premium_discount_app::utils::release_opened_gpu();
+                premium_discount_app::utils::rocm_exit_now_if_used(0);
+            }
+        });
 }

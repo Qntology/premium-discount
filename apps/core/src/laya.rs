@@ -10,7 +10,9 @@
 //!   최대 1024 토큰 중 질문·선택지에 256 (rl_agent_config.json).
 //! - 정밀도: 지시서대로 양자화 면제가 기본이다 (F32, 원본 F16에서 정확히 바꾼 값). Q8_0은 설정으로만.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::VarBuilder;
@@ -130,17 +132,21 @@ fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Te
 /// (t, HEAD_DIM) cos, sin (rotate_half 방식: 앞 절반과 뒤 절반이 같은 주파수)
 fn rope(t: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
     let half = HEAD_DIM / 2;
+    let inv_freq: Vec<f64> = (0..half)
+        .map(|i| 1.0 / ROPE_THETA.powf((2 * i) as f64 / HEAD_DIM as f64))
+        .collect();
     let mut cos = vec![0f32; t * HEAD_DIM];
     let mut sin = vec![0f32; t * HEAD_DIM];
     for p in 0..t {
-        for i in 0..half {
-            let inv = 1.0 / ROPE_THETA.powf((2 * i) as f64 / HEAD_DIM as f64);
-            let a = p as f64 * inv;
-            let (c, s) = (a.cos() as f32, a.sin() as f32);
-            cos[p * HEAD_DIM + i] = c;
-            cos[p * HEAD_DIM + i + half] = c;
-            sin[p * HEAD_DIM + i] = s;
-            sin[p * HEAD_DIM + i + half] = s;
+        let base = p * HEAD_DIM;
+        let pf = p as f64;
+        for (i, &inv) in inv_freq.iter().enumerate() {
+            let (s, c) = (pf * inv).sin_cos();
+            let (c, s) = (c as f32, s as f32);
+            cos[base + i] = c;
+            cos[base + i + half] = c;
+            sin[base + i] = s;
+            sin[base + i + half] = s;
         }
     }
     Ok((Tensor::from_vec(cos, (t, HEAD_DIM), dev)?, Tensor::from_vec(sin, (t, HEAD_DIM), dev)?))
@@ -155,8 +161,11 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(cos)?.broadcast_add(&rotated.broadcast_mul(sin)?)
 }
 
-/// 창 어텐션 마스크 (t, t): |i - j| > 64면 매우 작은 값
-fn window_mask(t: usize, dev: &Device) -> Result<Tensor> {
+/// 창 어텐션 마스크 (t, t): |i - j| > 64면 매우 작은 값. 길이가 창 반경+1 이하이면 None.
+fn window_mask(t: usize, dev: &Device) -> Result<Option<Tensor>> {
+    if t <= WINDOW_RADIUS + 1 {
+        return Ok(None);
+    }
     let mut v = vec![0f32; t * t];
     for i in 0..t {
         for j in 0..t {
@@ -165,11 +174,30 @@ fn window_mask(t: usize, dev: &Device) -> Result<Tensor> {
             }
         }
     }
-    Tensor::from_vec(v, (t, t), dev)
+    Tensor::from_vec(v, (t, t), dev).map(Some)
 }
 
 /// (heads, t, d) 어텐션. scale은 1/sqrt(d)
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    if mask.is_none() && q.device().is_cpu() && q.dtype() == DType::F32 {
+        let (heads, t, d) = q.dims3()?;
+        if heads == HEADS && d == HEAD_DIM {
+            let q_shd = q.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let k_shd = k.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let v_shd = v.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let mut out = vec![0.0f32; t * HEADS * HEAD_DIM];
+            let cfg = premium_discount_cpu_kernels::CpuStreamAttnCfg {
+                num_heads: HEADS,
+                num_kv_heads: HEADS,
+                head_dim: HEAD_DIM,
+                scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                causal: false,
+                past_offset: 0,
+            };
+            premium_discount_cpu_kernels::stream_attention_f32(&q_shd, &k_shd, &v_shd, t, t, &cfg, &mut out);
+            return Tensor::from_vec(out, (t, HEADS, HEAD_DIM), q.device())?.transpose(0, 1);
+        }
+    }
     let scores = (q.matmul(&k.t()?)? / (HEAD_DIM as f64).sqrt())?;
     let scores = match mask {
         Some(m) => scores.broadcast_add(m)?,
@@ -190,7 +218,7 @@ struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    fn forward(&self, h: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, h: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let t = h.dim(0)?;
         let x = match &self.attn_norm {
             Some(w) => layer_norm(h, w, None, NORM_EPS)?,
@@ -202,7 +230,7 @@ impl EncoderLayer {
         let (q, k, v) = (part(0)?, part(1)?, part(2)?);
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;
-        let out = attention(&q, &k, &v, if self.global { None } else { Some(mask) })?;
+        let out = attention(&q, &k, &v, if self.global { None } else { mask })?;
         let out = out.transpose(0, 1)?.contiguous()?.reshape((t, HIDDEN))?;
         let h = (h + self.wo.forward(&out)?)?;
         let x = layer_norm(&h, &self.mlp_norm, None, NORM_EPS)?;
@@ -214,36 +242,37 @@ impl EncoderLayer {
     }
 }
 
-/// PyTorch nn.TransformerEncoderLayer (norm_first=True, activation=relu, batch_first)
+/// PyTorch nn.TransformerEncoderLayer (norm_first=True, activation=relu, batch_first).
+/// Weights are pre-transposed and contiguous at load time to avoid per-call transpose copies.
 struct HeadLayer {
     norm1: (Tensor, Tensor),
-    in_proj_w: Tensor,
+    in_proj_wt: Tensor,
     in_proj_b: Tensor,
-    out_w: Tensor,
+    out_wt: Tensor,
     out_b: Tensor,
     norm2: (Tensor, Tensor),
     lin1: (Tensor, Tensor),
     lin2: (Tensor, Tensor),
 }
 
-fn affine(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
-    x.matmul(&w.t()?)?.broadcast_add(b)
+fn affine_t(x: &Tensor, wt: &Tensor, b: &Tensor) -> Result<Tensor> {
+    x.matmul(wt)?.broadcast_add(b)
 }
 
 impl HeadLayer {
     fn load(vb: &VarBuilder) -> Result<Self> {
         let pair = |vb: VarBuilder, n: usize, m: Option<usize>| -> Result<(Tensor, Tensor)> {
             match m {
-                Some(m) => Ok((vb.get((n, m), "weight")?, vb.get(n, "bias")?)),
+                Some(m) => Ok((vb.get((n, m), "weight")?.t()?.contiguous()?, vb.get(n, "bias")?)),
                 None => Ok((vb.get(n, "weight")?, vb.get(n, "bias")?)),
             }
         };
         let a = vb.pp("self_attn");
         Ok(Self {
             norm1: pair(vb.pp("norm1"), HIDDEN, None)?,
-            in_proj_w: a.get((3 * HIDDEN, HIDDEN), "in_proj_weight")?,
+            in_proj_wt: a.get((3 * HIDDEN, HIDDEN), "in_proj_weight")?.t()?.contiguous()?,
             in_proj_b: a.get(3 * HIDDEN, "in_proj_bias")?,
-            out_w: a.pp("out_proj").get((HIDDEN, HIDDEN), "weight")?,
+            out_wt: a.pp("out_proj").get((HIDDEN, HIDDEN), "weight")?.t()?.contiguous()?,
             out_b: a.pp("out_proj").get(HIDDEN, "bias")?,
             norm2: pair(vb.pp("norm2"), HIDDEN, None)?,
             lin1: pair(vb.pp("linear1"), HEAD_FF, Some(HIDDEN))?,
@@ -254,15 +283,15 @@ impl HeadLayer {
     fn forward(&self, h: &Tensor) -> Result<Tensor> {
         let t = h.dim(0)?;
         let x = layer_norm(h, &self.norm1.0, Some(&self.norm1.1), NORM_EPS)?;
-        let qkv = affine(&x, &self.in_proj_w, &self.in_proj_b)?;
+        let qkv = affine_t(&x, &self.in_proj_wt, &self.in_proj_b)?;
         let split = |i: usize| -> Result<Tensor> {
             qkv.narrow(D::Minus1, i * HIDDEN, HIDDEN)?.reshape((t, HEADS, HEAD_DIM))?.transpose(0, 1)?.contiguous()
         };
         let out = attention(&split(0)?, &split(1)?, &split(2)?, None)?;
         let out = out.transpose(0, 1)?.contiguous()?.reshape((t, HIDDEN))?;
-        let h = (h + affine(&out, &self.out_w, &self.out_b)?)?;
+        let h = (h + affine_t(&out, &self.out_wt, &self.out_b)?)?;
         let x = layer_norm(&h, &self.norm2.0, Some(&self.norm2.1), NORM_EPS)?;
-        let y = affine(&affine(&x, &self.lin1.0, &self.lin1.1)?.relu()?, &self.lin2.0, &self.lin2.1)?;
+        let y = affine_t(&affine_t(&x, &self.lin1.0, &self.lin1.1)?.relu()?, &self.lin2.0, &self.lin2.1)?;
         h + y
     }
 }
@@ -281,6 +310,7 @@ pub struct LayaModel {
     scorer2: (Tensor, Tensor),
     temperature: [f32; 3],
     device: Device,
+    seq_cache: Mutex<HashMap<usize, (Tensor, Tensor, Option<Tensor>)>>,
 }
 
 impl LayaModel {
@@ -331,10 +361,17 @@ impl LayaModel {
             type_emb: vb.get((3, HIDDEN), "type_emb.weight").map_err(err("type_emb"))?,
             head,
             scorer_norm: (s.pp("0").get(HIDDEN, "weight").map_err(err("scorer"))?, s.pp("0").get(HIDDEN, "bias").map_err(err("scorer"))?),
-            scorer1: (s.pp("1").get((HIDDEN, HIDDEN), "weight").map_err(err("scorer"))?, s.pp("1").get(HIDDEN, "bias").map_err(err("scorer"))?),
-            scorer2: (s.pp("3").get((1, HIDDEN), "weight").map_err(err("scorer"))?, s.pp("3").get(1, "bias").map_err(err("scorer"))?),
+            scorer1: (
+                s.pp("1").get((HIDDEN, HIDDEN), "weight").and_then(|w| w.t()?.contiguous()).map_err(err("scorer"))?,
+                s.pp("1").get(HIDDEN, "bias").map_err(err("scorer"))?,
+            ),
+            scorer2: (
+                s.pp("3").get((1, HIDDEN), "weight").and_then(|w| w.t()?.contiguous()).map_err(err("scorer"))?,
+                s.pp("3").get(1, "bias").map_err(err("scorer"))?,
+            ),
             temperature: [temperature[0], temperature[1], temperature[2]],
             device,
+            seq_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -385,14 +422,27 @@ impl LayaModel {
         Ok((ids, markers))
     }
 
+    fn seq_tables(&self, t: usize) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        if let Some(entry) = self.seq_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&t) {
+            return Ok(entry.clone());
+        }
+        let (cos, sin) = rope(t, &self.device)?;
+        let mask = window_mask(t, &self.device)?;
+        let mut cache = self.seq_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(t, (cos.clone(), sin.clone(), mask.clone()));
+        Ok((cos, sin, mask))
+    }
+
     /// 인코더 마지막 은닉 상태 (t, 768). 시험에서 참조와 중간값을 비교할 때 쓴다
     pub fn encoder_hidden(&self, ids: &[u32]) -> Result<Tensor> {
         let t = ids.len();
         let mut h = layer_norm(&self.tokens.rows(ids)?, &self.emb_norm, None, NORM_EPS)?;
-        let (cos, sin) = rope(t, &self.device)?;
-        let mask = window_mask(t, &self.device)?;
+        let (cos, sin, mask) = self.seq_tables(t)?;
         for layer in &self.layers {
-            h = layer.forward(&h, &cos, &sin, &mask)?;
+            h = layer.forward(&h, &cos, &sin, mask.as_ref())?;
         }
         layer_norm(&h, &self.final_norm, None, NORM_EPS)
     }
@@ -407,8 +457,8 @@ impl LayaModel {
         let idx = Tensor::from_vec(markers.iter().map(|&m| m as u32).collect::<Vec<_>>(), markers.len(), &self.device)?;
         let m = h.index_select(&idx, 0)?;
         let m = layer_norm(&m, &self.scorer_norm.0, Some(&self.scorer_norm.1), NORM_EPS)?;
-        let m = affine(&m, &self.scorer1.0, &self.scorer1.1)?.gelu_erf()?;
-        affine(&m, &self.scorer2.0, &self.scorer2.1)?.squeeze(D::Minus1)?.to_vec1()
+        let m = affine_t(&m, &self.scorer1.0, &self.scorer1.1)?.gelu_erf()?;
+        affine_t(&m, &self.scorer2.0, &self.scorer2.1)?.squeeze(D::Minus1)?.to_vec1()
     }
 
     /// 상태(`{"body": 글}`)에 대한 질문의 선택지 확률

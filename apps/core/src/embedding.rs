@@ -47,7 +47,7 @@ pub fn check_contract(v: &[f32]) -> Result<(), AppError> {
     if v.iter().any(|x| !x.is_finite()) {
         return Err(AppError::Embed("vector contains non-finite values".into()));
     }
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm = premium_discount_cpu_kernels::dot_f32_simd(v, v).sqrt();
     if (norm - 1.0).abs() > 0.01 {
         return Err(AppError::Embed(format!("vector is not L2-normalized (norm={norm})")));
     }
@@ -60,7 +60,7 @@ pub fn l2_normalize(mut v: Vec<f32>) -> Result<Vec<f32>, AppError> {
     if v.iter().any(|x| !x.is_finite()) {
         return Err(AppError::Embed("vector contains non-finite values".into()));
     }
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm = premium_discount_cpu_kernels::dot_f32_simd(&v, &v).sqrt();
     if norm == 0.0 {
         return Err(AppError::Embed("zero vector cannot be normalized".into()));
     }

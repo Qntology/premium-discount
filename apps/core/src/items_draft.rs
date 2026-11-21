@@ -44,19 +44,37 @@ fn err(e: candle_core::Error) -> AppError {
 }
 
 /// JSON 문자열 안의 글을 따옴표가 나올 때까지 생성한다. 이스케이프(\")는 글로 본다.
-/// (글, 따옴표 뒤에 같은 토큰으로 이미 나온 글자)를 돌려준다
-fn generate_string(model: &Qwen35, head: &Head, st: &mut State, h: &mut candle_core::Tensor, max: usize) -> Result<(String, String), AppError> {
-    let mut ids: Vec<u32> = Vec::new();
-    let mut text = String::new();
-    for _ in 0..max {
+/// (글, 따옴표 뒤에 같은 토큰으로 이미 나온 글자)를 돌려준다.
+/// `advance_on_end == false`이면 마지막 토큰(닫는 따옴표 또는 `max` 도달) 뒤에 불필요한 `model.forward`를 생략한다.
+fn generate_string(
+    model: &Qwen35,
+    head: &Head,
+    st: &mut State,
+    h: &mut candle_core::Tensor,
+    max: usize,
+    advance_on_end: bool,
+) -> Result<(String, String), AppError> {
+    let mut ids: Vec<u32> = Vec::with_capacity(max);
+    for step in 0..max {
         let (id, _) = model.next_token(h, head, None).map_err(err)?;
         ids.push(id);
-        *h = model.forward(&[id], st).map_err(err)?;
-        text = model.decode(&ids);
-        if let Some(end) = closing_quote(&text) {
-            return Ok((unescape(&text[..end]), text[end + 1..].to_string()));
+        // ASCII '"' (0x22) never appears inside multi-byte UTF-8 continuation bytes, so we only run
+        // full sequence decode when the newest token piece contains '"' (avoiding O(N^2) decoding).
+        let piece = model.decode(&[id]);
+        if piece.contains('"') {
+            let text = model.decode(&ids);
+            if let Some(end) = closing_quote(&text) {
+                if advance_on_end {
+                    *h = model.forward(&[id], st).map_err(err)?;
+                }
+                return Ok((unescape(&text[..end]), text[end + 1..].to_string()));
+            }
+        }
+        if advance_on_end || step + 1 < max {
+            *h = model.forward(&[id], st).map_err(err)?;
         }
     }
+    let text = model.decode(&ids);
     Ok((unescape(&text), String::new()))
 }
 
@@ -88,17 +106,31 @@ fn unescape(s: &str) -> String {
 
 /// 잘라 낸 출력 헤드로 초안을 만든다: 고정 어휘에 이 페이지의 토큰을 더한 16,384개 (요청마다 행 1~2만 개를 매핑에서 읽는다)
 pub fn draft_trimmed(model: &Qwen35, plan: &VocabPlan, page: &str, link: &str) -> Result<ItemDraft, AppError> {
-    let mut page_ids = model.encode(page);
-    page_ids.truncate(MAX_PAGE_TOKENS);
-    page_ids.extend(model.encode(link));
-    let head = model.trimmed_head(plan.ids_for(&page_ids)).map_err(err)?;
-    draft(model, &head, page, link)
+    let raw_page_ids = model.encode(page);
+    let truncated_page = if raw_page_ids.len() > MAX_PAGE_TOKENS {
+        model.decode(&raw_page_ids[..MAX_PAGE_TOKENS])
+    } else {
+        page.to_string()
+    };
+    let mut vocab_ids = raw_page_ids;
+    vocab_ids.truncate(MAX_PAGE_TOKENS);
+    vocab_ids.extend(model.encode(link));
+    let head = model.trimmed_head(plan.ids_for(&vocab_ids)).map_err(err)?;
+    draft_preprocessed(model, &head, &truncated_page, link)
 }
 
 /// 페이지 글과 링크로 초안을 만든다
 pub fn draft(model: &Qwen35, head: &Head, page: &str, link: &str) -> Result<ItemDraft, AppError> {
     let page_ids = model.encode(page);
-    let page = if page_ids.len() > MAX_PAGE_TOKENS { model.decode(&page_ids[..MAX_PAGE_TOKENS]) } else { page.to_string() };
+    let page = if page_ids.len() > MAX_PAGE_TOKENS {
+        model.decode(&page_ids[..MAX_PAGE_TOKENS])
+    } else {
+        page.to_string()
+    };
+    draft_preprocessed(model, head, &page, link)
+}
+
+fn draft_preprocessed(model: &Qwen35, head: &Head, page: &str, link: &str) -> Result<ItemDraft, AppError> {
     let prompt = chat_prompt(SYSTEM, &format!("{page}\n\nlink: {link}"));
     let mut st = model.new_state();
     let mut ids = model.encode(&prompt);
@@ -112,9 +144,9 @@ pub fn draft(model: &Qwen35, head: &Head, page: &str, link: &str) -> Result<Item
     let kind = if choice == one { 1 } else { 2 };
 
     h = model.forward(&[&[choice][..], &model.encode(", \"head\": \"")].concat(), &mut st).map_err(err)?;
-    let (title, rest) = generate_string(model, head, &mut st, &mut h, MAX_HEAD_TOKENS)?;
+    let (title, rest) = generate_string(model, head, &mut st, &mut h, MAX_HEAD_TOKENS, true)?;
     h = model.forward(&model.encode(remaining(", \"body\": \"", &rest)), &mut st).map_err(err)?;
-    let (body, _) = generate_string(model, head, &mut st, &mut h, MAX_BODY_TOKENS)?;
+    let (body, _) = generate_string(model, head, &mut st, &mut h, MAX_BODY_TOKENS, false)?;
     Ok(ItemDraft { kind, digest: digest(title.trim()), head: title.trim().to_string(), body: body.trim().to_string(), link: link.to_string() })
 }
 
@@ -151,6 +183,16 @@ impl DraftEngine {
 
     pub fn loaded(&self) -> bool {
         self.slot.try_lock().map(|s| s.is_some()).unwrap_or(true)
+    }
+
+    /// Drops the cached Qwen3.5 draft model so its memory/GPU buffers are freed before shutdown.
+    pub async fn release(&self) -> bool {
+        self.slot.lock().await.take().is_some()
+    }
+
+    /// Best-effort non-async release for synchronous shutdown hooks (`tauri::RunEvent::Exit`).
+    pub fn try_release(&self) -> bool {
+        self.slot.try_lock().map(|mut slot| slot.take().is_some()).unwrap_or(false)
     }
 
     pub async fn run(&self, args: DraftArgs) -> Result<ItemDraft, crate::commands::CommandError> {

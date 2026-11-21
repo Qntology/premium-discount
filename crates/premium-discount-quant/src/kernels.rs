@@ -8,6 +8,7 @@
 
 use crate::gguf::GgmlType;
 use half::{bf16, f16};
+use rayon::prelude::*;
 
 #[inline]
 fn f16_at(b: &[u8], i: usize) -> f32 {
@@ -135,7 +136,9 @@ pub fn dot_row(ty: GgmlType, b: &[u8], x: &[f32]) -> f32 {
         GgmlType::Q8_0 => {
             let mut acc = 0f32;
             for (blk, xb) in b.chunks_exact(34).zip(x.chunks_exact(32)) {
-                acc += f16_at(blk, 0) * dot32(blk[2..].iter().map(|&q| (q as i8) as f32), xb);
+                // SAFETY: `blk[2..]` has length 32 and `i8` has alignment 1 (identical layout to `u8`).
+                let qi8 = unsafe { std::slice::from_raw_parts(blk[2..].as_ptr() as *const i8, 32) };
+                acc += f16_at(blk, 0) * premium_discount_cpu_kernels::dot_f32_i8_simd(xb, qi8);
             }
             acc
         }
@@ -208,7 +211,17 @@ pub fn dot_row(ty: GgmlType, b: &[u8], x: &[f32]) -> f32 {
         // registers, no allocation.
         GgmlType::BF16 => dot32(b.chunks_exact(2).map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32()), x),
         GgmlType::F16 => dot32(b.chunks_exact(2).map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32()), x),
-        GgmlType::F32 => dot32(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])), x),
+        GgmlType::F32 => {
+            #[cfg(target_endian = "little")]
+            {
+                // SAFETY: `align_to` only yields `mid` when properly aligned for `f32`.
+                let (head, mid, tail) = unsafe { b.align_to::<f32>() };
+                if head.is_empty() && tail.is_empty() && mid.len() == x.len() {
+                    return premium_discount_cpu_kernels::dot_f32_simd(mid, x);
+                }
+            }
+            dot32(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])), x)
+        }
         GgmlType::I32 => {
             let mut row = vec![0f32; x.len()];
             dequant_row(ty, b, &mut row);
@@ -217,21 +230,27 @@ pub fn dot_row(ty: GgmlType, b: &[u8], x: &[f32]) -> f32 {
     }
 }
 
-/// `y = W x` for a packed row-major matrix, rows split across threads.
+/// `y = W x` for a packed row-major matrix, rows split across the rayon thread pool.
 pub fn matvec(ty: GgmlType, w: &[u8], rows: usize, cols: usize, x: &[f32], y: &mut [f32]) {
     let rb = ty.row_bytes(cols);
     assert_eq!(w.len(), rows * rb);
     assert_eq!(x.len(), cols);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(rows.max(1));
-    let per = rows.div_ceil(threads);
-    std::thread::scope(|s| {
-        for (t, ys) in y.chunks_mut(per).enumerate() {
-            let w = &w[t * per * rb..];
-            s.spawn(move || {
-                for (i, yi) in ys.iter_mut().enumerate() {
-                    *yi = dot_row(ty, &w[i * rb..(i + 1) * rb], x);
-                }
-            });
+    assert_eq!(y.len(), rows);
+    if rows == 0 {
+        return;
+    }
+    if rows * cols < 16_384 {
+        for (i, yi) in y.iter_mut().enumerate() {
+            *yi = dot_row(ty, &w[i * rb..(i + 1) * rb], x);
+        }
+        return;
+    }
+    let chunk = (rows / rayon::current_num_threads().max(1)).clamp(8, 256);
+    y.par_chunks_mut(chunk).enumerate().for_each(|(c, ys)| {
+        let r0 = c * chunk;
+        for (i, yi) in ys.iter_mut().enumerate() {
+            let r = r0 + i;
+            *yi = dot_row(ty, &w[r * rb..(r + 1) * rb], x);
         }
     });
 }

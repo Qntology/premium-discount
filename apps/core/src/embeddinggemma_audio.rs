@@ -5,6 +5,7 @@
 //! 참조 비교는 tests/embeddinggemma_audio.rs. 입력이 30초를 넘으면 processor처럼 앞 30초만 쓴다.
 
 use std::f64::consts::{LN_2, PI};
+use std::sync::OnceLock;
 
 use candle_core::quantized::QTensor;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
@@ -120,27 +121,33 @@ fn linspace(start: f64, stop: f64, num: usize) -> Vec<f64> {
 }
 
 /// HTK 삼각 mel 필터 [NUM_BINS x NUM_MEL_BINS], 행 우선. norm 없음 (transformers mel_filter_bank와 같다)
-fn mel_filter_bank() -> Vec<f64> {
-    let mel_points = linspace(hz_to_mel(0.0), hz_to_mel(8000.0), NUM_MEL_BINS + 2);
-    let freqs: Vec<f64> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
-    let fft_freqs = linspace(0.0, 8000.0, NUM_BINS);
-    let diff: Vec<f64> = freqs.windows(2).map(|w| w[1] - w[0]).collect();
-    let mut out = vec![0f64; NUM_BINS * NUM_MEL_BINS];
-    for (k, &f) in fft_freqs.iter().enumerate() {
-        for m in 0..NUM_MEL_BINS {
-            let rise = (f - freqs[m]) / diff[m];
-            let fall = (freqs[m + 2] - f) / diff[m + 1];
-            out[k * NUM_MEL_BINS + m] = rise.min(fall).max(0.0);
+fn mel_filter_bank() -> &'static [f64] {
+    static TABLE: OnceLock<Vec<f64>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mel_points = linspace(hz_to_mel(0.0), hz_to_mel(8000.0), NUM_MEL_BINS + 2);
+        let freqs: Vec<f64> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
+        let fft_freqs = linspace(0.0, 8000.0, NUM_BINS);
+        let diff: Vec<f64> = freqs.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut out = vec![0f64; NUM_BINS * NUM_MEL_BINS];
+        for (k, &f) in fft_freqs.iter().enumerate() {
+            for m in 0..NUM_MEL_BINS {
+                let rise = (f - freqs[m]) / diff[m];
+                let fall = (freqs[m + 2] - f) / diff[m + 1];
+                out[k * NUM_MEL_BINS + m] = rise.min(fall).max(0.0);
+            }
         }
-    }
-    out
+        out
+    })
 }
 
 /// 주기적 Hann 창 (np.hanning(321)[:-1]을 float32로 저장한 값)
-fn hann_window() -> Vec<f64> {
-    (0..FRAME_LENGTH)
-        .map(|n| (0.5 - 0.5 * (2.0 * PI * n as f64 / FRAME_LENGTH as f64).cos()) as f32 as f64)
-        .collect()
+fn hann_window() -> &'static [f64] {
+    static TABLE: OnceLock<Vec<f64>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..FRAME_LENGTH)
+            .map(|n| (0.5 - 0.5 * (2.0 * PI * n as f64 / FRAME_LENGTH as f64).cos()) as f32 as f64)
+            .collect()
+    })
 }
 
 /// 길이가 2의 거듭제곱인 복소 FFT (제자리, radix-2)
@@ -204,6 +211,7 @@ fn compute_mel(samples: &[f32]) -> Mel {
     let mut valid = 0;
     let mut re = vec![0f64; FFT_LENGTH];
     let mut im = vec![0f64; FFT_LENGTH];
+    let mut mag = vec![0f64; NUM_BINS];
     for i in 0..frames {
         // 프레임 끝 위치 (321 샘플 창의 마지막 칸). 실제 음성 안에 있으면 유효
         let end = i * HOP_LENGTH + FRAME_LENGTH;
@@ -219,7 +227,9 @@ fn compute_mel(samples: &[f32]) -> Mel {
             re[k] = (wave(i * HOP_LENGTH + k) * window[k] as f32) as f64;
         }
         fft_in_place(&mut re, &mut im);
-        let mag: Vec<f64> = (0..NUM_BINS).map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt()).collect();
+        for k in 0..NUM_BINS {
+            mag[k] = (re[k] * re[k] + im[k] * im[k]).sqrt();
+        }
         for m in 0..NUM_MEL_BINS {
             let mut acc = 0f64;
             for (k, &mk) in mag.iter().enumerate() {
@@ -362,34 +372,45 @@ impl ChunkAttention {
 
         let mut out = vec![0f32; t * HIDDEN];
         let cap = LOGIT_CAP;
+        let mut query = [0f32; HEAD_DIM];
+        let mut logits = [0f32; CONTEXT_LEFT];
+        let mut weights = [0f32; CONTEXT_LEFT];
         for qi in 0..t {
             for hd in 0..HEADS {
                 let qb = qi * HIDDEN + hd * HEAD_DIM;
-                let query: Vec<f32> = (0..HEAD_DIM).map(|x| q[qb + x] * self.query_scale[x]).collect();
+                for x in 0..HEAD_DIM {
+                    query[x] = q[qb + x] * self.query_scale[x];
+                }
 
                 // 거리 d = 0..min(12, qi+1) 인 키만 쓴다. 나머지는 마스크로 0이 된다
                 let span = CONTEXT_LEFT.min(qi + 1);
-                let mut logits = Vec::with_capacity(span);
+                let mut peak = f32::NEG_INFINITY;
                 for d in 0..span {
                     let kb = (qi - d) * HIDDEN + hd * HEAD_DIM;
                     let rb = (POS_LEN - 1 - d) * HIDDEN + hd * HEAD_DIM;
-                    let mut ac = 0f32;
-                    let mut bd = 0f32;
-                    for x in 0..HEAD_DIM {
-                        ac += query[x] * k[kb + x];
-                        bd += query[x] * self.relative_keys[rb + x];
+                    let ac = premium_discount_cpu_kernels::dot_f32_simd(&query, &k[kb..kb + HEAD_DIM]);
+                    let bd = premium_discount_cpu_kernels::dot_f32_simd(&query, &self.relative_keys[rb..rb + HEAD_DIM]);
+                    let l = cap * ((ac + bd) / cap).tanh();
+                    logits[d] = l;
+                    if l > peak {
+                        peak = l;
                     }
-                    logits.push(cap * ((ac + bd) / cap).tanh());
                 }
 
-                let peak = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let weights: Vec<f32> = logits.iter().map(|l| (l - peak).exp()).collect();
-                let total: f32 = weights.iter().sum();
-                for (d, w) in weights.iter().enumerate() {
+                let mut total = 0f32;
+                for d in 0..span {
+                    let w = (logits[d] - peak).exp();
+                    weights[d] = w;
+                    total += w;
+                }
+                let inv_total = 1.0 / total;
+                let dst = &mut out[qb..qb + HEAD_DIM];
+                for d in 0..span {
                     let vb_ = (qi - d) * HIDDEN + hd * HEAD_DIM;
-                    let w = w / total;
+                    let w = weights[d] * inv_total;
+                    let vrow = &v[vb_..vb_ + HEAD_DIM];
                     for x in 0..HEAD_DIM {
-                        out[qb + x] += w * v[vb_ + x];
+                        dst[x] += w * vrow[x];
                     }
                 }
             }
