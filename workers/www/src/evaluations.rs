@@ -29,6 +29,23 @@ use crate::util::{hex, validation_error};
 pub const EVAL_DIMENSIONS: usize = 768;
 /// Vectorize: 메타데이터를 함께 반환할 때 topK 최대 50
 pub const TOP_K_MAX: u32 = 50;
+
+/// 검색이 고르는 창 — 원본이 Vectorize 에 묻던 topK: 등급 조건이 있으면 거르고도 topK 가 차도록 세 배(최대 50), 없으면 topK
+pub fn search_window(top_k: f64, tiered: bool) -> f64 {
+    if tiered {
+        f64::from(TOP_K_MAX).min(top_k * 3.0)
+    } else {
+        top_k
+    }
+}
+
+/// 고침(fix-graph-similar-overfetch): 검색이 Vectorize 에 묻는 topK. fix-graph-similar-phantom 이 유령(D1 에 행이 없는 결과)을 창 안에서 빼
+/// 결과가 topK 보다 적을 수 있었다. 이제 창의 두 배(여유 = 창)를 받아 유령을 뺀 뒤 창으로 자르고, 그 안에서 등급으로 거른다(유령이 없으면
+/// 원본과 같은 결과). 상한은 `returnMetadata: true`(V2 에서 'all' 로 본다)의 50 — developers.cloudflare.com/vectorize/platform/limits ·
+/// reference/client-api. 그래서 창이 25를 넘으면(등급 조건 없는 topK 26~50, 등급 조건 있는 topK 9 이상) 여유가 50 − 창으로 줄고 창이 50이면 없다
+pub fn search_query_top_k(window: f64) -> f64 {
+    f64::from(TOP_K_MAX).min(window * 2.0)
+}
 /// 원문 최대 크기 (UTF-8 바이트). 임시값
 pub const MAX_TEXT_BYTES: usize = 8192;
 /// 판정 조회 한 번에 받는 최대 id 수 (IN 바인딩이 D1 의 문장당 상한 100 을 넘지 않게)
@@ -699,8 +716,10 @@ mod wasm {
         let tier = body.get("tier");
         let tiers = if tier.is_undef() { None } else { Some(parse_tier_filter(&tier)?) };
 
-        // 거르고도 topK 가 차도록 등급 조건이 있으면 세 배(최대 50)까지 받아 온다
-        let options = obj! { "topK" => if tiers.is_some() { f64::from(TOP_K_MAX).min(top_k * 3.0) } else { top_k }, "returnMetadata" => true };
+        // 거르고도 topK 가 차도록 등급 조건이 있으면 세 배(최대 50)의 창. 고침(fix-graph-similar-overfetch): 유령을 빼고도 창이 차도록
+        // 그 두 배(최대 50)를 받아 온다
+        let window = search_window(top_k, tiers.is_some());
+        let options = obj! { "topK" => search_query_top_k(window), "returnMetadata" => true };
         if !filter.keys().is_empty() {
             options.put("filter", filter);
         }
@@ -710,8 +729,13 @@ mod wasm {
             ids.push(m.g("id")?);
         }
         let (stored, verdicts) = summaries(env, &ids).await?;
-        // 고침(fix-graph-similar-phantom): D1 에 평가 행이 없는 결과(유령)는 등급 조건보다 먼저 뺀다 (남은 것의 차례는 그대로)
-        let found: Vec<V> = match_list(&result)?.into_iter().filter(|m| stored.iter().any(|k| same_value_zero(k, &m.get("id")))).collect();
+        // 고침(fix-graph-similar-phantom): D1 에 평가 행이 없는 결과(유령)는 등급 조건보다 먼저 뺀다 (남은 것의 차례는 그대로).
+        // 고침(fix-graph-similar-overfetch): 남은 것을 원본의 창으로 자른다 — 등급 조건은 원본처럼 창 안에서만
+        let found: Vec<V> = match_list(&result)?
+            .into_iter()
+            .filter(|m| stored.iter().any(|k| same_value_zero(k, &m.get("id"))))
+            .take(window as usize)
+            .collect();
         let matches = match &tiers {
             Some(t) => found
                 .into_iter()
@@ -911,6 +935,24 @@ mod tests {
         assert!(!same_evaluation(&masked, &Submitted { to: &V::Null, ..s }));
         assert!(!same_evaluation(&masked, &Submitted { cc: "other.com", ..s }));
         assert!(!same_evaluation(&masked, &Submitted { ref_: &V::Null, ..s }));
+    }
+
+    #[test]
+    fn search_over_fetches_twice_the_window_within_the_metadata_cap() {
+        assert_eq!(search_window(10.0, false), 10.0);
+        assert_eq!(search_window(10.0, true), 30.0);
+        assert_eq!(search_window(17.0, true), 50.0);
+        assert_eq!(search_query_top_k(search_window(10.0, false)), 20.0);
+        assert_eq!(search_query_top_k(search_window(25.0, false)), 50.0);
+        assert_eq!(search_query_top_k(search_window(50.0, false)), 50.0, "창이 50이면 여유가 없다");
+        assert_eq!(search_query_top_k(search_window(1.0, true)), 6.0);
+        assert_eq!(search_query_top_k(search_window(10.0, true)), 50.0);
+        for k in 1..=50 {
+            for tiered in [false, true] {
+                let w = search_window(f64::from(k), tiered);
+                assert!(search_query_top_k(w) >= w && search_query_top_k(w) <= f64::from(TOP_K_MAX));
+            }
+        }
     }
 
     #[test]

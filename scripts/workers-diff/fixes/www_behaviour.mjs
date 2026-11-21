@@ -8,6 +8,9 @@
 //   행이 있는 결과만 그 차례대로 남긴다.
 // fix-eval-replay-mismatch: 같은 request_id 의 다시 보내기를 cc · ref 로만 견줘, 글이 다른 평가도 처음 항목으로 200 이었다. 찾은 행이 아직 쥐고
 //   있는 내용(to 늘, bcc 는 저장된 평가 · 살아 있는 대기열, text_hash 는 pending · processing 대기열)까지 견줘 다르면 409.
+// 그 뒤 하나 (위 고침에 덧댄다, 배열 차례대로 적용):
+// fix-graph-similar-overfetch: 유령을 topK 로 자른 뒤에 빼 결과가 topK 보다 적던 것 — Vectorize 에 두 배(상한 similar 100 · 검색 50)를 묻고
+//   유령을 뺀 뒤 원래 요청 수로 자른다.
 const GRAPH = "workers/www/src/graph.ts";
 const EVAL = "workers/www/src/evaluations.ts";
 
@@ -137,5 +140,41 @@ export default [
     id: "fix-eval-replay-mismatch", worker: "www", file: EVAL,
     find: "const again = await findReplay(env, requestId, cc, ref)",
     replace: "const again = await findReplay(env, requestId, content)",
+  },
+  // fix-graph-similar-overfetch (위 fix-graph-similar-phantom 에 덧댐): 유령을 빼고도 topK 가 차도록 Vectorize 에 두 배를 묻고(상한: similar 는
+  // values · metadata 없이 100, 검색은 returnMetadata 라 50), 유령을 뺀 뒤 원래 요청 수로 자른다. 유령이 없으면 결과는 원본과 같다
+  {
+    id: "fix-graph-similar-overfetch", worker: "www", file: GRAPH,
+    find: "topK: topK + 1,",
+    replace: "topK: Math.min(2 * (topK + 1), 100),",
+  },
+  {
+    id: "fix-graph-similar-overfetch", worker: "www", file: GRAPH,
+    find: "const candidates = res.matches.filter((m) => m.id !== id).slice(0, topK)",
+    replace: "const candidates = res.matches.filter((m) => m.id !== id)",
+  },
+  {
+    id: "fix-graph-similar-overfetch", worker: "www", file: GRAPH,
+    find: "const matches = candidates.filter((m) => stored.has(m.id))",
+    replace: "const matches = candidates.filter((m) => stored.has(m.id)).slice(0, topK)",
+  },
+  {
+    id: "fix-graph-similar-overfetch", worker: "www", file: EVAL,
+    find: [
+      "const result = await env.EVAL_VECTORIZE.query(vector, {",
+      "// 거르고도 topK가 차도록 등급 조건이 있으면 세 배까지 받아 온다",
+      "topK: tiers ? Math.min(TOP_K_MAX, topK * 3) : topK,",
+    ].join("\n"),
+    replace: [
+      "// 거르고도 topK가 차도록 등급 조건이 있으면 세 배까지의 창. 유령을 빼고도 창이 차도록 그 두 배(최대 50)를 받아 온다",
+      "\tconst searchWindow = tiers ? Math.min(TOP_K_MAX, topK * 3) : topK",
+      "\tconst result = await env.EVAL_VECTORIZE.query(vector, {",
+      "\t\ttopK: Math.min(TOP_K_MAX, searchWindow * 2),",
+    ].join("\n"),
+  },
+  {
+    id: "fix-graph-similar-overfetch", worker: "www", file: EVAL,
+    find: "const found = result.matches.filter((m) => stored.has(m.id))",
+    replace: "const found = result.matches.filter((m) => stored.has(m.id)).slice(0, searchWindow)",
   },
 ];
