@@ -40,6 +40,7 @@ const PATCH_DIM: usize = PATCH_SIZE * PATCH_SIZE * 3;
 const ROPE_THETA: f32 = 100.0;
 const RMS_EPS: f64 = 1e-6;
 /// processor_config.json의 rescale_factor (1/255)
+#[cfg(test)]
 const RESCALE: f32 = 0.00392156862745098;
 /// bicubic 커널의 a 값 (torch와 PIL 모두 -0.5)
 const BICUBIC_A: f64 = -0.5;
@@ -217,24 +218,21 @@ pub fn preprocess(image: &RgbImage, max_soft_tokens: usize) -> Result<Preprocess
     };
 
     let (ph, pw) = (th / PATCH_SIZE, tw / PATCH_SIZE);
-    let mut lut = [0f32; 256];
-    for i in 0..256 {
-        lut[i] = 2.0 * (i as f32 * RESCALE - 0.5);
-    }
-    let mut pixels = Vec::with_capacity(ph * pw * PATCH_DIM);
+    let mut pixels = vec![0.0f32; ph * pw * PATCH_DIM];
+    premium_discount_cpu_kernels::patchify_norm_hwc_u8_f32(
+        &img.pixels,
+        tw,
+        th,
+        PATCH_SIZE,
+        1,
+        [0.5; 3],
+        [0.5; 3],
+        &mut pixels,
+    );
     let mut positions = Vec::with_capacity(ph * pw);
     for py in 0..ph {
         for px in 0..pw {
             positions.push([px as u32, py as u32]);
-            for ry in 0..PATCH_SIZE {
-                let row = (py * PATCH_SIZE + ry) * tw + px * PATCH_SIZE;
-                for rx in 0..PATCH_SIZE {
-                    let base = (row + rx) * 3;
-                    pixels.push(lut[img.pixels[base] as usize]);
-                    pixels.push(lut[img.pixels[base + 1] as usize]);
-                    pixels.push(lut[img.pixels[base + 2] as usize]);
-                }
-            }
         }
     }
     Ok(Preprocessed {

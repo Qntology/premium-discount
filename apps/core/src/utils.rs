@@ -218,12 +218,43 @@ pub fn device_label(d: &Device) -> String {
     }
 }
 
+/// 장치의 GPU 순번(ordinal). CPU 이면 0.
+pub fn device_ordinal(d: &Device) -> usize {
+    match d.location() {
+        candle_core::DeviceLocation::Cpu => 0,
+        candle_core::DeviceLocation::Cuda { gpu_id }
+        | candle_core::DeviceLocation::Rocm { gpu_id }
+        | candle_core::DeviceLocation::Metal { gpu_id }
+        | candle_core::DeviceLocation::Vulkan { gpu_id }
+        | candle_core::DeviceLocation::OpenCl { gpu_id } => gpu_id,
+    }
+}
+
 /// 기록용 장치 이름
 pub fn describe(d: &Device) -> String {
     if d.is_cpu() {
         return "cpu".into();
     }
     format!("{:?}", d.location())
+}
+
+/// 추론 구간 사이 유휴 GPU 메모리 풀을 보수적으로 정리한다.
+/// ROCm 은 유휴 풀이 320 MiB 이상일 때만 256 MiB 핫 풀을 남기고 돌려주어 `hipMallocAsync`/`hipFreeAsync` 스톨을 방지한다.
+pub fn trim_idle_gpu_pool(device: &Device) {
+    match device {
+        #[cfg(feature = "rocm")]
+        Device::Rocm(rd) => {
+            const HIGH_WATER: usize = 320 << 20;
+            const KEEP_HOT: usize = 256 << 20;
+            if rd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
+                let _ = rd.trim_memory_pool_to(KEEP_HOT);
+            }
+        }
+        Device::Cuda(_) | Device::Vulkan(_) => {
+            let _ = device.trim_memory_pool(0);
+        }
+        _ => {}
+    }
 }
 
 /// GPU가 쥐고 있는 캐시 메모리를 드라이버에 돌려준다. 텐서를 모두 놓은 뒤에 부른다.
@@ -272,10 +303,43 @@ pub fn rocm_exit_now_if_used(code: u32) {
     let _ = code;
 }
 
-/// (free, total) 바이트. 현재 열려 있는 GPU(없으면 None)의 실제 여유/전체 VRAM 을 돌려준다.
-pub fn gpu_mem_info(_device_index: usize) -> Option<(u64, u64)> {
-    let dev = opened_gpu().lock().unwrap_or_else(|p| p.into_inner()).clone()?;
-    dev.mem_info().ok().flatten().map(|(f, t)| (f as u64, t as u64))
+/// (free, total) 바이트. 지정한 `device_index` GPU의 실제 여유/전체 VRAM 을 돌려준다.
+/// 이미 열려 있는 GPU가 같은 순번이면 그 핸들을 재사용하고, 아니면 전역 `OPENED_GPU` 를
+/// 덮어쓰지 않고 해당 순번의 장치를 직접 질의한다.
+pub fn gpu_mem_info(device_index: usize) -> Option<(u64, u64)> {
+    if let Some(dev) = opened_gpu().lock().unwrap_or_else(|p| p.into_inner()).clone() {
+        if device_ordinal(&dev) == device_index {
+            return dev.mem_info().ok().flatten().map(|(f, t)| (f as u64, t as u64));
+        }
+    }
+    #[cfg(feature = "cuda")]
+    if let Ok(d) = Device::new_cuda(device_index) {
+        if let Ok(Some((f, t))) = d.mem_info() {
+            return Some((f as u64, t as u64));
+        }
+    }
+    #[cfg(feature = "rocm")]
+    if let Ok(d) = Device::new_rocm(device_index) {
+        ROCM_USED.store(true, Ordering::Relaxed);
+        if let Ok(Some((f, t))) = d.mem_info() {
+            return Some((f as u64, t as u64));
+        }
+    }
+    #[cfg(feature = "vulkan")]
+    if device_index < candle_core::vulkan_backend::device_count().unwrap_or(0) {
+        if let Ok(d) = Device::new_vulkan(device_index) {
+            if let Ok(Some((f, t))) = d.mem_info() {
+                return Some((f as u64, t as u64));
+            }
+        }
+    }
+    #[cfg(feature = "metal")]
+    if let Ok(d) = Device::new_metal(device_index) {
+        if let Ok(Some((f, t))) = d.mem_info() {
+            return Some((f as u64, t as u64));
+        }
+    }
+    None
 }
 
 // ── Per-(Backend, ordinal, AccelOp) catch_unwind 자가 진단 ────────────────────
@@ -288,6 +352,7 @@ pub enum AccelOp {
     FlashAttn,
     DecoderOps,
     LmHeadArgmax,
+    GatedDeltaRule,
     QuantQ8,
 }
 
@@ -425,25 +490,100 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             if want.ids.to_vec1::<u32>()? != got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
                 return Ok(f32::INFINITY);
             }
-            rel_err_f32(got.max_vals.as_ref().unwrap(), want.max_vals.as_ref().unwrap())
+            let e_mode_b = rel_err_f32(got.max_vals.as_ref().unwrap(), want.max_vals.as_ref().unwrap())?;
+            // Mode A (`fused_linear_argmax_cs`, Qwen35::next_token 경로): CUDA/ROCm/Vulkan 네이티브 커널 검증
+            let h = Tensor::from_vec(det_vec(2 * 64, 16), (2, 64), &Device::Cpu)?;
+            let w = Tensor::from_vec(det_vec(128 * 64, 17), (128, 64), &Device::Cpu)?;
+            let want_a = candle_core::lm_head::fused_linear_argmax_cs(&h, &w, None, None, None)?;
+            let got_a = candle_core::lm_head::fused_linear_argmax_cs(
+                &h.to_device(device)?,
+                &w.to_device(device)?,
+                None,
+                None,
+                None,
+            )?;
+            if want_a.ids.to_vec1::<u32>()? != got_a.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+                return Ok(f32::INFINITY);
+            }
+            let e_mode_a = rel_err_f32(got_a.max_vals.as_ref().unwrap(), want_a.max_vals.as_ref().unwrap())?;
+            let mut worst = e_mode_b.max(e_mode_a);
+            if device.is_rocm() {
+                use candle_core::quantized::{GgmlDType, QTensor};
+                let hq = Tensor::from_vec(det_vec(4 * 256, 18), (4, 256), &Device::Cpu)?;
+                let wq = Tensor::from_vec(det_vec(64 * 256, 19), (64, 256), &Device::Cpu)?;
+                let qt_cpu = QTensor::quantize(&wq, GgmlDType::Q4K)?;
+                let want_q = candle_core::lm_head::logits_argmax_cs(&qt_cpu.forward_exact(&hq)?, None, None, None)?;
+                let qt_dev = QTensor::quantize(&wq.to_device(device)?, GgmlDType::Q4K)?;
+                let got_q = candle_core::lm_head::fused_quant_argmax_cs(
+                    &hq.to_device(device)?,
+                    &qt_dev,
+                    None,
+                    None,
+                    None,
+                )?;
+                if want_q.ids.to_vec1::<u32>()? != got_q.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+                    return Ok(f32::INFINITY);
+                }
+                if let (Some(gv), Some(wv)) = (got_q.max_vals.as_ref(), want_q.max_vals.as_ref()) {
+                    worst = worst.max(rel_err_f32(gv, wv)?);
+                }
+            }
+            Ok(worst)
+        }
+        AccelOp::GatedDeltaRule => {
+            use candle_core::delta_rule::{fused_gated_delta_rule, GdnConfig};
+            let cfg = GdnConfig::new(2, 2, 16, 16);
+            let (b, t, c, hv) = (1usize, 6usize, cfg.conv_dim(), cfg.num_v_heads);
+            let mixed = Tensor::from_vec(det_vec(b * t * c, 21), (b, t, c), &Device::Cpu)?;
+            let conv_w = Tensor::from_vec(det_vec(c * cfg.conv_kernel, 22), (c, cfg.conv_kernel), &Device::Cpu)?;
+            let a = Tensor::from_vec(det_vec(b * t * hv, 23), (b, t, hv), &Device::Cpu)?;
+            let beta_in = Tensor::from_vec(det_vec(b * t * hv, 24), (b, t, hv), &Device::Cpu)?;
+            let neg_a = Tensor::from_vec(vec![-0.5f32; hv], hv, &Device::Cpu)?;
+            let dt_bias = Tensor::from_vec(det_vec(hv, 25), hv, &Device::Cpu)?;
+            let want = fused_gated_delta_rule(&mixed, &conv_w, None, None, &a, &beta_in, &neg_a, &dt_bias, None, &cfg)?;
+            let got = fused_gated_delta_rule(
+                &mixed.to_device(device)?,
+                &conv_w.to_device(device)?,
+                None,
+                None,
+                &a.to_device(device)?,
+                &beta_in.to_device(device)?,
+                &neg_a.to_device(device)?,
+                &dt_bias.to_device(device)?,
+                None,
+                &cfg,
+            )?;
+            let e_out = rel_err_f32(&got.out, &want.out)?;
+            let e_conv = rel_err_f32(&got.conv_state, &want.conv_state)?;
+            let e_rec = rel_err_f32(&got.recurrent_state, &want.recurrent_state)?;
+            Ok(e_out.max(e_conv).max(e_rec))
         }
         AccelOp::QuantQ8 => {
             use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
             use candle_core::Module;
-            let a = Tensor::from_vec(det_vec(4 * 64, 14), (4, 64), &Device::Cpu)?;
-            let w = Tensor::from_vec(det_vec(64 * 64, 15), (64, 64), &Device::Cpu)?;
-            let qt_cpu = QTensor::quantize(&w, GgmlDType::Q8_0)?;
-            let want = a.matmul(&qt_cpu.dequantize(&Device::Cpu)?.t()?)?;
-            let qd = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(device)?, GgmlDType::Q8_0)?)?;
-            let got = if device.is_cuda() || device.is_metal() || device.is_rocm() {
-                qd.forward_exact(&a.to_device(device)?)?
-            } else {
-                qd.forward(&a.to_device(device)?)?
-            };
-            let err = rel_err_f32(&got, &want)?;
-            // Exact paths match dequantized F32 reference within ~1e-3; Vulkan Q8 activation quant within 5e-2.
-            let tol = if device.is_cuda() || device.is_metal() || device.is_rocm() { 1e-2 } else { 5e-2 };
-            Ok(if err <= tol { err * 0.1 } else { err })
+            let a = Tensor::from_vec(det_vec(4 * 256, 14), (4, 256), &Device::Cpu)?;
+            let w = Tensor::from_vec(det_vec(64 * 256, 15), (64, 256), &Device::Cpu)?;
+            let a_dev = a.to_device(device)?;
+            let w_dev = w.to_device(device)?;
+            let mut worst = 0f32;
+            for dt in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+                let qt_cpu = QTensor::quantize(&w, dt)?;
+                let want = a.matmul(&qt_cpu.dequantize(&Device::Cpu)?.t()?)?;
+                let qd = QMatMul::from_qtensor(QTensor::quantize(&w_dev, dt)?)?;
+                let got = if device.is_cuda() || device.is_metal() || device.is_rocm() {
+                    qd.forward_exact(&a_dev)?
+                } else {
+                    qd.forward(&a_dev)?
+                };
+                let err = rel_err_f32(&got, &want)?;
+                let tol = if device.is_cuda() || device.is_metal() || device.is_rocm() || device.is_vulkan() {
+                    1e-2
+                } else {
+                    5e-2
+                };
+                worst = worst.max(if err <= tol { err * 0.1 } else { err });
+            }
+            Ok(worst)
         }
     }
 }
@@ -488,11 +628,17 @@ mod tests {
             let gpu = candle_nn::ops::softmax_last_dim(&a.to_device(&dev)?.matmul(&w.to_device(&dev)?.t()?)?)?;
             let dense = max_abs_diff(&cpu, &gpu)?;
 
-            // 앱의 양자화 경로(quant.rs)가 쓰는 Q8_0. 장치마다 활성값 양자화가 달라 출력 크기의 5 % 안에서 본다 (raon-infer와 같은 기준)
-            let cpu_q = QMatMul::from_qtensor(QTensor::quantize(&w, GgmlDType::Q8_0)?)?.forward(&a)?;
-            let gpu_q = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&dev)?, GgmlDType::Q8_0)?)?.forward(&a.to_device(&dev)?)?;
-            let scale = cpu_q.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
-            (dense, max_abs_diff(&cpu_q, &gpu_q)?, scale)
+            // 앱의 양자화 경로(quant.rs)가 쓰는 Q8_0 · K-quant(Q4K/Q5K/Q6K).
+            // candle@b90b12c 는 ROCm w8a16 및 Vulkan GpuQuant 로 모든 형식을 GPU 에서 직접 계산한다.
+            let mut max_ratio = 0f32;
+            for dt in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+                let cpu_q = QMatMul::from_qtensor(QTensor::quantize(&w, dt)?)?.forward(&a)?;
+                let gpu_q = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&dev)?, dt)?)?.forward(&a.to_device(&dev)?)?;
+                let scale = cpu_q.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+                let diff = max_abs_diff(&cpu_q, &gpu_q)?;
+                max_ratio = max_ratio.max(diff / scale.max(1e-3));
+            }
+            (dense, max_ratio, 1.0f32)
         };
         release_gpu(&dev)?;
         assert!(dense < 1e-4, "softmax(matmul) 차이 {dense}");
@@ -511,6 +657,7 @@ mod tests {
             AccelOp::FlashAttn,
             AccelOp::DecoderOps,
             AccelOp::LmHeadArgmax,
+            AccelOp::GatedDeltaRule,
             AccelOp::QuantQ8,
         ] {
             assert!(accel_op_ok(&dev, op), "accel_op_ok failed for {op:?} on {}", describe(&dev));

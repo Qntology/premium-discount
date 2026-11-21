@@ -166,6 +166,17 @@ impl SelfAttention {
         let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
+        if mask.is_none()
+            && !x.device().is_cpu()
+            && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::FlashAttn)
+        {
+            let cfg = candle_nn::flash_attn::FlashAttnConfig::new(1.0);
+            if let Ok(out) = candle_nn::flash_attn::flash_attn_bhsd(&q, &k, &v, &cfg) {
+                let out = out.transpose(1, 2)?.reshape((b, t, self.heads * self.head_dim))?;
+                return self.o_proj.forward(&out);
+            }
+        }
+
         let reps = self.heads / self.kv_heads;
         let k = repeat_kv(k, reps)?;
         let v = repeat_kv(v, reps)?;
