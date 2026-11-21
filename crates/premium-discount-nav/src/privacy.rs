@@ -487,8 +487,8 @@ mod tests {
         assert_eq!(scrub_anchor("cell:12,7"), "cell:12,7");
     }
 
-    /// BIP-39 단어표의 첫 12낱말
-    const SEED: &str = "abandon ability able about above absent absorb abstract absurd abuse access accident";
+    /// BIP-39 공식 12낱말 시드 구문 벡터 (체크섬 유효)
+    const SEED: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
     #[test]
     fn card_dates_security_codes_and_seed_phrases_leave_names() {

@@ -126,15 +126,18 @@ fn check_indexes<'a>(phrase_words: impl Iterator<Item = &'a str>) -> Result<(), 
     Ok(())
 }
 
-/// 글 속 시드 구문의 바이트 범위 `(시작, 끝)`: BIP-39 단어표 낱말이 12개([`SEED_PHRASE_MIN_WORDS`]) 이상 이어진 첫 구간.
+/// 글 속 시드 구문의 바이트 범위 `(시작, 끝)`: BIP-39 단어표 낱말이 12개([`SEED_PHRASE_MIN_WORDS`]) 이상 이어지고,
+/// 아래 셋 가운데 하나를 만족하는 첫 구간.
 ///
-/// 낱말 사이에는 공백 · 줄바꿈 · 숫자 · 문장 부호가 끼어도 된다 (지갑 앱이 보여 주는 `1. abandon 2. ability …` 꼴).
-/// 단어표에 없는 낱말(한글 낱말 포함)이 하나라도 끼면 거기서 끊긴다. 보통 영어 문장에는 단어표에 없는 `the` · `and` ·
-/// `is` · `to` · `of` · `in` 이 거의 늘 끼므로 영어 게임 대사 · 쇼핑몰 설명은 걸리지 않는다.
+/// 1. 구간 안의 12 · 15 · 18 · 21 · 24단어 창이 BIP-39 SHA-256 체크섬을 통과한다 (진짜 지갑 시드 구문은 앞뒤 문맥이
+///    전혀 없어도 늘 잡힌다).
+/// 2. 지갑 앱이 보여 주는 번호 붙은 칸 형식(`1. abandon 2. ability …`)이다 (옮겨 적다 한두 낱말이 틀려 체크섬이
+///    깨진 번호 목록도 잡는다).
+/// 3. 구간 앞뒤 64바이트 안에 지갑 · 시드 문맥 말(`seed`, `mnemonic`, `recovery`, `phrase`, `wallet`, `시드`, `복구`,
+///    `니모닉`, `지갑` 등)이 있다 (문맥이 붙은 오타 시드도 잡는다).
 ///
-/// 체크섬은 보지 않는다: 한두 낱말을 잘못 옮겨 적은 시드 구문도, 앞뒤에 단어표 낱말이 더 붙은 구문도 비밀이다
-/// (체크섬까지 맞는 구문인지는 [`is_valid_phrase`]). 낱말 12개가 모두 단어표에 있는 글만 걸리므로, 체크섬이 맞는
-/// 구문은 늘 걸린다.
+/// 반대로 `"game boss sword shield armor arrow magic hero level bonus reward win"` 처럼 흔한 영어 단어만 우연히 12개
+/// 이어졌고 체크섬 · 번호 · 지갑 문맥이 모두 없는 일반 문장은 오탐하지 않는다.
 pub fn detect_seed_phrase_span(text: &str) -> Option<(usize, usize)> {
     phrase_runs(text, true).into_iter().next()
 }
@@ -144,30 +147,100 @@ pub fn seed_phrase_spans(text: &str) -> Vec<(usize, usize)> {
     phrase_runs(text, false)
 }
 
-/// 단어표 낱말이 [`SEED_PHRASE_MIN_WORDS`] 개 이상 이어진 구간들 (`first_only` 면 첫 구간에서 멈춘다)
+const SEED_CONTEXT_WORDS: &[&str] = &[
+    "seed", "mnemonic", "recovery", "phrase", "wallet", "backup", "bip39", "bip-39",
+    "시드", "복구", "니모닉", "지갑", "백업",
+];
+
+fn checksum_matches_slice(indexes: &[u16]) -> bool {
+    if !PHRASE_LENGTHS.contains(&indexes.len()) {
+        return false;
+    }
+    let total = indexes.len() * 11;
+    let checksum_bits = total / 33;
+    let entropy_bits = total - checksum_bits;
+    let bit = |k: usize| (indexes[k / 11] >> (10 - k % 11)) & 1 == 1;
+    let mut entropy = Zeroizing::new(vec![0u8; entropy_bits / 8]);
+    for k in 0..entropy_bits {
+        if bit(k) {
+            entropy[k / 8] |= 0x80 >> (k % 8);
+        }
+    }
+    let hash = Sha256::digest(entropy.as_slice());
+    (0..checksum_bits).all(|k| bit(entropy_bits + k) == ((hash[k / 8] >> (7 - k % 8)) & 1 == 1))
+}
+
+fn run_has_valid_checksum(indexes: &[u16]) -> bool {
+    PHRASE_LENGTHS.iter().copied().filter(|&n| n <= indexes.len()).any(|n| {
+        (0..=indexes.len() - n).any(|i| checksum_matches_slice(&indexes[i..i + n]))
+    })
+}
+
+fn run_is_numbered(text: &str, spans: &[(usize, usize)]) -> bool {
+    let mut numbered = 0usize;
+    if let Some(&(first_s, _)) = spans.first() {
+        let mut lead_start = first_s.saturating_sub(8);
+        while lead_start < first_s && !text.is_char_boundary(lead_start) {
+            lead_start += 1;
+        }
+        if text[lead_start..first_s].bytes().any(|b| b.is_ascii_digit()) {
+            numbered += 1;
+        }
+    }
+    for pair in spans.windows(2) {
+        if text[pair[0].1..pair[1].0].bytes().any(|b| b.is_ascii_digit()) {
+            numbered += 1;
+        }
+    }
+    numbered >= 6
+}
+
+fn run_has_seed_context(text: &str, start: usize, end: usize) -> bool {
+    let mut lo = start.saturating_sub(64);
+    while lo < start && !text.is_char_boundary(lo) {
+        lo += 1;
+    }
+    let mut hi = (end + 64).min(text.len());
+    while hi > end && !text.is_char_boundary(hi) {
+        hi -= 1;
+    }
+    let before = text[lo..start].to_lowercase();
+    let after = text[end..hi].to_lowercase();
+    SEED_CONTEXT_WORDS.iter().any(|k| before.contains(k) || after.contains(k))
+}
+
+/// 단어표 낱말이 [`SEED_PHRASE_MIN_WORDS`] 개 이상 이어지고 체크섬 · 번호 · 지갑 문맥 중 하나가 맞는 구간들
 fn phrase_runs(text: &str, first_only: bool) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let (mut count, mut start, mut end) = (0usize, 0usize, 0usize);
-    for (s, e) in word_spans(text) {
-        if word_index(&text[s..e]).is_some() {
-            if count == 0 {
-                start = s;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut indexes = Zeroizing::new(Vec::<u16>::new());
+    let flush = |spans: &mut Vec<(usize, usize)>, indexes: &mut Zeroizing<Vec<u16>>, out: &mut Vec<(usize, usize)>| -> bool {
+        let matched = if spans.len() >= SEED_PHRASE_MIN_WORDS {
+            let (start, end) = (spans[0].0, spans[spans.len() - 1].1);
+            if run_has_valid_checksum(indexes) || run_is_numbered(text, spans) || run_has_seed_context(text, start, end) {
+                out.push((start, end));
+                true
+            } else {
+                false
             }
-            count += 1;
-            end = e;
+        } else {
+            false
+        };
+        spans.clear();
+        indexes.zeroize();
+        matched
+    };
+    for (s, e) in word_spans(text) {
+        if let Some(idx) = word_index(&text[s..e]) {
+            spans.push((s, e));
+            indexes.push(idx);
             continue;
         }
-        if count >= SEED_PHRASE_MIN_WORDS {
-            out.push((start, end));
-            if first_only {
-                return out;
-            }
+        if flush(&mut spans, &mut indexes, &mut out) && first_only {
+            return out;
         }
-        count = 0;
     }
-    if count >= SEED_PHRASE_MIN_WORDS {
-        out.push((start, end));
-    }
+    flush(&mut spans, &mut indexes, &mut out);
     out
 }
 
@@ -280,13 +353,19 @@ mod tests {
         let grid = "1. abandon 2. abandon 3. abandon 4. abandon\n5. abandon 6. abandon 7. abandon 8. abandon\n9. abandon 10. abandon 11. abandon 12. about";
         let (s, e) = detect_seed_phrase_span(grid).unwrap();
         assert_eq!((&grid[s..s + 7], &grid[e - 5..e]), ("abandon", "about"));
-        // 체크섬이 틀려도(옮겨 적다 틀림), 대문자로 시작해도 비밀이다
-        assert!(detect_seed_phrase_span("Test test test test test test test test test test test test").is_some());
-        // 보통 영어 문장은 단어표에 없는 낱말(the · and · your · defeat …)이 끼어 끊긴다
+        // 문맥이 붙은 오타 시드 구문도 잡힌다
+        assert!(detect_seed_phrase_span("내 시드: Test test test test test test test test test test test test").is_some());
+        // 번호 매긴 지갑 칸에 오타가 있어도 잡힌다
+        assert!(detect_seed_phrase_span("1. test 2. test 3. test 4. test 5. test 6. test 7. test 8. test 9. test 10. test 11. test 12. test").is_some());
+        // 앞뒤 문맥이 없어도 체크섬이 맞는 진짜 시드 구문은 잡힌다
+        assert_eq!(detect_seed_phrase_span(VECTOR), Some((0, VECTOR.len())));
+        // 보통 영어 문장 + 흔한 영어 게임 낱말만 12개 이어진 글(체크섬 불일치 · 문맥 없음)은 오탐하지 않는다
         for plain in [
             "The quick brown fox jumps over the lazy dog and then runs into the forest to hide",
             "Please enter your password to continue and click the button below to sign in now",
             "Defeat the boss to unlock the next level and earn a legendary sword for your hero",
+            "game boss sword shield armor arrow magic hero level bonus reward win",
+            "game boss game boss game boss game boss game boss game boss",
         ] {
             assert_eq!(detect_seed_phrase_span(plain), None, "{plain}");
         }

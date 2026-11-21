@@ -113,9 +113,13 @@
           "repo": "premium-discount",
           "path": "crates/premium-discount-mcp/src/client.rs",
           "test": "cr05_"
+        },
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/pd_bridge.rs",
+          "test": "cr05_"
         }
-      ],
-      "pending": "SyncLoop 양보(hold_for_interactive)만 확인한다. 0ms PreThink · 600ms LocalMirrorIndex 응답 · 캐시 적재는 raon-zena 앱(pd_bridge) 연결에서 남았다"
+      ]
     },
     {
       "id": "CR-06",
@@ -126,8 +130,13 @@
         "epoch 1 검색 · 토큰 생성 폐기, 말풍선은 epoch 2 만",
         "privacy_epoch 가 다른 늦은 결과는 캐시에 넣지 않는다"
       ],
-      "owners": [],
-      "pending": "raon-zena 앱의 ask_epoch × privacy_epoch 레이스(pd_bridge)가 아직 없다"
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/pd_bridge.rs",
+          "test": "cr06_"
+        }
+      ]
     },
     {
       "id": "CR-07",

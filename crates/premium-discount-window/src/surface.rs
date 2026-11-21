@@ -16,6 +16,7 @@
 //! Win32 가 필요 없다: 시험은 손으로 만든 창 목록으로 한다.
 
 use crate::identify::VisibleWindowEntry;
+use crate::layer::{WS_EX_NOACTIVATE, WS_EX_TRANSPARENT};
 
 /// `GetWindowDisplayAffinity`: 아무것도 막지 않음
 pub const WDA_NONE: u32 = 0x00;
@@ -212,6 +213,25 @@ pub fn sensitive_title(title: &str) -> bool {
     })
 }
 
+/// 게임 오버레이 프로세스: 게임 내내 클릭 통과 · 비활성 · 초소형(≤ 16px) 호스트 창을 띄워 둘 수 있어,
+/// 실제로 클릭 · 포커스를 받거나 결제 · 인증 제목이 있는 활성 창만 결제 오버레이로 본다.
+const GAME_OVERLAY_PREFIXES: &[&str] = &["gameoverlayui", "eosoverlayrenderer"];
+
+/// 게임 오버레이가 실제 결제 · Shift+Tab 창이 아니라 게임 중 늘 떠 있는 유휴 호스트 창인가.
+fn is_dormant_game_overlay(w: &VisibleWindowEntry, exe: &str, capture: PxRect) -> bool {
+    if !GAME_OVERLAY_PREFIXES.iter().any(|p| exe.starts_with(p)) {
+        return false;
+    }
+    if sensitive_title(&w.info.title) {
+        return false;
+    }
+    let tiny = w
+        .rect
+        .intersect(capture)
+        .is_none_or(|v| v.width() <= 16 || v.height() <= 16);
+    tiny || (w.ex_style & WS_EX_TRANSPARENT != 0) || (w.ex_style & WS_EX_NOACTIVATE != 0)
+}
+
 /// 창 하나의 신호 (없으면 `None`). 캡처 보호 > 결제 프로세스 > 민감 제목 > 알림 토스트 순으로 하나만 준다
 pub fn classify_window(w: &VisibleWindowEntry, capture: PxRect) -> Option<SurfaceSignal> {
     if w.capture_protected() {
@@ -224,7 +244,9 @@ pub fn classify_window(w: &VisibleWindowEntry, capture: PxRect) -> Option<Surfac
         .unwrap_or_default()
         .to_lowercase();
     if !exe.is_empty() && PAYMENT_PROCESS_PREFIXES.iter().any(|p| exe.starts_with(p)) {
-        return Some(SurfaceSignal::PaymentOverlay);
+        if !is_dormant_game_overlay(w, &exe, capture) {
+            return Some(SurfaceSignal::PaymentOverlay);
+        }
     }
     if sensitive_title(&w.info.title) {
         return Some(SurfaceSignal::SensitiveTitle);
@@ -387,7 +409,7 @@ mod tests {
                 PxRect::new(560, 240, 1360, 840),
             )
         };
-        let v = assess_surfaces(&[overlay, game()], MONITOR);
+        let v = assess_surfaces(&[overlay.clone(), game()], MONITOR);
         assert!(v.full_lockdown());
         let hit = v.lockdown().unwrap();
         assert_eq!(
@@ -399,7 +421,34 @@ mod tests {
             !assess_surfaces(&[game()], MONITOR).full_lockdown(),
             "게임만이면 깨끗하다"
         );
-        // B: 화면을 나눠 왼쪽은 창 모드 게임(앞 창), 오른쪽 절반은 WDA_EXCLUDEFROMCAPTURE 은행 창
+        // B: 게임 내내 떠 있는 Steam 유휴 호스트 창(클릭 통과 / 비활성 / 초소형)은 잠그지 않는다
+        let dormant_transparent = VisibleWindowEntry {
+            ex_style: WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+            ..overlay.clone()
+        };
+        assert!(!assess_surfaces(&[dormant_transparent, game()], MONITOR).full_lockdown());
+        let dormant_noactivate = VisibleWindowEntry {
+            ex_style: WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            ..overlay.clone()
+        };
+        assert!(!assess_surfaces(&[dormant_noactivate, game()], MONITOR).full_lockdown());
+        let dormant_tiny = VisibleWindowEntry {
+            rect: PxRect::new(0, 0, 1, 1),
+            ..overlay.clone()
+        };
+        assert!(!assess_surfaces(&[dormant_tiny, game()], MONITOR).full_lockdown());
+        // 비활성이더라도 결제 · 인증 제목이 있으면 잠근다
+        let titled_checkout = VisibleWindowEntry {
+            ex_style: WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            info: WindowInfo {
+                title: "Steam /checkout/pay".into(),
+                ..overlay.info.clone()
+            },
+            ..overlay.clone()
+        };
+        assert!(assess_surfaces(&[titled_checkout, game()], MONITOR).full_lockdown());
+
+        // C: 화면을 나눠 왼쪽은 창 모드 게임(앞 창), 오른쪽 절반은 WDA_EXCLUDEFROMCAPTURE 은행 창
         let left_game = win(
             100,
             "BossRush-Win64-Shipping.exe",
