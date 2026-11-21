@@ -133,9 +133,10 @@ mod imp {
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowDisplayAffinity,
-        GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
+        EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetLayeredWindowAttributes,
+        GetWindowDisplayAffinity, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, WindowFromPoint,
+        GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
     };
 
     pub fn window_at(x: i32, y: i32) -> Option<WindowInfo> {
@@ -276,6 +277,9 @@ mod imp {
             }
             // SAFETY: hwnd 를 넘기기만 한다. 확장 스타일은 32비트 값이라 GetWindowLongW 로 충분하다.
             let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+            if fully_transparent_layered(hwnd, ex_style) {
+                continue;
+            }
             out.push(VisibleWindowEntry {
                 info: WindowInfo {
                     hwnd: hwnd as isize,
@@ -339,6 +343,19 @@ mod imp {
         }
         let rect = PxRect::new(r.left, r.top, r.right, r.bottom);
         (!rect.is_empty()).then_some(rect)
+    }
+
+    /// `WS_EX_LAYERED` 창이 `LWA_ALPHA` 로 완전 투명(alpha == 0)이면 화면에 보이지 않는다 (게임 오버레이 · 백그라운드 호스트 창).
+    fn fully_transparent_layered(hwnd: HWND, ex_style: u32) -> bool {
+        if ex_style & WS_EX_LAYERED == 0 {
+            return false;
+        }
+        let (mut alpha, mut flags) = (255u8, 0u32);
+        // SAFETY: 지역 변수 주소만 넘긴다. 실패하면 불투명한 것으로 둔다.
+        let ok = unsafe {
+            GetLayeredWindowAttributes(hwnd, std::ptr::null_mut(), &mut alpha, &mut flags)
+        };
+        ok != 0 && (flags & LWA_ALPHA != 0) && alpha == 0
     }
 
     fn class_name(hwnd: HWND) -> String {

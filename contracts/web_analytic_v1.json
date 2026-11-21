@@ -163,8 +163,13 @@
         "LABEL_SPACE 로 \"Buy Now\" GoldenPath 와 1:1",
         "시크릿 탭 기록 0건"
       ],
-      "owners": [],
-      "pending": "raon-zena 의 비동기 UIA 브라우저 감시기(탭 cc 격리 · 시크릿 탭 차단 · LABEL_SPACE 매칭)가 아직 없다"
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/browser_uia.rs",
+          "test": "wa09_"
+        }
+      ]
     },
     {
       "id": "WA-10",
