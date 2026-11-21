@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+premium-discount-cpu-kernels.workspace = true
 anyhow.workspace = true
 half.workspace = true
 memmap2.workspace = true

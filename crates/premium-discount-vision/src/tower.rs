@@ -16,15 +16,15 @@
 
 use anyhow::{bail, Context, Result};
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul};
-use candle_core::{DType, Device, Module, Tensor, D};
+use candle_core::{DType, Device, DeviceLocation, Module, Tensor, D};
 use candle_nn::LayerNorm;
 use premium_discount_quant::kquant::{encode, Format};
 use premium_discount_quant::safetensors::SafeTensors;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use crate::layout::{Layout, Weights};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use premium_discount_sensor::naflex::PatchGrid;
 
 /// 판독을 그만둔 까닭. `anyhow::Error` 로 감싸 올라오므로 [`VisionAbort::of`] 로 알아본다
@@ -151,7 +151,15 @@ pub(crate) struct Proj {
 
 impl Proj {
     pub(crate) fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let y = self.inner.forward(&x.contiguous()?)?;
+        let xc = x.contiguous()?;
+        let y = match &self.inner {
+            QMatMul::QTensor(_)
+                if x.device().is_cuda() || x.device().is_metal() || x.device().is_rocm() =>
+            {
+                self.inner.forward_exact(&xc)?
+            }
+            _ => self.inner.forward(&xc)?,
+        };
         match &self.bias {
             Some(b) => y.broadcast_add(b),
             None => Ok(y),
@@ -231,8 +239,71 @@ pub(crate) fn mlp_width(mlp: usize, format: WeightFormat) -> usize {
     }
 }
 
+fn gpu_flash_attn_key(dev: &Device, hd: usize) -> Option<(u8, usize, usize)> {
+    match dev.location() {
+        DeviceLocation::Cpu => None,
+        DeviceLocation::Cuda { gpu_id } => Some((1, gpu_id, hd)),
+        DeviceLocation::Rocm { gpu_id } => Some((2, gpu_id, hd)),
+        DeviceLocation::Vulkan { gpu_id } => Some((3, gpu_id, hd)),
+        DeviceLocation::Metal { gpu_id } => Some((4, gpu_id, hd)),
+        DeviceLocation::OpenCl { gpu_id } => Some((5, gpu_id, hd)),
+    }
+}
+
+fn gpu_flash_attn_ok(dev: &Device, hd: usize) -> bool {
+    let Some(key) = gpu_flash_attn_key(dev, hd) else {
+        return false;
+    };
+    static CACHE: OnceLock<Mutex<HashMap<(u8, usize, usize), bool>>> = OnceLock::new();
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&ok) = map.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return ok;
+    }
+    let scale = (hd as f32).powf(-0.5);
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> candle_core::Result<bool> {
+        let q = Tensor::zeros((1, 1, 2, hd), DType::F32, dev)?;
+        let k = Tensor::zeros((1, 1, 2, hd), DType::F32, dev)?;
+        let v = Tensor::ones((1, 1, 2, hd), DType::F32, dev)?;
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale);
+        let out = candle_nn::flash_attn::flash_attn_bhsd(&q, &k, &v, &cfg)?;
+        let vals = out.flatten_all()?.to_vec1::<f32>()?;
+        Ok(vals.len() == 2 * hd && vals.iter().all(|&x| (x - 1.0).abs() < 1e-3))
+    }))
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or(false);
+    map.lock().unwrap_or_else(|e| e.into_inner()).insert(key, ok);
+    ok
+}
+
 pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, hd: usize) -> candle_core::Result<Tensor> {
     let dtype = q.dtype();
+    if q.device().is_cpu() && dtype == DType::F32 {
+        let (b, heads, nq, d) = q.dims4()?;
+        let (_, kv_heads, nkv, _) = k.dims4()?;
+        if b == 1 && d == hd && heads > 0 && kv_heads > 0 && heads % kv_heads == 0 {
+            let q_shd = q.squeeze(0)?.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let k_shd = k.squeeze(0)?.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let v_shd = v.squeeze(0)?.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let mut out = vec![0.0f32; nq * heads * hd];
+            let cfg = premium_discount_cpu_kernels::CpuStreamAttnCfg {
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                head_dim: hd,
+                scale: (hd as f32).powf(-0.5),
+                causal: false,
+                past_offset: 0,
+            };
+            premium_discount_cpu_kernels::stream_attention_f32(&q_shd, &k_shd, &v_shd, nq, nkv, &cfg, &mut out);
+            return Tensor::from_vec(out, (1, nq, heads, hd), q.device())?.transpose(1, 2);
+        }
+    }
+    if !q.device().is_cpu() && gpu_flash_attn_ok(q.device(), hd) {
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new((hd as f32).powf(-0.5));
+        if let Ok(out) = candle_nn::flash_attn::flash_attn_bhsd(q, k, v, &cfg) {
+            return Ok(out);
+        }
+    }
     let scores = (q.matmul(&k.t()?)? * (hd as f64).powf(-0.5))?;
     let probs = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(dtype)?;
     probs.matmul(v)
@@ -304,8 +375,8 @@ impl Block {
 
 /// timm `AttentionPoolLatent`: one latent query attends over the tokens, then `proj`, then `+ mlp(norm ·)`.
 struct MapHead {
-    latent: Tensor,
-    q: Proj,
+    /// Precomputed `q.forward(latent)` shaped `(1, heads, 1, hd)` — avoids recomputing the constant latent projection every pass.
+    q_latent: Tensor,
     kv: Proj,
     proj: Proj,
     norm: LayerNorm,
@@ -319,16 +390,24 @@ impl MapHead {
     fn load(l: &Loader<'_>, cfg: &VisionConfig) -> Result<MapHead> {
         let p = "visual.trunk.attn_pool";
         let (d, m) = (cfg.hidden, mlp_width(cfg.mlp, l.format));
+        let heads = cfg.heads;
+        let hd = d / heads;
+        let latent = l.tensor(&format!("{p}.latent"), &[1, 1, d])?;
+        let q = l.proj(&format!("{p}.q.weight"), Some(&format!("{p}.q.bias")), d, d)?;
+        let q_latent = q
+            .forward(&latent)?
+            .reshape((1, 1, heads, hd))?
+            .transpose(1, 2)?
+            .contiguous()?;
         Ok(MapHead {
-            latent: l.tensor(&format!("{p}.latent"), &[1, 1, d])?,
-            q: l.proj(&format!("{p}.q.weight"), Some(&format!("{p}.q.bias")), d, d)?,
+            q_latent,
             kv: l.proj(&format!("{p}.kv.weight"), Some(&format!("{p}.kv.bias")), 2 * d, d)?,
             proj: l.proj(&format!("{p}.proj.weight"), Some(&format!("{p}.proj.bias")), d, d)?,
             norm: l.norm(&format!("{p}.norm"), d, cfg.eps)?,
             fc1: l.proj(&format!("{p}.mlp.fc1.weight"), Some(&format!("{p}.mlp.fc1.bias")), m, d)?,
             fc2: l.proj(&format!("{p}.mlp.fc2.weight"), Some(&format!("{p}.mlp.fc2.bias")), d, m)?,
-            heads: cfg.heads,
-            hd: d / cfg.heads,
+            heads,
+            hd,
         })
     }
 
@@ -336,16 +415,18 @@ impl MapHead {
         x + self.fc2.forward(&self.fc1.forward(&self.norm.forward(x)?)?.gelu()?)?
     }
 
+    fn q_for_batch(&self, b: usize) -> candle_core::Result<Tensor> {
+        if b == 1 {
+            Ok(self.q_latent.clone())
+        } else {
+            self.q_latent.broadcast_as((b, self.heads, 1, self.hd))?.contiguous()
+        }
+    }
+
     /// The pooled embedding `(b, d)` of tokens `(b, n, d)`.
     fn pooled(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, n, d) = x.dims3()?;
-        let lat = self.latent.broadcast_as((b, 1, d))?.contiguous()?;
-        let q = self
-            .q
-            .forward(&lat)?
-            .reshape((b, 1, self.heads, self.hd))?
-            .transpose(1, 2)?
-            .contiguous()?;
+        let q = self.q_for_batch(b)?;
         let kv = self
             .kv
             .forward(x)?
@@ -361,6 +442,22 @@ impl MapHead {
         let d = x.dim(D::Minus1)?;
         let v = self.kv.forward(x)?.narrow(D::Minus1, d, d)?;
         self.residual_mlp(&self.proj.forward(&v)?)
+    }
+
+    /// Single-pass pooled `(b, d)` and per-token dense `(b, n, d)` features sharing one `kv.forward(x)` projection.
+    fn pooled_and_dense(&self, x: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+        let (b, n, d) = x.dims3()?;
+        let kv_raw = self.kv.forward(x)?;
+        let q = self.q_for_batch(b)?;
+        let kv = kv_raw
+            .reshape((b, n, 2, self.heads, self.hd))?
+            .permute((2, 0, 3, 1, 4))?;
+        let (k, v) = (kv.get(0)?.contiguous()?, kv.get(1)?.contiguous()?);
+        let o = attend(&q, &k, &v, self.hd)?.transpose(1, 2)?.reshape((b, 1, d))?;
+        let pooled = self.residual_mlp(&self.proj.forward(&o)?)?.reshape((b, d))?;
+        let v_flat = kv_raw.narrow(D::Minus1, d, d)?;
+        let dense = self.residual_mlp(&self.proj.forward(&v_flat)?)?;
+        Ok((pooled, dense))
     }
 }
 
@@ -642,19 +739,30 @@ impl VisionTower {
 
     /// Per-cell unit features of a pass's tokens, in `pass.cells` order.
     pub fn dense(&self, pass: &SparsePass) -> Result<Vec<Vec<f32>>> {
-        let m: Vec<Vec<f32>> = self.head.dense(&pass.tokens)?.to_dtype(DType::F32)?.squeeze(0)?.to_vec2()?;
-        Ok(m.into_iter().map(unit).collect())
+        let flat: Vec<f32> = self.head.dense(&pass.tokens)?.to_dtype(DType::F32)?.squeeze(0)?.flatten_all()?.to_vec1()?;
+        let d = self.cfg.hidden;
+        Ok(flat.chunks_exact(d).map(|row| unit(row.to_vec())).collect())
+    }
+
+    /// Single-pass pooled embedding (unit) and per-cell unit dense features (sharing one `MapHead::kv` projection).
+    pub fn pooled_and_dense(&self, pass: &SparsePass) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        let (pooled_t, dense_t) = self.head.pooled_and_dense(&pass.tokens)?;
+        let pooled_v: Vec<f32> = pooled_t.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let dense_flat: Vec<f32> = dense_t.to_dtype(DType::F32)?.squeeze(0)?.flatten_all()?.to_vec1()?;
+        let d = self.cfg.hidden;
+        let dense = dense_flat.chunks_exact(d).map(|row| unit(row.to_vec())).collect();
+        Ok((unit(pooled_v), dense))
     }
 }
 
 pub fn unit(mut v: Vec<f32>) -> Vec<f32> {
-    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    let n = premium_discount_cpu_kernels::dot_f32_simd(&v, &v).sqrt().max(1e-12);
     v.iter_mut().for_each(|x| *x /= n);
     v
 }
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    premium_discount_cpu_kernels::dot_f32_simd(a, b)
 }
 
 /// 시험용 작은 탑 (체크포인트 없이, CPU).
@@ -709,8 +817,7 @@ pub(crate) mod toy {
             blocks,
             norm: norm(),
             head: MapHead {
-                latent: Tensor::zeros((1, 1, d), DType::F32, &dev).unwrap(),
-                q: proj(zeros(d, d)),
+                q_latent: Tensor::zeros((1, heads, 1, d / heads), DType::F32, &dev).unwrap(),
                 kv: proj(eye(2 * d, d, d)),
                 proj: proj(eye(d, d, 0)),
                 norm: norm(),

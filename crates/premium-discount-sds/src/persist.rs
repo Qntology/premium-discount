@@ -114,15 +114,38 @@ pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Writes `bytes` to `path.tmp` and renames it over `path`; falls back to a direct write when the rename fails
-/// (logis `write_atomic`).
+/// Writes `bytes` to a unique temp file with `sync_all()` and atomically replaces `path`.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = with_suffix(path, ".tmp");
-    match fs::write(&tmp, bytes).and_then(|_| fs::rename(&tmp, path)) {
+    use std::io::Write;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = with_suffix(path, &format!(".tmp.{}.{seq}", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
-        Err(_) => {
+        Err(_) if path.exists() => {
+            let bak = with_suffix(path, &format!(".bak.{}.{seq}", std::process::id()));
+            let _ = fs::remove_file(&bak);
+            fs::rename(path, &bak)?;
+            match fs::rename(&tmp, path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&bak);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = fs::rename(&bak, path);
+                    let _ = fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
             let _ = fs::remove_file(&tmp);
-            fs::write(path, bytes)
+            Err(e)
         }
     }
 }

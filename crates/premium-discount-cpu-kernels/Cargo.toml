@@ -1,0 +1,10 @@
+[package]
+name = "premium-discount-cpu-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable SIMD (AVX-512/AVX2+FMA/NEON/scalar) PackedW NR=32 GEMM, 64-key streaming attention (incl. head_dim=72), 1-pass RMSNorm/LayerNorm/GELU, dot/cosine, and image patchify"
+
+[dependencies]
+rayon = { workspace = true }

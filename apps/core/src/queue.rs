@@ -539,9 +539,7 @@ impl OfflineQueue {
     /// 호출하는 쪽이 큐가 바뀔 때마다(보내기 뒤, 저장 뒤) 호출해야 한다.
     pub fn save_to(&self, path: &std::path::Path) -> Result<(), AppError> {
         let json = self.to_json().map_err(|e| AppError::Storage(e.to_string()))?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json).map_err(|e| AppError::Storage(e.to_string()))?;
-        std::fs::rename(&tmp, path).map_err(|e| AppError::Storage(e.to_string()))
+        crate::utils::write_file_atomic(path, json.as_bytes()).map_err(|e| AppError::Storage(e.to_string()))
     }
 
     /// 파일에서 되살린다. 파일이 없으면 빈 큐다. 내용이 깨졌으면 에러를 돌려주고, 조용히 빈 큐로 바꾸지 않는다.

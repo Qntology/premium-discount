@@ -217,20 +217,22 @@ pub fn preprocess(image: &RgbImage, max_soft_tokens: usize) -> Result<Preprocess
     };
 
     let (ph, pw) = (th / PATCH_SIZE, tw / PATCH_SIZE);
+    let mut lut = [0f32; 256];
+    for i in 0..256 {
+        lut[i] = 2.0 * (i as f32 * RESCALE - 0.5);
+    }
     let mut pixels = Vec::with_capacity(ph * pw * PATCH_DIM);
     let mut positions = Vec::with_capacity(ph * pw);
     for py in 0..ph {
         for px in 0..pw {
             positions.push([px as u32, py as u32]);
             for ry in 0..PATCH_SIZE {
+                let row = (py * PATCH_SIZE + ry) * tw + px * PATCH_SIZE;
                 for rx in 0..PATCH_SIZE {
-                    let y = py * PATCH_SIZE + ry;
-                    let x = px * PATCH_SIZE + rx;
-                    let base = (y * tw + x) * 3;
-                    for c in 0..3 {
-                        let v = img.pixels[base + c] as f32 * RESCALE;
-                        pixels.push(2.0 * (v - 0.5));
-                    }
+                    let base = (row + rx) * 3;
+                    pixels.push(lut[img.pixels[base] as usize]);
+                    pixels.push(lut[img.pixels[base + 1] as usize]);
+                    pixels.push(lut[img.pixels[base + 2] as usize]);
                 }
             }
         }
@@ -364,14 +366,42 @@ impl Block {
         let k = apply_rope(&rms_norm(&k, Some(&self.k_norm))?, cos, sin)?;
         let v = rms_norm(&self.v_proj.forward(x)?.reshape((n, HEADS, HEAD_DIM))?, None)?;
 
+        if x.device().is_cpu() && x.dtype() == candle_core::DType::F32 {
+            let q_vec = q.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let k_vec = k.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let v_vec = v.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let mut out = vec![0.0f32; n * HEADS * HEAD_DIM];
+            let cfg = premium_discount_cpu_kernels::CpuStreamAttnCfg {
+                num_heads: HEADS,
+                num_kv_heads: HEADS,
+                head_dim: HEAD_DIM,
+                scale: 1.0,
+                causal: false,
+                past_offset: 0,
+            };
+            premium_discount_cpu_kernels::stream_attention_f32(&q_vec, &k_vec, &v_vec, n, n, &cfg, &mut out);
+            let out = Tensor::from_vec(out, (n, HEADS * HEAD_DIM), x.device())?;
+            return self.o_proj.forward(&out);
+        }
+
         let q = q.transpose(0, 1)?.contiguous()?;
         let k = k.transpose(0, 1)?.contiguous()?;
         let v = v.transpose(0, 1)?.contiguous()?;
         // 점수 배율은 1.0이다 (q_norm, k_norm이 크기를 맞춘다). 패딩이 없어서 마스크도 없다.
-        let scores = q.matmul(&k.transpose(1, 2)?.contiguous()?)?;
-        let probs = ops::softmax_last_dim(&scores)?;
-        let out = probs
-            .matmul(&v)?
+        let out = if crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::FlashAttn) {
+            let cfg = candle_nn::flash_attn::FlashAttnConfig::new(1.0);
+            match candle_nn::flash_attn::flash_attn_bhsd(&q.unsqueeze(0)?, &k.unsqueeze(0)?, &v.unsqueeze(0)?, &cfg) {
+                Ok(o) => o.squeeze(0)?,
+                Err(_) => {
+                    let scores = q.matmul(&k.transpose(1, 2)?.contiguous()?)?;
+                    ops::softmax_last_dim(&scores)?.matmul(&v)?
+                }
+            }
+        } else {
+            let scores = q.matmul(&k.transpose(1, 2)?.contiguous()?)?;
+            ops::softmax_last_dim(&scores)?.matmul(&v)?
+        };
+        let out = out
             .transpose(0, 1)?
             .contiguous()?
             .reshape((n, HEADS * HEAD_DIM))?;
@@ -471,20 +501,15 @@ impl VisionTower {
             h = h.broadcast_add(&m)?;
         }
 
-        // 3x3 평균 풀링 (칸마다 1/9), 그다음 sqrt(768) 배율
+        // 3x3 평균 풀링 (칸마다 1/9), 그다음 sqrt(768) 배율 — dense sparse-zeros matmul 대신 exact reshape+mean
         let (ph, pw) = prep.grid;
         let (oh, ow) = (ph / POOLING_KERNEL, pw / POOLING_KERNEL);
         let cells = oh * ow;
-        let mut mat = vec![0f32; cells * n];
-        let weight = 1.0 / (POOLING_KERNEL * POOLING_KERNEL) as f32;
-        for py in 0..ph {
-            for px in 0..pw {
-                let cell = (py / POOLING_KERNEL) * ow + px / POOLING_KERNEL;
-                mat[cell * n + py * pw + px] = weight;
-            }
-        }
-        let pooled = Tensor::from_vec(mat, (cells, n), dev)?
-            .matmul(&h)?
+        let pooled = h
+            .reshape((oh, POOLING_KERNEL, ow, POOLING_KERNEL, HIDDEN))?
+            .mean(3)?
+            .mean(1)?
+            .reshape((cells, HIDDEN))?
             .affine((HIDDEN as f64).sqrt(), 0.0)?;
         let normed = rms_norm(&pooled, None)?;
         self.embed_proj.forward(&normed)

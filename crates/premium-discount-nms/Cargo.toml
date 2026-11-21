@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+premium-discount-cpu-kernels.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 premium-discount-sds.workspace = true

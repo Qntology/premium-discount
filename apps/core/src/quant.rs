@@ -342,7 +342,19 @@ impl Module for Lin {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward(x),
+            Self::Quant(QMatMul::QTensor(q))
+                if x.device().is_cuda() || x.device().is_metal() || x.device().is_rocm() =>
+            {
+                q.forward_exact(x)
+            }
             Self::Quant(q) => q.forward(x),
+            // On CUDA/Metal/ROCm, `forward_exact` runs exact weight-only matmul without materializing
+            // a full F32 weight buffer every call (including Metal's native F32-activation Q8 kernel).
+            Self::Packed(q)
+                if x.device().is_cuda() || x.device().is_metal() || x.device().is_rocm() =>
+            {
+                q.forward_exact(x)
+            }
             // 층 하나 분량(최대 2048 x 512 x 4 = 4MB)만 잠깐 F32로 풀었다가 버린다
             Self::Packed(q) => Linear::new(q.dequantize(x.device())?, None).forward(x),
         }

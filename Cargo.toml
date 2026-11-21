@@ -16,6 +16,7 @@ resolver = "2"
 # crates/* 글롭 대신 하나씩 적는다: 예전 빌드 폴더(crates/target)처럼 Cargo.toml 없는 폴더가 crates/ 아래에 남아 있어도 작업 공간이 깨지지 않게
 members = [
     "crates/premium-discount-identity",
+    "crates/premium-discount-cpu-kernels",
     "crates/premium-discount-verdict",
     "crates/premium-discount-nav",
     "crates/premium-discount-schema",
@@ -62,6 +63,7 @@ candle-nn = "0.11.0"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 # 내부 crate (crates/)
+premium-discount-cpu-kernels = { path = "crates/premium-discount-cpu-kernels" }
 premium-discount-identity = { path = "crates/premium-discount-identity" }
 premium-discount-verdict = { path = "crates/premium-discount-verdict" }
 premium-discount-nav = { path = "crates/premium-discount-nav" }
@@ -85,17 +87,32 @@ premium-discount-app = { path = "apps/core" }
 # 예전 세 매니페스트(crates/ · app/ · app/src-tauri)에 같은 줄이 있던 것을 여기 하나로 합쳤다.
 # [patch] 는 빌드하는 쪽 루트의 것만 적용되므로, 이 crate 들을 링크하는 다른 작업 공간도 같은 줄을 둔다.
 [patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
 
 # 디버그 정보는 끈다 (예전 app/ · app/src-tauri 의 값). 모바일 빌드(staticlib·cdylib)는 의존성 전부를 한 파일로 묶는데,
 # 디버그 정보가 있으면 파일 하나가 수 GB가 된다. 이제 작업 공간이 하나라 crates/ 의 디버그 빌드에도 적용된다.
 [profile.dev]
 debug = 0
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# accel_check 의 catch_unwind 가 릴리스에서도 정상 작동하도록 unwind 유지
+panic = "unwind"
+
 [profile.dev.package.candle-core]
 opt-level = 3
 [profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.premium-discount-cpu-kernels]
+opt-level = 3
+[profile.dev.package.premium-discount-quant]
+opt-level = 3
+[profile.dev.package.premium-discount-sensor]
+opt-level = 3
+[profile.dev.package.premium-discount-vision]
 opt-level = 3
 [profile.dev.package.gemm]
 opt-level = 3

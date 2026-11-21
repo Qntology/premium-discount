@@ -68,15 +68,22 @@ impl SessionStore {
     }
 
     pub fn save(&self, session: &SavedSession) -> Result<(), AppError> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         session.validate()?;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).map_err(storage)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
-        let _ = std::fs::remove_file(&tmp);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp_os = self.path.as_os_str().to_os_string();
+        tmp_os.push(format!(".tmp.{}.{seq}", std::process::id()));
+        let tmp = PathBuf::from(tmp_os);
         let json = serde_json::to_string(session).map_err(storage)?;
         write_private(&tmp, json.as_bytes()).map_err(storage)?;
-        std::fs::rename(&tmp, &self.path).map_err(storage)
+        if let Err(e) = crate::utils::atomic_replace(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(storage(e));
+        }
+        Ok(())
     }
 
     /// 저장된 세션을 지운다. 이미 없으면 아무것도 하지 않는다
@@ -100,7 +107,10 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 #[cfg(test)]

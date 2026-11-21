@@ -37,8 +37,10 @@
 //! in every row, so the real tokens see exactly what they see in a single-text pass and the vectors equal
 //! [`Granite::embed`]'s up to float summation order.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use candle_core::{DType, Device, Module, Tensor, D};
@@ -249,12 +251,15 @@ impl LayerNorm {
     }
 }
 
-/// F32 RoPE tables `[max_positions, head_dim / 2]` (rotate-half layout): the angle is one F32 product
-/// `position × inv_freq`, `inv_freq = 1 / θ^(2i / head_dim)`. F32 also on GPUs whose weights are BF16 — BF16 cannot hold
-/// positions above 256 exactly.
+/// F32 RoPE tables `[max_positions, head_dim / 2]` (rotate-half layout) plus pre-concatenated
+/// `[1, 1, max_positions, head_dim]` views so `cos_sin(len)` is a zero-copy narrow.
 struct Rope {
+    #[allow(dead_code)]
     cos: Tensor,
+    #[allow(dead_code)]
     sin: Tensor,
+    cos_full: Tensor,
+    sin_full: Tensor,
 }
 
 impl Rope {
@@ -266,21 +271,29 @@ impl Rope {
         let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
         let t = Tensor::arange(0u32, max_positions as u32, device)?.to_dtype(DType::F32)?.unsqueeze(1)?;
         let freqs = t.matmul(&inv_freq.unsqueeze(0)?)?;
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
+        let cos_full = Tensor::cat(&[&cos, &cos], D::Minus1)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .contiguous()?;
+        let sin_full = Tensor::cat(&[&sin, &sin], D::Minus1)?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .contiguous()?;
         Ok(Self {
-            cos: freqs.cos()?,
-            sin: freqs.sin()?,
+            cos,
+            sin,
+            cos_full,
+            sin_full,
         })
     }
 
-    /// `[1, 1, len, head_dim]` (cos, sin), built once per forward pass and shared by its layers.
+    /// `[1, 1, len, head_dim]` (cos, sin), zero-copy slice of the prebuilt table.
     fn cos_sin(&self, len: usize) -> candle_core::Result<(Tensor, Tensor)> {
-        let cos = self.cos.narrow(0, 0, len)?;
-        let sin = self.sin.narrow(0, 0, len)?;
-        let cos = Tensor::cat(&[&cos, &cos], D::Minus1)?;
-        let sin = Tensor::cat(&[&sin, &sin], D::Minus1)?;
         Ok((
-            cos.unsqueeze(0)?.unsqueeze(0)?.contiguous()?,
-            sin.unsqueeze(0)?.unsqueeze(0)?.contiguous()?,
+            self.cos_full.narrow(2, 0, len)?,
+            self.sin_full.narrow(2, 0, len)?,
         ))
     }
 
@@ -411,6 +424,7 @@ pub struct Encoder {
     local_rope: Rope,
     window_half: usize,
     hidden_size: usize,
+    window_cache: Mutex<HashMap<(usize, DType), Tensor>>,
 }
 
 impl Encoder {
@@ -442,11 +456,30 @@ impl Encoder {
             local_rope: Rope::new(head_dim, cfg.max_positions, cfg.local_rope_theta, device)?,
             window_half: cfg.local_window_half,
             hidden_size: h,
+            window_cache: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn hidden_size(&self) -> usize {
         self.hidden_size
+    }
+
+    fn cached_window_mask(&self, len: usize, device: &Device, dtype: DType) -> candle_core::Result<Option<Tensor>> {
+        if len <= self.window_half.saturating_add(1) {
+            return Ok(None);
+        }
+        if let Some(m) = self.window_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&(len, dtype)) {
+            return Ok(Some(m.clone()));
+        }
+        let Some(m) = window_mask(len, self.window_half, device, dtype)? else {
+            return Ok(None);
+        };
+        let mut cache = self.window_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert((len, dtype), m.clone());
+        Ok(Some(m))
     }
 
     /// Final-normed hidden states `[batch, len, hidden]` for `ids` = `[batch · len]` (row-major) or `[batch, len]`.
@@ -457,7 +490,7 @@ impl Encoder {
         let mut x = self.embeddings_norm.forward(&x)?;
         let (cg, sg) = self.global_rope.cos_sin(len)?;
         let (cl, sl) = self.local_rope.cos_sin(len)?;
-        let local_mask = match (mask, window_mask(len, self.window_half, x.device(), x.dtype())?) {
+        let local_mask = match (mask, self.cached_window_mask(len, x.device(), x.dtype())?) {
             (Some(m), Some(w)) => Some(m.broadcast_add(&w)?),
             (None, w) => w,
             (m, None) => m.cloned(),

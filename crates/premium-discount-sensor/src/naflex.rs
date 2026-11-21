@@ -230,15 +230,27 @@ pub fn patchify_frame_with(rgb: &[u8], w: usize, h: usize, max_patches: usize, p
     let (th, tw) = image_size_for_max_patches(h, w, PATCH, max_patches);
     let img = resize(rgb, w, h, 3, tw, th, pre.resample);
     let (gh, gw) = (th / PATCH, tw / PATCH);
+    // 256-entry LUT per channel: bit-identical to `(u as f32 / 255.0 - mean[c]) / std[c]` with zero per-pixel divisions.
+    let mut lut = [[0f32; 256]; 3];
+    for c in 0..3 {
+        let mean = pre.mean[c];
+        let std = pre.std[c];
+        for v in 0..256 {
+            lut[c][v] = (v as f32 / 255.0 - mean) / std;
+        }
+    }
     let mut patches = vec![0f32; gh * gw * PatchGrid::DIM];
     for py in 0..gh {
         for px in 0..gw {
             let base = (py * gw + px) * PatchGrid::DIM;
             for c in 0..3 {
+                let table = &lut[c];
+                let ch_base = base + c * PATCH * PATCH;
                 for yy in 0..PATCH {
+                    let row_off = ((py * PATCH + yy) * tw + px * PATCH) * 3 + c;
+                    let dst_off = ch_base + yy * PATCH;
                     for xx in 0..PATCH {
-                        let v = img[((py * PATCH + yy) * tw + px * PATCH + xx) * 3 + c] as f32 / 255.0;
-                        patches[base + c * PATCH * PATCH + yy * PATCH + xx] = (v - pre.mean[c]) / pre.std[c];
+                        patches[dst_off + xx] = table[img[row_off + xx * 3] as usize];
                     }
                 }
             }

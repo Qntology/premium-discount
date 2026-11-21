@@ -26,11 +26,127 @@ pub struct ColdGuard {
 
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    let mut acc = [0f32; 8];
-    for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        acc[i & 7] += x * y;
+    premium_discount_cpu_kernels::dot_f32_simd(a, b)
+}
+
+/// Mean-centered Cauchy-Schwarz upper-bound guard (Pack A/C) over cold vocabulary rows:
+///
+/// For every cold row `w_i` with optional bias `b_i`:
+///   `w_i · h + b_i = mu_rest · h + (w_i - mu_rest) · h + b_i`
+///   `<= mu_rest · h + w_rest_bound * ||h||_2 + b_rest_max`
+/// where `mu_rest = mean(w_i)` and `w_rest_bound = max_i ||w_i - mu_rest||_2` (inflated by an
+/// F32 rounding margin). When `upper_bound(h) < kept_max`, no cold row can beat the kept top-1,
+/// guaranteeing 100% lossless exact argmax without evaluating cold rows.
+#[derive(Debug, Clone)]
+pub struct MeanCenteredCsGuard {
+    pub dim: usize,
+    /// Mean of all cold weight rows `[dim]`.
+    pub mu_rest: Vec<f32>,
+    /// `max_i ||w_i - mu_rest||_2` inflated for F32 rounding safety.
+    pub w_rest_bound: f32,
+    /// `max_i b_i` (0.0 when unbiased).
+    pub b_rest_max: f32,
+    /// Cold token ids in row order.
+    pub ids: Vec<u32>,
+}
+
+impl MeanCenteredCsGuard {
+    /// Builds a guard from dense F32 cold weight rows `[ids.len(), dim]` and optional biases `[ids.len()]`.
+    pub fn from_rows(rows: &[f32], ids: &[u32], bias: Option<&[f32]>, dim: usize) -> Self {
+        let n = ids.len();
+        assert_eq!(rows.len(), n * dim);
+        if let Some(b) = bias {
+            assert_eq!(b.len(), n);
+        }
+        if n == 0 {
+            return Self {
+                dim,
+                mu_rest: vec![0.0; dim],
+                w_rest_bound: 0.0,
+                b_rest_max: f32::NEG_INFINITY,
+                ids: Vec::new(),
+            };
+        }
+        let mut sum = vec![0.0f64; dim];
+        for r in rows.chunks_exact(dim) {
+            for (s, &v) in sum.iter_mut().zip(r) {
+                *s += v as f64;
+            }
+        }
+        let inv_n = 1.0 / n as f64;
+        let mu_rest: Vec<f32> = sum.iter().map(|&s| (s * inv_n) as f32).collect();
+        let max_dev_sq: f64 = rows
+            .par_chunks_exact(dim)
+            .map(|r| {
+                r.iter()
+                    .zip(&mu_rest)
+                    .map(|(&w, &m)| {
+                        let d = w as f64 - m as f64;
+                        d * d
+                    })
+                    .sum::<f64>()
+            })
+            .reduce(|| 0.0f64, f64::max);
+        let w_rest_bound = (max_dev_sq.sqrt() as f32) * (1.0 + 1e-4) + 1e-6;
+        let b_rest_max = bias
+            .map(|b| b.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+            .unwrap_or(0.0);
+        Self {
+            dim,
+            mu_rest,
+            w_rest_bound,
+            b_rest_max,
+            ids: ids.to_vec(),
+        }
     }
-    acc.iter().sum()
+
+    /// Strict upper bound on `max_{i in cold} (w_i · h + b_i)` with F32 rounding margin.
+    #[inline]
+    pub fn upper_bound(&self, h: &[f32], h_norm: f32) -> f32 {
+        if self.ids.is_empty() {
+            return f32::NEG_INFINITY;
+        }
+        let mu_h = dot(&self.mu_rest, h);
+        let dev = self.w_rest_bound * h_norm;
+        let ub = mu_h + dev + self.b_rest_max;
+        ub + 1e-3 * (mu_h.abs() + dev) + 1e-4
+    }
+
+    /// Returns `true` iff any cold token could possibly tie or beat `kept_max`.
+    #[inline]
+    pub fn needs_rescue(&self, kept_max: f32, h: &[f32], h_norm: f32) -> bool {
+        !self.ids.is_empty() && self.upper_bound(h, h_norm) >= kept_max
+    }
+
+    /// Exact top-1 over `kept_ids` union `self.ids` using the single-vector mean-centered CS guard.
+    /// Returns `(best_id, best_logit, rescued)` where `rescued == true` iff cold rows were evaluated.
+    pub fn exact_argmax(
+        &self,
+        kept_logits: &[f32],
+        kept_ids: &[u32],
+        h: &[f32],
+        cold_logit: impl Fn(u32) -> f32,
+    ) -> (u32, f32, bool) {
+        let (mut best_id, mut best) = (u32::MAX, f32::NEG_INFINITY);
+        for (&l, &id) in kept_logits.iter().zip(kept_ids) {
+            if l > best || (l == best && id < best_id) {
+                best = l;
+                best_id = id;
+            }
+        }
+        let h_norm = dot(h, h).sqrt();
+        if !self.needs_rescue(best, h, h_norm) {
+            return (best_id, best, false);
+        }
+        for &id in &self.ids {
+            let l = cold_logit(id);
+            if l > best || (l == best && id < best_id) {
+                best = l;
+                best_id = id;
+            }
+        }
+        (best_id, best, true)
+    }
 }
 
 /// Lloyd k-means (Euclidean) over the decoded cold rows `rows` (`n × dim`), seeded with evenly
@@ -213,5 +329,61 @@ mod tests {
         }
         // The bound prunes: on average far fewer rows than the cold set are re-scored.
         assert!(refined / 200 < cold.len(), "{refined}");
+    }
+
+    #[test]
+    fn mean_centered_cs_guard_is_exact_and_prunes() {
+        let (v, d) = (1024usize, 64usize);
+        let mut s = 123u64;
+        // Cold rows clustered tightly around a shared mean, hot rows with wider directional spread.
+        let mut table = vec![0.0f32; v * d];
+        let cold_mean: Vec<f32> = (0..d).map(|_| rng(&mut s) * 0.5).collect();
+        let kept: Vec<u32> = (0..256u32).collect();
+        let cold: Vec<u32> = (256..v as u32).collect();
+        for &id in &kept {
+            for j in 0..d {
+                table[id as usize * d + j] = rng(&mut s);
+            }
+        }
+        for &id in &cold {
+            for j in 0..d {
+                table[id as usize * d + j] = cold_mean[j] + 0.05 * rng(&mut s);
+            }
+        }
+        let cold_rows: Vec<f32> = cold
+            .iter()
+            .flat_map(|&i| table[i as usize * d..(i as usize + 1) * d].to_vec())
+            .collect();
+        let guard = MeanCenteredCsGuard::from_rows(&cold_rows, &cold, None, d);
+        let mut rescues = 0usize;
+        for trial in 0..100 {
+            let mut h: Vec<f32> = (0..d).map(|_| rng(&mut s)).collect();
+            if trial % 4 == 0 {
+                // Force a cold token to win.
+                let t = cold[trial % cold.len()] as usize;
+                for j in 0..d {
+                    h[j] = table[t * d + j] * 4.0 + 0.05 * h[j];
+                }
+            } else {
+                // Point strongly at a kept token so CS guard prunes cleanly.
+                let t = kept[trial % kept.len()] as usize;
+                for j in 0..d {
+                    h[j] = table[t * d + j] * 3.0;
+                }
+            }
+            let logit = |id: u32| dot(&table[id as usize * d..(id as usize + 1) * d], &h);
+            let kept_logits: Vec<f32> = kept.iter().map(|&i| logit(i)).collect();
+            let (id, l, rescued) = guard.exact_argmax(&kept_logits, &kept, &h, logit);
+            if rescued {
+                rescues += 1;
+            }
+            let (full_id, full_l) = (0..v as u32).map(|i| (i, logit(i))).fold(
+                (u32::MAX, f32::NEG_INFINITY),
+                |a, b| if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) { b } else { a },
+            );
+            assert_eq!((id, l), (full_id, full_l), "trial {trial}");
+        }
+        assert!(rescues < 100, "guard should prune hot-winning trials (rescues={rescues})");
+        assert!(rescues >= 25, "cold-winning trials must rescue (rescues={rescues})");
     }
 }

@@ -50,6 +50,13 @@ pub fn is_full_attention(layer: usize) -> bool {
 
 /// Qwen3.5 RMSNorm: x / sqrt(mean(x^2) + eps) * (1 + w)
 fn rms_norm_1p(x: &Tensor, w_plus_one: &Tensor) -> Result<Tensor> {
+    if !x.device().is_cpu()
+        && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::DecoderOps)
+    {
+        if let Ok(y) = candle_core::decoder_ops::rmsnorm_fused(x, w_plus_one, EPS as f32, false) {
+            return Ok(y);
+        }
+    }
     let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
     x.broadcast_div(&(ms + EPS)?.sqrt()?)?.broadcast_mul(w_plus_one)
 }
@@ -146,7 +153,7 @@ pub struct Qwen35 {
     tokens: TokenTable,
     layers: Vec<Layer>,
     norm: Tensor,
-    rope: (Vec<f32>, Vec<f32>),
+    rope_inv: Vec<f32>,
     device: Device,
 }
 
@@ -210,7 +217,7 @@ impl Qwen35 {
         let norm = one_plus(lm.pp("norm").get(HIDDEN, "weight")?)?;
         let half = ROTARY_DIM / 2;
         let inv: Vec<f32> = (0..half).map(|i| (1.0 / ROPE_THETA.powf((2 * i) as f64 / ROTARY_DIM as f64)) as f32).collect();
-        Ok(Self { tokenizer, tokens, layers, norm, rope: (inv, Vec::new()), device })
+        Ok(Self { tokenizer, tokens, layers, norm, rope_inv: inv, device })
     }
 
     pub fn new_state(&self) -> State {
@@ -285,7 +292,17 @@ impl Qwen35 {
             };
             x = (x + mixed)?;
             let h = rms_norm_1p(&x, &layer.post_norm)?;
-            let y = layer.down.forward(&(layer.gate.forward(&h)?.silu()? * layer.up.forward(&h)?)?)?;
+            let gate = layer.gate.forward(&h)?;
+            let up = layer.up.forward(&h)?;
+            let glu = if !gate.device().is_cpu()
+                && crate::utils::accel_op_ok(gate.device(), crate::utils::AccelOp::DecoderOps)
+            {
+                candle_core::decoder_ops::silu_mul(&gate, &up)
+                    .or_else(|_| &gate.silu()? * &up)?
+            } else {
+                (&gate.silu()? * &up)?
+            };
+            let y = layer.down.forward(&glu)?;
             x = (x + y)?;
         }
         st.pos += t;
@@ -318,50 +335,61 @@ impl Qwen35 {
         let scale = 1.0 / (LIN_DIM as f32).sqrt();
         let mut core = vec![0f32; t * KEY_DIM];
         let l2 = |v: &mut [f32]| {
-            let inv = 1.0 / (v.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
+            let inv = 1.0 / (premium_discount_cpu_kernels::dot_f32_simd(v, v) + 1e-6).sqrt();
             v.iter_mut().for_each(|x| *x *= inv);
         };
+        // Stack-allocated scratch buffers reused across every (t, head): zero per-head heap allocs.
+        let mut q_buf = [0f32; LIN_DIM];
+        let mut k_buf = [0f32; LIN_DIM];
+        let mut kv_buf = [0f32; LIN_DIM];
+        let mut delta_buf = [0f32; LIN_DIM];
         for i in 0..t {
+            let base = i * CONV_DIM;
             for hd in 0..LIN_HEADS {
-                let base = i * CONV_DIM;
-                let mut q = qkv[base + hd * LIN_DIM..base + (hd + 1) * LIN_DIM].to_vec();
-                let mut k = qkv[base + KEY_DIM + hd * LIN_DIM..base + KEY_DIM + (hd + 1) * LIN_DIM].to_vec();
+                q_buf.copy_from_slice(&qkv[base + hd * LIN_DIM..base + (hd + 1) * LIN_DIM]);
+                k_buf.copy_from_slice(&qkv[base + KEY_DIM + hd * LIN_DIM..base + KEY_DIM + (hd + 1) * LIN_DIM]);
                 let v = &qkv[base + 2 * KEY_DIM + hd * LIN_DIM..base + 2 * KEY_DIM + (hd + 1) * LIN_DIM];
-                l2(&mut q);
-                l2(&mut k);
-                q.iter_mut().for_each(|x| *x *= scale);
+                l2(&mut q_buf);
+                l2(&mut k_buf);
+                for x in &mut q_buf {
+                    *x *= scale;
+                }
                 let beta = 1.0 / (1.0 + (-b[i * LIN_HEADS + hd]).exp());
                 let decay = (g.neg_a[hd] * softplus(a[i * LIN_HEADS + hd] + g.dt_bias[hd])).exp();
                 let s = &mut ssm[hd * LIN_DIM * LIN_DIM..(hd + 1) * LIN_DIM * LIN_DIM];
-                s.iter_mut().for_each(|x| *x *= decay);
+                for x in s.iter_mut() {
+                    *x *= decay;
+                }
                 // kv = k^T S, delta = (v - kv) * beta, S += k ⊗ delta, out = q^T S
-                let mut kv = vec![0f32; LIN_DIM];
-                for (r, kr) in k.iter().enumerate() {
+                kv_buf.fill(0.0);
+                for (r, &kr) in k_buf.iter().enumerate() {
                     let row = &s[r * LIN_DIM..(r + 1) * LIN_DIM];
-                    for (acc, sv) in kv.iter_mut().zip(row) {
-                        *acc += kr * sv;
+                    for (acc, &sv) in kv_buf.iter_mut().zip(row) {
+                        *acc = kr.mul_add(sv, *acc);
                     }
                 }
-                let delta: Vec<f32> = v.iter().zip(&kv).map(|(vv, kk)| (vv - kk) * beta).collect();
-                for (r, kr) in k.iter().enumerate() {
+                for j in 0..LIN_DIM {
+                    delta_buf[j] = (v[j] - kv_buf[j]) * beta;
+                }
+                for (r, &kr) in k_buf.iter().enumerate() {
                     let row = &mut s[r * LIN_DIM..(r + 1) * LIN_DIM];
-                    for (sv, d) in row.iter_mut().zip(&delta) {
-                        *sv += kr * d;
+                    for (sv, &d) in row.iter_mut().zip(&delta_buf) {
+                        *sv = kr.mul_add(d, *sv);
                     }
                 }
                 let out = &mut core[i * KEY_DIM + hd * LIN_DIM..i * KEY_DIM + (hd + 1) * LIN_DIM];
-                for (r, qr) in q.iter().enumerate() {
+                for (r, &qr) in q_buf.iter().enumerate() {
                     let row = &s[r * LIN_DIM..(r + 1) * LIN_DIM];
-                    for (o, sv) in out.iter_mut().zip(row) {
-                        *o += qr * sv;
+                    for (o, &sv) in out.iter_mut().zip(row) {
+                        *o = qr.mul_add(sv, *o);
                     }
                 }
                 // 게이트 RMSNorm: x / sqrt(mean(x^2) + eps) * w * silu(z)
-                let ms = out.iter().map(|x| x * x).sum::<f32>() / LIN_DIM as f32;
+                let ms = premium_discount_cpu_kernels::dot_f32_simd(out, out) / LIN_DIM as f32;
                 let inv = 1.0 / (ms + EPS as f32).sqrt();
                 let zrow = &z[i * KEY_DIM + hd * LIN_DIM..i * KEY_DIM + (hd + 1) * LIN_DIM];
-                for ((o, w), zz) in out.iter_mut().zip(&g.norm_w).zip(zrow) {
-                    *o = *o * inv * w * silu(*zz);
+                for ((o, &w), &zz) in out.iter_mut().zip(&g.norm_w).zip(zrow) {
+                    *o = *o * inv * w * silu(zz);
                 }
             }
         }
@@ -373,10 +401,10 @@ impl Qwen35 {
         let mut cos = vec![0f32; t * half];
         let mut sin = vec![0f32; t * half];
         for i in 0..t {
-            for (j, f) in self.rope.0.iter().enumerate() {
-                let a = (pos0 + i) as f32 * f;
-                cos[i * half + j] = a.cos();
-                sin[i * half + j] = a.sin();
+            for (j, &f) in self.rope_inv.iter().enumerate() {
+                let (s, c) = ((pos0 + i) as f32 * f).sin_cos();
+                cos[i * half + j] = c;
+                sin[i * half + j] = s;
             }
         }
         (cos, sin)
@@ -424,7 +452,7 @@ impl Qwen35 {
                 let mut max = f32::NEG_INFINITY;
                 for (p, sc) in scores.iter_mut().enumerate().take(limit) {
                     let kv = &keys[(p * KV_HEADS + kvh) * HEAD_DIM..(p * KV_HEADS + kvh + 1) * HEAD_DIM];
-                    *sc = qv.iter().zip(kv).map(|(a, b)| a * b).sum::<f32>() * scale;
+                    *sc = premium_discount_cpu_kernels::dot_f32_simd(qv, kv) * scale;
                     max = max.max(*sc);
                 }
                 let mut sum = 0f32;
@@ -447,20 +475,85 @@ impl Qwen35 {
         a.o.forward(&out)
     }
 
-    /// 마지막 은닉 → 다음 토큰 (그리디). 잘라 낸 헤드면 그 안에서 고른다
+    /// 마지막 은닉 → 다음 토큰 (그리디). 잘라 낸 헤드면 그 안에서 고른다.
+    /// - `allow = Some(ids)` with a small whitelist scores ONLY the allowed rows (avoiding full-vocab GEMV).
+    /// - `allow = None` on GPU uses Pack A/C fused tile argmax (`fused_linear_argmax_cs`) with 0-byte logits materialization.
     pub fn next_token(&self, h: &Tensor, head: &Head, allow: Option<&[u32]>) -> Result<(u32, f32)> {
+        if let Some(allowed) = allow {
+            if !allowed.is_empty() && allowed.len() <= 64 {
+                let h_row = h.unsqueeze(0)?;
+                let mut best = (0u32, f32::NEG_INFINITY);
+                match head {
+                    Head::Full(w) => {
+                        let rows = Tensor::from_slice(allowed, allowed.len(), w.device())?;
+                        let sub = w.index_select(&rows, 0)?;
+                        let logits: Vec<f32> = h_row.matmul(&sub.t()?)?.squeeze(0)?.to_vec1()?;
+                        for (&id, &l) in allowed.iter().zip(&logits) {
+                            if l > best.1 || (l == best.1 && id < best.0) {
+                                best = (id, l);
+                            }
+                        }
+                        return Ok(best);
+                    }
+                    Head::Trimmed { ids, weight } => {
+                        let mut idxs = Vec::with_capacity(allowed.len());
+                        let mut matched_ids = Vec::with_capacity(allowed.len());
+                        for (i, &id) in ids.iter().enumerate() {
+                            if allowed.contains(&id) {
+                                idxs.push(i as u32);
+                                matched_ids.push(id);
+                            }
+                        }
+                        if idxs.is_empty() {
+                            return Ok(best);
+                        }
+                        let rows = Tensor::from_slice(&idxs, idxs.len(), weight.device())?;
+                        let sub = weight.index_select(&rows, 0)?;
+                        let logits: Vec<f32> = h_row.matmul(&sub.t()?)?.squeeze(0)?.to_vec1()?;
+                        for (&id, &l) in matched_ids.iter().zip(&logits) {
+                            if l > best.1 || (l == best.1 && id < best.0) {
+                                best = (id, l);
+                            }
+                        }
+                        return Ok(best);
+                    }
+                }
+            }
+        }
+        if allow.is_none()
+            && !h.device().is_cpu()
+            && crate::utils::accel_op_ok(h.device(), crate::utils::AccelOp::LmHeadArgmax)
+        {
+            let h_row = h.unsqueeze(0)?;
+            let (weight, ids_opt) = match head {
+                Head::Full(w) => (w, None),
+                Head::Trimmed { ids, weight } => (weight, Some(ids.as_slice())),
+            };
+            if let Ok(out) = candle_core::lm_head::fused_linear_argmax_cs(&h_row, weight, None, None, None) {
+                let local_id = out.ids.to_vec1::<u32>()?[0];
+                let val = out
+                    .max_vals
+                    .and_then(|t| t.to_vec1::<f32>().ok())
+                    .and_then(|v| v.first().copied())
+                    .unwrap_or(0.0);
+                let token_id = ids_opt.map_or(local_id, |v| v[local_id as usize]);
+                return Ok((token_id, val));
+            }
+        }
         let (logits, ids) = head.logits(h)?;
         let id_of = |i: usize| ids.map_or(i as u32, |v| v[i]);
+        let allow_set: Option<std::collections::HashSet<u32>> =
+            allow.map(|a| a.iter().copied().collect());
         let mut best = (0u32, f32::NEG_INFINITY);
-        for (i, l) in logits.iter().enumerate() {
+        for (i, &l) in logits.iter().enumerate() {
             let id = id_of(i);
-            if let Some(allow) = allow {
-                if !allow.contains(&id) {
+            if let Some(ref set) = allow_set {
+                if !set.contains(&id) {
                     continue;
                 }
             }
-            if *l > best.1 {
-                best = (id, *l);
+            if l > best.1 || (l == best.1 && id < best.0) {
+                best = (id, l);
             }
         }
         Ok(best)

@@ -125,16 +125,21 @@ pub fn seed_labels(bank: &AnchorBank, scores: &[VisionScore], n: usize) -> Vec<u
     labels
 }
 
-/// Contrast heats of `labels` on the cells a pass evaluated (NaN on the others).
-fn label_heats(tower: &VisionTower, pass: &SparsePass, bank: &AnchorBank, labels: &[usize], n: usize) -> Result<Vec<Vec<f32>>> {
-    let dense = tower.dense(pass)?;
+/// Contrast heats of `labels` on already-computed dense features (NaN on unvisited cells).
+fn heats_from_dense(cells: &[u32], dense: &[Vec<f32>], bank: &AnchorBank, labels: &[usize], n: usize) -> Vec<Vec<f32>> {
     let mut out = vec![vec![f32::NAN; n]; labels.len()];
-    for (c, v) in pass.cells.iter().zip(&dense) {
+    for (c, v) in cells.iter().zip(dense) {
         for (k, h) in bank.contrast(labels, v).into_iter().enumerate() {
             out[k][*c as usize] = h;
         }
     }
-    Ok(out)
+    out
+}
+
+/// Contrast heats of `labels` on the cells a pass evaluated (NaN on the others).
+fn label_heats(tower: &VisionTower, pass: &SparsePass, bank: &AnchorBank, labels: &[usize], n: usize) -> Result<Vec<Vec<f32>>> {
+    let dense = tower.dense(pass)?;
+    Ok(heats_from_dense(&pass.cells, &dense, bank, labels, n))
 }
 
 /// The pass over `grid` that `cfg` asks for: full, or perforated with the minesweeper opening.
@@ -198,9 +203,9 @@ fn encode_gated(
         ..PerfReport::default()
     };
     if let (Some(x), false) = (perf.expand, bank.is_empty()) {
-        let pooled = tower.pooled(&pass)?;
+        let (pooled, dense) = tower.pooled_and_dense(&pass)?;
         let labels = seed_labels(bank, &bank.score(&pooled), cfg.seed_labels);
-        let mut heats = label_heats(tower, &pass, bank, &labels, n)?;
+        let mut heats = heats_from_dense(&pass.cells, &dense, bank, &labels, n);
         let seed_cells = seeds(&heats, cols, rows, &x);
         rep.seeds = seed_cells.len();
         for round in 0..x.rounds {
@@ -287,7 +292,12 @@ fn read_gated(
     let t0 = std::time::Instant::now();
     let (pass, report) = encode_gated(tower, cfg, grid, bank, masked, gate)?;
     gate()?;
-    let pooled = tower.pooled(&pass)?;
+    let (pooled, dense_opt) = if bank.is_empty() {
+        (tower.pooled(&pass)?, None)
+    } else {
+        let (p, d) = tower.pooled_and_dense(&pass)?;
+        (p, Some(d))
+    };
     let scores = bank.score(&pooled);
     let n = grid.cells();
     let (cols, rows) = (grid.grid_w as u32, grid.grid_h as u32);
@@ -298,7 +308,10 @@ fn read_gated(
         .collect();
     let peak = match top.first() {
         Some(_) => {
-            let mut h = label_heats(tower, &pass, bank, &top, n)?.remove(0);
+            let mut h = match dense_opt {
+                Some(ref dense) => heats_from_dense(&pass.cells, dense, bank, &top, n).remove(0),
+                None => label_heats(tower, &pass, bank, &top, n)?.remove(0),
+            };
             let mut open = vec![false; n];
             for &c in &pass.cells {
                 open[c as usize] = true;

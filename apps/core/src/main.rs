@@ -152,20 +152,19 @@ struct Shell {
 }
 
 impl Shell {
-    /// 우아한 종료 (`cmd_shutdown`): 코어(모델 텐서 · LanceDB)를 먼저 놓고, GPU 가 쥔 캐시 풀을 드라이버에 돌려준다.
-    /// Windows HIP 는 풀이 남은 채 프로세스가 끝나면 종료 단계에서 멈춘다(utils::release_gpu). 답한 뒤 serve_lines 가 끝난다
+    /// 우아한 종료 (`cmd_shutdown`): 코어(모델 텐서 · LanceDB) · 초안 모델(draft) · 필터 모델(laya)을 모두 놓고,
+    /// 이 프로세스가 실제로 열었던 GPU가 있을 때만 풀을 반환한다 (종료 시 새 GPU 컨텍스트를 열지 않음).
     async fn release(&self) -> Value {
         let had_core = {
             let mut state = self.core.lock().await;
             let previous = std::mem::replace(&mut *state, CoreState::Empty);
             matches!(previous, CoreState::Ready(_))
         };
-        let released = match premium_discount_app::utils::device_from_env() {
-            Ok(device) => premium_discount_app::utils::release_gpu(&device).is_ok(),
-            Err(_) => false,
-        };
-        eprintln!("shutdown: core released ({had_core}), gpu pool released ({released})");
-        serde_json::json!({ "shutdown": true, "core_released": had_core, "gpu_released": released })
+        let had_draft = self.draft.release().await;
+        self.filter.set(Arc::new(premium_discount_app::filter::LocalFilter::default()), "dictionary");
+        let released = premium_discount_app::utils::release_opened_gpu();
+        eprintln!("shutdown: core released ({had_core}), draft released ({had_draft}), gpu pool released ({released})");
+        serde_json::json!({ "shutdown": true, "core_released": had_core, "draft_released": had_draft, "gpu_released": released })
     }
 
     async fn core(&self) -> Result<Arc<Core>, String> {
@@ -309,6 +308,8 @@ async fn main() {
     let shell = &shell;
     if let Err(e) = serve_lines(stdin, tokio::io::stdout(), |cmd, args| async move { shell.handle(cmd, args).await }).await {
         eprintln!("error: {e}");
+        premium_discount_app::utils::rocm_exit_now_if_used(1);
         std::process::exit(1);
     }
+    premium_discount_app::utils::rocm_exit_now_if_used(0);
 }

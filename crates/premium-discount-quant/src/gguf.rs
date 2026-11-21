@@ -187,7 +187,11 @@ pub struct GgufWriter {
 
 impl GgufWriter {
     pub fn create(dest: &Path, kvs: &[(String, Kv)], decls: Vec<TensorDecl>) -> Result<Self> {
-        let part = dest.with_extension("gguf.part");
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut part_os = dest.as_os_str().to_os_string();
+        part_os.push(format!(".part.{}.{seq}", std::process::id()));
+        let part = PathBuf::from(part_os);
         let mut w = BufWriter::with_capacity(8 << 20, File::create(&part).with_context(|| format!("create {}", part.display()))?);
         w.write_all(b"GGUF")?;
         w.write_all(&3u32.to_le_bytes())?;
@@ -254,7 +258,22 @@ impl GgufWriter {
         self.w.flush()?;
         self.w.get_ref().sync_all()?;
         drop(self.w);
-        std::fs::rename(&self.part, &self.dest)?;
+        match std::fs::rename(&self.part, &self.dest) {
+            Ok(()) => {}
+            Err(_) if self.dest.exists() => {
+                let mut bak_os = self.dest.as_os_str().to_os_string();
+                bak_os.push(format!(".bak.{}", std::process::id()));
+                let bak = PathBuf::from(bak_os);
+                let _ = std::fs::remove_file(&bak);
+                std::fs::rename(&self.dest, &bak)?;
+                if let Err(e) = std::fs::rename(&self.part, &self.dest) {
+                    let _ = std::fs::rename(&bak, &self.dest);
+                    return Err(e.into());
+                }
+                let _ = std::fs::remove_file(&bak);
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(self.dest)
     }
 }

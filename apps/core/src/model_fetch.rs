@@ -483,7 +483,7 @@ impl Job {
             let _ = std::fs::remove_file(&part);
             return Err(Stop::Failed(format!("{}: 받은 내용의 해시가 다릅니다 (다시 받으세요)", spec.name)));
         }
-        std::fs::rename(&part, &target)?;
+        crate::utils::atomic_replace(&part, &target)?;
         Ok(())
     }
 
@@ -545,7 +545,7 @@ impl Job {
             let _ = std::fs::remove_file(&part);
             return Err(Stop::Failed("텍스트 모델 구간의 해시가 다릅니다 (다시 받으세요)".into()));
         }
-        std::fs::rename(&part, &target)?;
+        crate::utils::atomic_replace(&part, &target)?;
         Ok(())
     }
 

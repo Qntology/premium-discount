@@ -112,7 +112,6 @@ impl QCache {
         }
         let mut tensors = HashMap::new();
         for name in content.tensor_infos.keys() {
-            f.rewind().ok()?;
             let q = content.tensor(&mut f, name, device).ok()?;
             tensors.insert(name.clone(), q);
         }
@@ -133,11 +132,13 @@ impl QCache {
         (q.dtype() == dtype && q.shape().dims() == shape).then_some(q)
     }
 
-    /// 텐서들을 캐시로 쓴다 (임시 파일 → 이름 바꾸기). 같은 component의 다른 레시피 캐시는 지운다.
+    /// 텐서들을 캐시로 쓴다 (고유 임시 파일 → fsync → 원자적 교체). 같은 component의 다른 레시피 캐시는 지운다.
     pub fn save(path: &Path, fp: &Fingerprint, tensors: &[(String, &QTensor)]) -> std::io::Result<()> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".tmp-{}-{}.gguf", fp.component, std::process::id()));
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".tmp-{}-{}-{seq}.gguf", fp.component, std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp)?;
             let meta = fp.entries();
@@ -146,7 +147,10 @@ impl QCache {
             gguf_file::write(&mut f, &meta_refs, &tensor_refs).map_err(|e| std::io::Error::other(e.to_string()))?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)?;
+        if let Err(e) = crate::utils::atomic_replace(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         // 다른 레시피로 만든 같은 component의 캐시는 더 쓰이지 않는다
         let keep = path.file_name().map(|n| n.to_os_string());
         if let Ok(entries) = std::fs::read_dir(dir) {
