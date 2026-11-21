@@ -120,10 +120,17 @@ pub struct LocalMatch {
     pub local_id: String,
     pub id: Option<String>,
     pub cc: String,
+    /// 대상 주소 (행의 `to`). 스코프 부스트(L1 체크포인트 · L2 개체)가 이 값으로 순위를 올린다
+    pub to: Option<String>,
+    /// 스레드 루트와 부모 (서버가 접수한 뒤에만 있다). raon-zena 의 LabelHydrator 가 원격 히트를 내 스레드에 잇는 데 쓴다
+    pub root: Option<String>,
+    pub ref_: Option<String>,
     pub state: LocalState,
     pub text: String,
     /// 코사인 유사도 (1에 가까울수록 비슷하다). 서버 검색의 score와 같은 방향이다
     pub score: f32,
+    /// 만든 시각 (밀리초)
+    pub created_at: i64,
 }
 
 /// 화면 캐시(Dexie)로 내보낼 때 "없음"을 빈 문자열로 바꾼다 (README 13-3의 변환 규칙, 이 함수 한 곳에서만)
@@ -539,7 +546,8 @@ impl LocalDb {
         if top_k == 0 {
             return Ok(vec![]);
         }
-        let mut filter = String::from("vector IS NOT NULL AND state IN ('queued', 'pending', 'stored')");
+        // 거부(rejected) · 실패(failed)한 내 글은 찾지 않는다. 서버 결과를 모르게 된 글(missing)은 내 메모로 남아 찾는다
+        let mut filter = String::from("vector IS NOT NULL AND state IN ('queued', 'pending', 'stored', 'missing')");
         if let Some(cc) = cc {
             filter.push_str(&format!(" AND cc = {}", sql_str(cc)));
         }
@@ -564,8 +572,15 @@ impl LocalDb {
             let local_id = string_col(b, "local_id")?;
             let id = string_col(b, "id")?;
             let cc = string_col(b, "cc")?;
+            let to = string_col(b, "to")?;
+            let root = string_col(b, "root")?;
+            let ref_ = string_col(b, "ref")?;
             let text = string_col(b, "text")?;
             let state = string_col(b, "state")?;
+            let created_at = b
+                .column_by_name("created_at")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| AppError::Storage("search result has no created_at column".into()))?;
             let distance = b
                 .column_by_name("_distance")
                 .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
@@ -576,10 +591,14 @@ impl LocalDb {
                     local_id: local_id.value(i).to_string(),
                     id: opt(id, i),
                     cc: cc.value(i).to_string(),
+                    to: opt(to, i),
+                    root: opt(root, i),
+                    ref_: opt(ref_, i),
                     state: LocalState::parse(state.value(i))?,
                     text: text.value(i).to_string(),
                     // 코사인 거리 = 1 - 코사인 유사도
                     score: 1.0 - distance.value(i),
+                    created_at: created_at.value(i),
                 });
             }
         }

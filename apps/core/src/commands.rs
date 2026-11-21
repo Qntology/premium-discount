@@ -75,6 +75,10 @@ fn search_options(a: &SearchArgs) -> SearchOptions {
         ref_: blank_to_none(a.ref_.clone()),
         to: blank_to_none(a.to.clone()),
         tier: blank_to_none(a.tier.clone()),
+        scope: a.scope.as_ref().map(|s| crate::pipeline::ScopeBoost {
+            l1_checkpoint_to: blank_to_none(s.l1_checkpoint_to.clone()).map(|t| t.to_ascii_lowercase()),
+            l2_entity_tos: s.l2_entity_tos.iter().filter_map(|t| blank_to_none(Some(t.clone()))).map(|t| t.to_ascii_lowercase()).collect(),
+        }),
     }
 }
 
@@ -236,11 +240,16 @@ pub fn model_command(f: &Fetchers, cmd: &str, args: Value) -> Option<Result<Valu
     }
 }
 
+/// 우아한 종료 명령. 셸이 코어와 GPU 풀을 놓고 답하면 [`serve_lines`] 가 그 답을 쓴 뒤 돌아온다(프로세스가 끝난다).
+/// premium-discount-mcp 가 유휴 회수 때 이 명령을 먼저 보내고, 2초 안에 끝나지 않을 때만 강제로 끝낸다
+pub const SHUTDOWN_COMMAND: &str = "cmd_shutdown";
+
 /// 한 줄에 JSON 하나씩 읽어 `handle(명령, 인자)`로 처리하고, 같은 `id`를 달아 한 줄로 답한다. 입력이 끝나면 돌아온다.
 ///
 /// 요청: `{"id": 1, "cmd": "cmd_search_local", "args": {"query": "..."}}`
 /// 응답: `{"id": 1, "ok": true, "result": ...}` 또는 `{"id": 1, "ok": false, "error": {"kind": "...", "message": "..."}}`
 /// 요청은 차례로 처리한다. 형식이 틀린 줄에는 `id: null`로 오류를 답하고 계속 읽는다.
+/// [`SHUTDOWN_COMMAND`] 가 성공하면 그 답을 쓰고 돌아온다.
 pub async fn serve_lines<R, W, F, Fut>(reader: R, mut writer: W, mut handle: F) -> std::io::Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -253,6 +262,7 @@ where
         if line.trim().is_empty() {
             continue;
         }
+        let mut shutdown = false;
         let reply = match serde_json::from_str::<Value>(&line) {
             Err(e) => error_reply(Value::Null, CommandError::new("invalid_input", format!("not valid JSON: {e}"))),
             Ok(req) => {
@@ -262,7 +272,10 @@ where
                     Some(cmd) => {
                         let args = req.get("args").cloned().unwrap_or(Value::Null);
                         match handle(cmd.to_string(), args).await {
-                            Ok(result) => serde_json::json!({ "id": id, "ok": true, "result": result }),
+                            Ok(result) => {
+                                shutdown = cmd == SHUTDOWN_COMMAND;
+                                serde_json::json!({ "id": id, "ok": true, "result": result })
+                            }
                             Err(e) => error_reply(id, e),
                         }
                     }
@@ -272,6 +285,9 @@ where
         writer.write_all(reply.to_string().as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
+        if shutdown {
+            break;
+        }
     }
     Ok(())
 }
@@ -398,16 +414,30 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
         let events = store.events(&host, range).await?;
         let top_k = args.top_k.unwrap_or(5).min(50) as usize;
         let prompted = crate::embeddinggemma::with_prompt(crate::embeddinggemma::Role::Query, &args.query);
-        let vector = crate::embedding::l2_normalize(self.evaluator.embedder().embed(&prompted)?)?;
-        let matches = store.search(&vector, top_k, &host, range).await?;
+        // 퍼널 · 병목 · 선택 대조(Track 1)는 모델 없이 계산된다. 임베딩이 안 되면 요약글 검색만 비우고 리포트는 낸다 (WA-11)
+        let matches = match self.evaluator.embedder().embed(&prompted).and_then(crate::embedding::l2_normalize) {
+            Ok(vector) => store.search(&vector, top_k, &host, range).await?,
+            Err(e) => {
+                eprintln!("analytic report without summary search: {e}");
+                Vec::new()
+            }
+        };
         Ok(crate::analytic::build_report(&host, query, &events, matches))
     }
 
-    /// 웹 행동 분석: 사건 지우기. 묘비를 남겨 다시 받지 않는다
+    /// 웹 행동 분석: 사건 지우기. 묘비를 남겨 다시 받지 않는다. 사건 id 목록과 사이트의 시각 컷오프(`host` + `before_ms`,
+    /// `cutoff:<host>` 묘비)를 함께 받는다 (시나리오 5 WA-12). 서버 원시 사건 지우기(`flush_remote`)는 아직 없다
     pub async fn cmd_analytic_forget(&self, args: AnalyticForgetArgs) -> Result<Value, CommandError> {
+        args.validate().map_err(|e| CommandError::new("invalid_input", e))?;
         let store = self.analytic_store()?;
-        let deleted = store.forget(&args.ids, crate::analytic::now_ms()).await?;
-        Ok(serde_json::json!({ "deleted": deleted }))
+        let now = crate::analytic::now_ms();
+        let by_id = store.forget(&args.ids, now).await?;
+        let mut by_range = 0;
+        if let Some((host, before_ms)) = args.range(now) {
+            let host = Self::analytic_host(host)?;
+            by_range = store.forget_before(&host, before_ms).await?;
+        }
+        Ok(serde_json::json!({ "deleted": by_id + by_range, "deleted_ids": by_id, "deleted_range": by_range, "remote_flushed": false }))
     }
 
     /// 화면에 보여 줄 경로와 서버 주소
@@ -568,12 +598,34 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
         Ok(VerdictsResult { verdicts, missing, stale: remote_error.is_some(), remote_error })
     }
 
+    /// 보낼 것 · 확인할 것의 수 (서버에 가지 않는다). premium-discount-mcp 가 보내기 없는 동기화(`flush: false`)에서도
+    /// 투표만 남은 상태를 SyncLoop 에 알리는 데 쓴다 (예전에는 보내기를 해야만 votes_remaining 을 알았다)
+    pub async fn cmd_queue_counts(&self) -> Result<Value, CommandError> {
+        let outbox = self.outbox.read().await;
+        let queued_votes = outbox.votes().queued_count().await?;
+        Ok(serde_json::json!({
+            "queued": outbox.queued(),
+            "awaiting_result": outbox.awaiting_result(),
+            "queued_votes": queued_votes,
+        }))
+    }
+
     pub async fn cmd_flush_outbox(&self) -> Result<FlushSummary, CommandError> {
         let mut outbox = self.outbox.write().await;
         let flushed = self.evaluator.flush_outbox(&mut outbox).await;
         let synced = self.evaluator.sync_outbox_status(&mut outbox).await;
         let voted = outbox.votes().flush(self.evaluator.backend()).await;
+        let auth_required = flushed.auth_required || synced.auth_required || voted.auth_required;
+        let retry_after_ms = [flushed.retry_after_ms, synced.retry_after_ms, voted.retry_after_ms].into_iter().flatten().max();
+        // 보낼 것도 확인할 것도 없으면(유휴) 30분에 한 번 작은 파일을 합친다 (E-17: 오래 켜 둔 앱의 조각 파일)
+        if flushed.remaining == 0 && synced.still_pending == 0 && voted.remaining == 0 {
+            if let Some(Err(e)) = outbox.maintain_if_due(crate::queue::now_ms(), crate::outbox::MAINTAIN_EVERY_MS).await {
+                eprintln!("outbox maintain: {e}");
+            }
+        }
         Ok(FlushSummary {
+            auth_required,
+            retry_after_ms,
             sent: flushed.sent.len(),
             rejected: flushed.rejected.into_iter().map(Into::into).collect(),
             remaining: flushed.remaining,
@@ -701,6 +753,7 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> AppCore<B, E, F> {
             "cmd_search_remote" => out(self.cmd_search_remote(parse(args)?).await?),
             "cmd_search_merged" => out(self.cmd_search_merged(parse(args)?).await?),
             "cmd_flush_outbox" => out(self.cmd_flush_outbox().await?),
+            "cmd_queue_counts" => out(self.cmd_queue_counts().await?),
             "cmd_vote" => out(self.cmd_vote(parse(args)?).await?),
             "cmd_supersede" => out(self.cmd_supersede(parse(args)?).await?),
             "cmd_verdicts" => out(self.cmd_verdicts(parse(args)?).await?),
@@ -984,12 +1037,12 @@ mod tests {
         assert!(report.query.page_kinds.contains(&"cart".to_string()));
         assert_eq!(report.matches.len(), 2);
 
-        let forgot = core.cmd_analytic_forget(AnalyticForgetArgs { ids: vec!["e1".into()] }).await.unwrap();
+        let forgot = core.cmd_analytic_forget(AnalyticForgetArgs::by_ids(vec!["e1".into()])).await.unwrap();
         assert_eq!(forgot["deleted"], 1);
         // 분석 저장소가 없는 코어는 not_ready
         let outbox = Outbox::open(temp_dir("commands-no-analytic")).await.unwrap();
         let bare = AppCore::new(Evaluator::new(server.clone(), AxisEmbedder, LocalFilter::default()), outbox);
-        assert_eq!(bare.cmd_analytic_forget(AnalyticForgetArgs { ids: vec![] }).await.unwrap_err().kind, "not_ready");
+        assert_eq!(bare.cmd_analytic_forget(AnalyticForgetArgs::by_ids(vec![])).await.unwrap_err().kind, "not_ready");
     }
 
     fn submit(text: &str) -> SubmitArgs {
@@ -1187,7 +1240,7 @@ mod tests {
         // 검색 결과에 내 표가 붙는다
         *server.remote_matches.lock().unwrap() = vec![remote(OTHER_ID, 0.4)];
         let found = core
-            .cmd_search_remote(SearchArgs { query: "아무거나".into(), top_k: 5, cc: None, root: None, ref_: None, to: None, tier: None })
+            .cmd_search_remote(SearchArgs { query: "아무거나".into(), top_k: 5, cc: None, root: None, ref_: None, to: None, tier: None, scope: None })
             .await
             .unwrap();
         assert_eq!(found.matches[0].my_vote, Some(1));
@@ -1243,7 +1296,7 @@ mod tests {
         m.verdict = Some(crate::api::MatchVerdict { tier: "premium".into(), grade: Some(1), rank: Some(0.6), evidence: 4.0 });
         *server.remote_matches.lock().unwrap() = vec![m];
 
-        let args = |tier: Option<&str>| SearchArgs { query: "등급 검색".into(), top_k: 5, cc: None, root: None, ref_: None, to: None, tier: tier.map(Into::into) };
+        let args = |tier: Option<&str>| SearchArgs { query: "등급 검색".into(), top_k: 5, cc: None, root: None, ref_: None, to: None, tier: tier.map(Into::into), scope: None };
         let all = core.cmd_search_merged(args(None)).await.unwrap();
         assert_eq!(all.matches.len(), 2);
         let other = all.matches.iter().find(|m| m.id.as_deref() == Some(OTHER_ID)).unwrap();
@@ -1269,7 +1322,7 @@ mod tests {
         // 서버 검색에는 아직 내 글이 없고 남의 글만 있다 (cron이 처리하기 전)
         *server.remote_matches.lock().unwrap() = vec![remote(OTHER_ID, 0.4)];
 
-        let args = SearchArgs { query: "방금 쓴 글".into(), top_k: 10, cc: None, root: None, ref_: None, to: None, tier: None };
+        let args = SearchArgs { query: "방금 쓴 글".into(), top_k: 10, cc: None, root: None, ref_: None, to: None, tier: None, scope: None };
         let merged = core.cmd_search_merged(args).await.unwrap();
         assert_eq!(merged.remote_error, None);
         assert_eq!(merged.matches.len(), 2);
@@ -1284,7 +1337,7 @@ mod tests {
         let (core, server) = core().await;
         core.cmd_submit_evaluation(submit("양쪽에 있는 글")).await.unwrap();
         *server.remote_matches.lock().unwrap() = vec![remote(SERVER_ID, 0.97), remote(OTHER_ID, 0.2)];
-        let args = SearchArgs { query: "양쪽에 있는 글".into(), top_k: 10, cc: None, root: None, ref_: None, to: None, tier: None };
+        let args = SearchArgs { query: "양쪽에 있는 글".into(), top_k: 10, cc: None, root: None, ref_: None, to: None, tier: None, scope: None };
         let merged = core.cmd_search_merged(args).await.unwrap();
         assert_eq!(merged.matches.len(), 2, "같은 서버 id는 하나로 합친다");
         let mine = &merged.matches[0];
@@ -1299,7 +1352,7 @@ mod tests {
         let (core, server) = core().await;
         core.cmd_submit_evaluation(submit("오프라인 검색")).await.unwrap();
         server.offline.store(true, Ordering::SeqCst);
-        let args = SearchArgs { query: "오프라인 검색".into(), top_k: 5, cc: None, root: None, ref_: None, to: None, tier: None };
+        let args = SearchArgs { query: "오프라인 검색".into(), top_k: 5, cc: None, root: None, ref_: None, to: None, tier: None, scope: None };
         let merged = core.cmd_search_merged(args).await.unwrap();
         assert_eq!(merged.matches.len(), 1);
         assert!(merged.remote_error.as_deref().unwrap_or("").contains("offline"), "{merged:?}");
@@ -1310,7 +1363,7 @@ mod tests {
         let (core, server) = core().await;
         core.cmd_submit_evaluation(submit("필터 검색")).await.unwrap();
         *server.remote_matches.lock().unwrap() = vec![remote(OTHER_ID, 0.3)];
-        let args = SearchArgs { query: "필터 검색".into(), top_k: 5, cc: None, root: Some(OTHER_ID.into()), ref_: None, to: None, tier: None };
+        let args = SearchArgs { query: "필터 검색".into(), top_k: 5, cc: None, root: Some(OTHER_ID.into()), ref_: None, to: None, tier: None, scope: None };
         let merged = core.cmd_search_merged(args).await.unwrap();
         assert_eq!(merged.matches.len(), 1, "root 필터를 어기는 로컬 결과는 섞지 않는다");
         assert_eq!(merged.matches[0].id.as_deref(), Some(OTHER_ID));
@@ -1321,7 +1374,7 @@ mod tests {
         let (core, server) = core().await;
         *server.remote_matches.lock().unwrap() = vec![remote(OTHER_ID, 0.8)];
         let res = core
-            .cmd_search_remote(SearchArgs { query: "아무거나".into(), top_k: 5, cc: None, root: None, ref_: None, to: None, tier: None })
+            .cmd_search_remote(SearchArgs { query: "아무거나".into(), top_k: 5, cc: None, root: None, ref_: None, to: None, tier: None, scope: None })
             .await
             .unwrap();
         assert_eq!(res.matches, vec![remote(OTHER_ID, 0.8)]);

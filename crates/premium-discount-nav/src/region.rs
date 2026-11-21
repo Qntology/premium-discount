@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 /// 겹친 후보를 하나로 보는 IoU (noto-sandbox 의 타일 스캔 NMS 와 같은 값)
 pub const MERGE_IOU: f32 = 0.4;
+/// 이벤트 후보의 넓이 중 이만큼 이상이 트리 · 비전 영역 안에 들었으면 따로 남기지 않고 그 영역이 바뀐 것으로 본다
+/// (큰 카드 안의 작은 숫자만 바뀐 경우, [`merge_absorbing`])
+pub const CONTAIN_ABSORB: f32 = 0.70;
 
 /// 영역의 종류
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -101,16 +104,36 @@ impl Rect {
         (self.x + self.w / 2.0, self.y + self.h / 2.0)
     }
 
-    pub fn iou(&self, other: &Rect) -> f32 {
+    fn overlap(&self, other: &Rect) -> f32 {
         let ix = ((self.x + self.w).min(other.x + other.w) - self.x.max(other.x)).max(0.0);
         let iy = ((self.y + self.h).min(other.y + other.h) - self.y.max(other.y)).max(0.0);
-        let inter = ix * iy;
+        ix * iy
+    }
+
+    pub fn iou(&self, other: &Rect) -> f32 {
+        let inter = self.overlap(other);
         let union = self.area() + other.area() - inter;
         if union <= 0.0 {
             0.0
         } else {
             inter / union
         }
+    }
+
+    /// 이 사각형의 넓이 중 `outer` 안에 든 몫 (0 ~ 1). IoU 와 달리 작은 사각형이 큰 사각형 안에 들면 1 이다
+    pub fn containment(&self, outer: &Rect) -> f32 {
+        let area = self.area();
+        if area <= 0.0 {
+            0.0
+        } else {
+            self.overlap(outer) / area
+        }
+    }
+
+    /// 두 중심 사이의 거리 (창 기준)
+    pub fn center_distance(&self, other: &Rect) -> f32 {
+        let ((ax, ay), (bx, by)) = (self.center(), other.center());
+        (ax - bx).hypot(ay - by)
     }
 }
 
@@ -173,6 +196,17 @@ fn position_words(rect: &Rect) -> &'static str {
 /// 이벤트 후보는 남은 영역과 겹치면 그 영역에 `changed` 만 표시하고, 겹치는 영역이 없을 때만 "바뀐 영역"으로 남는다.
 /// 개인정보 화면([`sensitive_screen`])이면 트리 후보만 남긴다. 결과는 입력 순서를 따른다.
 pub fn merge(candidates: Vec<Region>, iou: f32) -> Vec<Region> {
+    merge_with(candidates, iou, None)
+}
+
+/// [`merge`] 에 포함률 흡수를 더한 것: 어떤 영역과도 IoU 로 겹치지 않는 이벤트 후보라도 넓이의 `contain` 몫 이상이 남은 트리 · 비전
+/// 영역 안에 들었으면 "바뀐 영역"으로 따로 남기지 않고 그 영역(여럿이면 가장 작은 것)에 `changed` 만 표시한다. 큰 카드 안의 작은
+/// 숫자만 바뀌어도 카드가 바뀐 것으로 보이고, 번호가 조각나지 않는다. 무점멸 번호([`crate::StickyNumberer`])가 쓴다
+pub fn merge_absorbing(candidates: Vec<Region>, iou: f32, contain: f32) -> Vec<Region> {
+    merge_with(candidates, iou, Some(contain))
+}
+
+fn merge_with(candidates: Vec<Region>, iou: f32, contain: Option<f32>) -> Vec<Region> {
     let candidates = if sensitive_screen(&candidates) {
         candidates.into_iter().filter(|c| c.source == Source::Tree).collect()
     } else {
@@ -192,7 +226,16 @@ pub fn merge(candidates: Vec<Region>, iou: f32) -> Vec<Region> {
     for i in order {
         let c = &candidates[i];
         let overlap: Vec<usize> = kept.iter().copied().filter(|&k| candidates[k].rect.iou(&c.rect) >= iou).collect();
-        if overlap.is_empty() {
+        // 이벤트는 트리 · 비전 다음에 오므로 이때 남은 영역은 모두 정해져 있다
+        let parent = contain.filter(|_| overlap.is_empty() && c.source == Source::Event).and_then(|contain| {
+            kept.iter()
+                .copied()
+                .filter(|&k| candidates[k].source != Source::Event && c.rect.containment(&candidates[k].rect) >= contain)
+                .min_by(|&a, &b| candidates[a].rect.area().total_cmp(&candidates[b].rect.area()))
+        });
+        if let Some(k) = parent {
+            changed[k] = true;
+        } else if overlap.is_empty() {
             kept.push(i);
             changed[i] |= c.changed || c.source == Source::Event;
         } else if c.source == Source::Event || c.changed {
@@ -273,6 +316,36 @@ mod tests {
         let out = merge(vec![a, b], MERGE_IOU);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].role, Role::Link);
+    }
+
+    #[test]
+    fn containment_is_the_share_of_the_inner_rect() {
+        let card = Rect::new(0.1, 0.1, 0.4, 0.3).unwrap();
+        let digit = Rect::new(0.2, 0.2, 0.05, 0.03).unwrap();
+        assert!((digit.containment(&card) - 1.0).abs() < 1e-5);
+        assert!(digit.iou(&card) < MERGE_IOU, "IoU 로는 겹친 것으로 보지 않는다");
+        let edge = Rect::new(0.45, 0.2, 0.1, 0.05).unwrap();
+        assert!((edge.containment(&card) - 0.5).abs() < 1e-5);
+        assert_eq!(card.containment(&Rect::new(0.8, 0.8, 0.1, 0.1).unwrap()), 0.0);
+        assert!((digit.center_distance(&Rect::new(0.25, 0.2, 0.05, 0.03).unwrap()) - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn contained_events_mark_the_smallest_parent_changed() {
+        let card = region("main>section.card", Role::Text, "주문 요약", (0.1, 0.1, 0.5, 0.4), Source::Tree);
+        let button = region("main>section.card>button", Role::Button, "결제", (0.15, 0.35, 0.2, 0.1), Source::Tree);
+        let vision = region("cell:7,1", Role::Image, "", (0.7, 0.1, 0.2, 0.2), Source::Vision);
+        // 카드 안 버튼의 숫자만 바뀌었다 · 비전 그림 안에서 바뀌었다 · 빈 배경에서 바뀌었다
+        let in_button = region("roi:0", Role::Other, "", (0.16, 0.36, 0.05, 0.04), Source::Event);
+        let in_vision = region("roi:1", Role::Other, "", (0.75, 0.15, 0.05, 0.05), Source::Event);
+        let lone = region("roi:2", Role::Other, "", (0.1, 0.8, 0.05, 0.05), Source::Event);
+        let all = vec![card.clone(), button.clone(), vision.clone(), in_button.clone(), in_vision.clone(), lone.clone()];
+        let out = merge_absorbing(all.clone(), MERGE_IOU, CONTAIN_ABSORB);
+        let anchors: Vec<&str> = out.iter().map(|r| r.anchor.as_str()).collect();
+        assert_eq!(anchors, [card.anchor.as_str(), button.anchor.as_str(), vision.anchor.as_str(), "roi:2"]);
+        assert_eq!(out.iter().map(|r| r.changed).collect::<Vec<_>>(), [false, true, true, true], "가장 작은 부모(버튼)만 바뀜 표시");
+        // 포함률 흡수가 없는 merge 는 예전처럼 작은 이벤트를 따로 남긴다
+        assert_eq!(merge(all, MERGE_IOU).len(), 6);
     }
 
     #[test]

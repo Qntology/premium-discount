@@ -13,8 +13,18 @@
 | `gen_analytic_blob_v1.mjs` | 웹 분석 사건 BLOB 코덱의 사례를 pako 로 만듭니다(`analytic_blob_v1.json` 을 다시 씀) |
 | `analytic_blob_v1.json` | D1 `data` 칸의 여러 모양(바이트 배열 · Buffer · `{"0":…}` · base64 · JSON · 원시값) 19 사례. 서버 `workers/www/src/blob.ts` 와 `crates/premium-discount-analytic` 의 `blob` 이 같은 객체를 냅니다(logis-center BUG-RT-2/3/4 사례 포함) |
 | `analytic_pug_v1.json` | 요소 → 속성 없는 PUG 13 사례. 수집 스크립트(`web/www/static/js/tracker.js` 의 `toPug`, 브라우저 DOM)와 `premium-discount-analytic` 의 `html_to_pug` 가 같은 결과를 냅니다 |
+| `gen_scenario_contracts_v1.py` | 최종 개선안의 시나리오 1 ~ 6 계약 여섯 파일을 다시 씁니다 . 사례마다 입력(given) · 기대(expect) · 그것을 확인하는 시험(owners)을 적습니다 |
+| `check_scenario_contracts.py` | 여섯 파일이 생성기와 같은지, 사례마다 owners 의 파일에 `<사례 id 소문자>_` 로 시작하는 시험이 있는지 봅니다(raon-zena 는 옆 폴더에 있을 때) |
+| `course_nav_v1.json` | 시나리오 1 타임트라이얼 코스 내비게이션 & 고스트 코칭 CN-01 ~ 12: 서브루프 축약 · 기점 보존 압축, 무점멸 번호(StickyNumberer), 3트랙 고스트(LiveGuide), CourseBrief |
+| `proactive_friction_v1.json` | 시나리오 2 실시간 마찰 · 비간섭 선제 코칭 PF-01 ~ 12: peek_live, 5중 InterruptGate · 보류 훅, 비차단 예열(45초 임대) · 서킷 브레이커, 피로도 |
+| `contextual_rag_v1.json` | 시나리오 3 문맥 복원 투트랙 RAG CR-01 ~ 12: 지시어 복원, 스코프 부스트(L1 0.12 · L2 0.06), SyncLoop 양보, 교차 스코프 대체 · 격리, 무블로킹 역해석, 노출 장부 |
+| `feedback_credit_v1.json` | 시나리오 4 화용 피드백 · 크레딧 · 무손실 동기화 FC-01 ~ 12: 피드백 추출, N×4 크레딧, Stance 4분화, 5초 멱등 키, 401/429 보류(E-11), 거부 알림(E-16), 큐 상한(E-17) |
+| `web_analytic_v1.json` | 시나리오 5 웹 퍼널 분석 WA-01 ~ 12: PUG 정규화, DebiasedChoiceBook × FrictionTrap, CommitGuard, pd_analytic(11번째 도구), +37h 대칭 비교, 통합 묘비 |
+| `privacy_shield_v1.json` | 시나리오 6 민감 화면 방어 PS-01 ~ 12: 4계층 감지, 5초 소급 제로화, 복귀 상태 기계 · ReceiptGuard · 동결 차감, 입력 PII 차단 · 종료 캡처 절단 |
 
 ```bash
+python contracts/gen_scenario_contracts_v1.py   # 여섯 파일을 다시 쓴다
+python contracts/check_scenario_contracts.py    # 사례마다 시험이 있는지 (없으면 종료 코드 1)
 python contracts/gen_verdict_v1.py   # premium-discount 폴더에서
 python contracts/gen_verdict_v2.py
 node contracts/gen_wallet_v1.mjs     # workers/www/node_modules 의 ethers 를 씁니다

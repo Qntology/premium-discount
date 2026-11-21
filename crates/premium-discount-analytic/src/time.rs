@@ -11,6 +11,9 @@
 //! - `this_week` · `last_week` 를 더했다(ISO 주, 월요일 시작). logis-center 에는 없었다.
 //! - 커머스 쿠폰 전용 조건(`started_at` · `expired_at`, 벽시계를 UTC 로 저장한 값)은 옮기지 않았다. 웹 분석 사건의 시각은
 //!   진짜 epoch ms 라서 [`period_ms`] 가 사용자 시간대의 하루 경계로 바로 자른다.
+//! - 기간 비교([`resolve_comparison_window`], 시나리오 5): [`resolve`] 는 `this_*` 를 그 기간 전체로 두지만(예전과 같다), 비교할
+//!   때 진행 중인 기간은 지금까지 지난 시간만큼만 보고 앞 기간도 같은 길이로 자른다. 화요일 13시의 "이번 주 vs 지난주" 는
+//!   월요일 0시부터 +37시간끼리 견준다.
 
 use chrono::{Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -291,6 +294,102 @@ pub fn resolve(time_key: &str, season_key: &str, lang_code: &str, anchor: Season
     Some(TimeRange { start, end, start_ms, end_ms, offset_minutes: offset.local_minus_utc() / 60, label })
 }
 
+/// 기간 비교 창 (epoch ms, 양 끝 포함)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonWindow {
+    pub current_start_ms: i64,
+    /// 진행 중인 기간이면 그 기간의 끝이 아니라 지금(`now_ms`)
+    pub current_end_ms: i64,
+    pub previous_start_ms: i64,
+    /// 진행 중인 기간이면 `previous_start_ms + (current_end_ms − current_start_ms)` (앞 기간이 더 짧으면 그 끝 23:59:59.999 에서 자른다)
+    pub previous_end_ms: i64,
+    /// 진행 중인 기간이라 같은 경과 시간으로 잘랐는가
+    pub pace_matched: bool,
+    /// `this_week (+37.0h) vs last_week (+37.0h)` · `yesterday vs day_before`
+    pub label: String,
+    /// 견주는 두 기간의 이름 (기간 키, 키가 없는 앞 기간은 `day_before` · `week_before` · `month_before` · `year_before` ·
+    /// `previous_period`)
+    pub current_key: String,
+    pub previous_key: String,
+}
+
+impl ComparisonWindow {
+    /// 현재 창 (시작, 끝)
+    pub fn current_range(&self) -> (i64, i64) {
+        (self.current_start_ms, self.current_end_ms)
+    }
+
+    /// 비교 창 (시작, 끝)
+    pub fn previous_range(&self) -> (i64, i64) {
+        (self.previous_start_ms, self.previous_end_ms)
+    }
+}
+
+/// 기간 키 바로 앞의 같은 단위 기간과 그 이름 (오늘의 앞은 어제, 이번 주의 앞은 지난주, 지난달의 앞은 그 전달 …)
+fn preceding(key: &str, start: NaiveDate, end: NaiveDate) -> Option<((NaiveDate, NaiveDate), &'static str)> {
+    let day = |d: NaiveDate| (d, d);
+    let week = || (start - Duration::days(7), end - Duration::days(7));
+    Some(match key {
+        "today" => (day(start.pred_opt()?), "yesterday"),
+        "yesterday" => (day(start.pred_opt()?), "day_before"),
+        "this_week" => (week(), "last_week"),
+        "last_week" => (week(), "week_before"),
+        "this_month" | "last_month" => {
+            let p = start.pred_opt()?;
+            (month_period(p.year(), p.month())?, if key == "this_month" { "last_month" } else { "month_before" })
+        }
+        "this_year" => (year_period(start.year() - 1)?, "last_year"),
+        "last_year" => (year_period(start.year() - 1)?, "year_before"),
+        "recently" => {
+            let len = (end - start).num_days() + 1;
+            ((start - Duration::days(len), start.pred_opt()?), "previous_period")
+        }
+        _ => return None,
+    })
+}
+
+/// 기간 비교 창. `primary_time_key` 가 없으면 `today` 다. `explicit_compare_key` 가 있으면 그 기간과, 없으면 바로 앞의 같은 단위
+/// 기간과 견준다(둘 중 더 늦은 기간이 현재 창이 된다: "지난주 대비 이번 주" 도 이번 주가 현재다). 현재 창이 지금을 품은 진행 중인
+/// 기간(오늘 · 이번 주 · 이번 달 · 올해 · 최근)이면 지금까지 지난 시간만 보고 비교 창도 같은 경과 시간으로 자른다(`pace_matched`).
+/// 끝난 기간(어제 · 지난주 …)은 두 기간 전체를 견준다. 기간 키가 아니면(계절 · 모르는 키) None
+pub fn resolve_comparison_window(primary_time_key: Option<&str>, explicit_compare_key: Option<&str>, lang: &str, now_ms: i64) -> Option<ComparisonWindow> {
+    let norm = |k: Option<&str>| k.map(|k| k.trim().to_ascii_lowercase()).filter(|k| !k.is_empty());
+    let primary = norm(primary_time_key).unwrap_or_else(|| "today".to_string());
+    let compare = norm(explicit_compare_key).filter(|k| *k != primary);
+    let (offset, _) = lang_clock(lang);
+    let today = today_in(&offset, now_ms);
+    let cur = relative_period(&primary, today)?;
+    let (prev, prev_key) = match compare {
+        Some(k) => (relative_period(&k, today)?, k),
+        None => {
+            let (p, name) = preceding(&primary, cur.0, cur.1)?;
+            (p, name.to_string())
+        }
+    };
+    let ((cur_key, cur), (prev_key, prev)) = if prev.0 > cur.0 { ((prev_key, prev), (primary, cur)) } else { ((primary, cur), (prev_key, prev)) };
+    let (cur_start, cur_end) = period_ms(&offset, cur.0, cur.1);
+    let (prev_start, prev_end) = period_ms(&offset, prev.0, prev.1);
+    let in_progress = cur_start <= now_ms && now_ms < cur_end;
+    let (current_end_ms, previous_end_ms, label) = if in_progress {
+        let elapsed = now_ms - cur_start;
+        let cut = (prev_start + elapsed).min(prev_end);
+        let hours = |ms: i64| ms as f64 / 3_600_000.0;
+        (now_ms, cut, format!("{cur_key} (+{:.1}h) vs {prev_key} (+{:.1}h)", hours(elapsed), hours(cut - prev_start)))
+    } else {
+        (cur_end, prev_end, format!("{cur_key} vs {prev_key}"))
+    };
+    Some(ComparisonWindow {
+        current_start_ms: cur_start,
+        current_end_ms,
+        previous_start_ms: prev_start,
+        previous_end_ms,
+        pace_matched: in_progress,
+        label,
+        current_key: cur_key,
+        previous_key: prev_key,
+    })
+}
+
 /// 질의에 들어갈 기준표: 오늘 · 어제 · 이번 주 · 지난주 · 이번 달 · 지난달 · 올해 · 작년의 날짜 (모델에게 보여 주는 참고. 모델은 키만 고른다)
 pub fn guide_table(lang_code: &str, now_ms: i64) -> Vec<(String, NaiveDate, NaiveDate)> {
     let (offset, _) = lang_clock(lang_code);
@@ -381,5 +480,44 @@ mod tests {
         let t = guide_table("ko", NOW);
         assert_eq!(t.len(), TIME_KEYS.len());
         assert_eq!(t[0], ("today".to_string(), d(2026, 11, 18), d(2026, 11, 18)));
+    }
+
+    // 2026-11-17 (화) 13:00 KST
+    const TUESDAY_13: i64 = 1_794_841_200_000 + 13 * 3_600_000;
+    const HOUR: i64 = 3_600_000;
+
+    #[test]
+    fn an_unfinished_week_is_compared_at_the_same_elapsed_time() {
+        let w = resolve_comparison_window(Some("this_week"), Some("last_week"), "ko", TUESDAY_13).unwrap();
+        let monday = 1_794_841_200_000 - DAY_MS;
+        assert_eq!(w.current_range(), (monday, TUESDAY_13));
+        assert_eq!(w.previous_range(), (monday - 7 * DAY_MS, monday - 7 * DAY_MS + 37 * HOUR));
+        assert!(w.pace_matched);
+        assert_eq!(w.label, "this_week (+37.0h) vs last_week (+37.0h)");
+        // 비교 키를 생략해도, 순서를 바꿔 물어도 같은 창이다
+        assert_eq!(resolve_comparison_window(Some("this_week"), None, "ko", TUESDAY_13).unwrap(), w);
+        assert_eq!(resolve_comparison_window(Some("last_week"), Some("this_week"), "ko", TUESDAY_13).unwrap(), w);
+        // 오늘 vs 어제 (기간 말이 없으면 오늘): 13시간끼리
+        let t = resolve_comparison_window(None, None, "ko", TUESDAY_13).unwrap();
+        assert_eq!((t.current_end_ms - t.current_start_ms, t.previous_end_ms - t.previous_start_ms), (13 * HOUR, 13 * HOUR));
+        assert_eq!((t.current_key.as_str(), t.previous_key.as_str()), ("today", "yesterday"));
+    }
+
+    #[test]
+    fn finished_periods_are_compared_whole_and_short_months_clamp() {
+        let y = resolve_comparison_window(Some("yesterday"), None, "ko", TUESDAY_13).unwrap();
+        assert!(!y.pace_matched);
+        assert_eq!(y.current_range(), (1_794_841_200_000 - DAY_MS, 1_794_841_200_000 - 1));
+        assert_eq!(y.previous_range(), (1_794_841_200_000 - 2 * DAY_MS, 1_794_841_200_000 - DAY_MS - 1));
+        assert_eq!(y.label, "yesterday vs day_before");
+        // 3월 31일 13시의 이번 달: 2월(28일)은 끝에서 자른다
+        let (kst, _) = lang_clock("ko");
+        let march_31 = day_start_ms(&kst, d(2026, 3, 31)) + 13 * HOUR;
+        let m = resolve_comparison_window(Some("this_month"), None, "ko", march_31).unwrap();
+        assert_eq!(m.previous_start_ms, day_start_ms(&kst, d(2026, 2, 1)));
+        assert_eq!(m.previous_end_ms, day_start_ms(&kst, d(2026, 3, 1)) - 1);
+        assert_eq!(m.current_range(), (day_start_ms(&kst, d(2026, 3, 1)), march_31));
+        // 기간 키가 아니면 비교하지 않는다
+        assert!(resolve_comparison_window(Some("summer"), None, "ko", TUESDAY_13).is_none());
     }
 }

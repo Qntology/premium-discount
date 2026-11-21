@@ -1,10 +1,14 @@
 //! BIP-39 시드 구문 (영어 단어표)
+//!
+//! 지갑을 만들고 되살리는 데 더해, 글 속에 시드 구문이 보이는지 알아보는 데도 쓴다 ([`detect_seed_phrase_span`]).
+//! 화면 라벨 · 창 제목 · 채팅 입력에서 시드 구문을 찾아 지우는 쪽(내비게이션의 개인 화면 판정, raon-zena 의 채팅
+//! 세탁기)이 "영단어 12개가 이어지면 시드" 같은 거친 규칙 대신 공식 2048단어표를 그대로 쓰게 하려는 것이다.
 
 use std::fmt;
 use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256, Sha512};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// BIP-39 영어 단어표 2048단어 (공식 english.txt 와 같은 파일. 시험이 SHA-256 을 확인한다)
 const WORDLIST: &str = include_str!("english.txt");
@@ -12,9 +16,40 @@ const WORDLIST: &str = include_str!("english.txt");
 /// 새로 만드는 시드 구문의 단어 수 (엔트로피 128비트, ethers 기본값)
 pub const PHRASE_WORDS: usize = 12;
 
+/// BIP-39 시드 구문이 가질 수 있는 단어 수
+pub const PHRASE_LENGTHS: [usize; 5] = [12, 15, 18, 21, 24];
+
+/// [`detect_seed_phrase_span`] 이 시드 구문으로 보는 가장 짧은 낱말 열 (가장 짧은 시드 구문)
+pub const SEED_PHRASE_MIN_WORDS: usize = 12;
+
+/// 영어 단어표 낱말의 가장 긴 길이 (3 ~ 8글자, 모두 ASCII 소문자)
+const WORD_MAX: usize = 8;
+
 fn words() -> &'static [&'static str] {
     static WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
     WORDS.get_or_init(|| WORDLIST.lines().collect())
+}
+
+/// 낱말 하나의 단어표 번호. ASCII 대소문자는 가리지 않는다. 소문자 사본은 스택에 두고 다 쓰면 0 으로 덮는다
+/// (시드 낱말이 힙에 남지 않게)
+fn word_index(word: &str) -> Option<u16> {
+    let bytes = word.as_bytes();
+    if !(3..=WORD_MAX).contains(&bytes.len()) || !bytes.iter().all(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    let mut lower = [0u8; WORD_MAX];
+    for (d, s) in lower.iter_mut().zip(bytes) {
+        *d = s.to_ascii_lowercase();
+    }
+    let found = std::str::from_utf8(&lower[..bytes.len()]).ok().and_then(|w| words().binary_search(&w).ok());
+    lower.zeroize();
+    found.map(|i| i as u16)
+}
+
+/// `word` 가 BIP-39 영어 단어표의 낱말인가. ASCII 대소문자는 가리지 않는다 (`Abandon` · `ZOO` 도 맞다).
+/// 공백 · 문장 부호가 붙어 있거나 한글이 섞이면 아니다
+pub fn is_bip39_word(word: &str) -> bool {
+    word_index(word).is_some()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,12 +84,27 @@ pub fn normalize_phrase(phrase: &str) -> String {
 
 /// 정규화한 시드 구문이 단어표 · 단어 수 · 체크섬에 맞는지 본다
 pub(crate) fn validate(phrase: &str) -> Result<(), PhraseError> {
-    let list = words();
-    let indexes = phrase
-        .split(' ')
-        .map(|w| list.binary_search(&w).map(|i| i as u16).map_err(|_| PhraseError::UnknownWord))
-        .collect::<Result<Vec<u16>, _>>()?;
-    if ![12, 15, 18, 21, 24].contains(&indexes.len()) {
+    check_indexes(phrase.split(' '))
+}
+
+/// 시드 구문을 BIP-39 로 검사한다: 단어 수(12 · 15 · 18 · 21 · 24), 단어표, 체크섬. 대소문자 · 공백은 너그럽게 받는다.
+/// 지갑을 만들지 않고 맞는지만 볼 때 쓴다 (채팅 입력의 시드 구문 차단 등). 정규화한 사본을 만들지 않는다
+pub fn validate_phrase(phrase: &str) -> Result<(), PhraseError> {
+    check_indexes(phrase.split_whitespace())
+}
+
+/// [`validate_phrase`] 가 통과하는가
+pub fn is_valid_phrase(phrase: &str) -> bool {
+    validate_phrase(phrase).is_ok()
+}
+
+/// 낱말들을 단어표 번호로 바꿔 단어 수 · 체크섬을 본다. 번호 목록도 시드와 같으므로 다 쓰면 0 으로 덮는다
+fn check_indexes<'a>(phrase_words: impl Iterator<Item = &'a str>) -> Result<(), PhraseError> {
+    let mut indexes = Zeroizing::new(Vec::with_capacity(24));
+    for w in phrase_words {
+        indexes.push(word_index(w).ok_or(PhraseError::UnknownWord)?);
+    }
+    if !PHRASE_LENGTHS.contains(&indexes.len()) {
         return Err(PhraseError::WordCount);
     }
     let total = indexes.len() * 11;
@@ -74,6 +124,66 @@ pub(crate) fn validate(phrase: &str) -> Result<(), PhraseError> {
         }
     }
     Ok(())
+}
+
+/// 글 속 시드 구문의 바이트 범위 `(시작, 끝)`: BIP-39 단어표 낱말이 12개([`SEED_PHRASE_MIN_WORDS`]) 이상 이어진 첫 구간.
+///
+/// 낱말 사이에는 공백 · 줄바꿈 · 숫자 · 문장 부호가 끼어도 된다 (지갑 앱이 보여 주는 `1. abandon 2. ability …` 꼴).
+/// 단어표에 없는 낱말(한글 낱말 포함)이 하나라도 끼면 거기서 끊긴다. 보통 영어 문장에는 단어표에 없는 `the` · `and` ·
+/// `is` · `to` · `of` · `in` 이 거의 늘 끼므로 영어 게임 대사 · 쇼핑몰 설명은 걸리지 않는다.
+///
+/// 체크섬은 보지 않는다: 한두 낱말을 잘못 옮겨 적은 시드 구문도, 앞뒤에 단어표 낱말이 더 붙은 구문도 비밀이다
+/// (체크섬까지 맞는 구문인지는 [`is_valid_phrase`]). 낱말 12개가 모두 단어표에 있는 글만 걸리므로, 체크섬이 맞는
+/// 구문은 늘 걸린다.
+pub fn detect_seed_phrase_span(text: &str) -> Option<(usize, usize)> {
+    phrase_runs(text, true).into_iter().next()
+}
+
+/// [`detect_seed_phrase_span`] 의 구간을 모두, 앞에서부터. 겹치지 않는다
+pub fn seed_phrase_spans(text: &str) -> Vec<(usize, usize)> {
+    phrase_runs(text, false)
+}
+
+/// 단어표 낱말이 [`SEED_PHRASE_MIN_WORDS`] 개 이상 이어진 구간들 (`first_only` 면 첫 구간에서 멈춘다)
+fn phrase_runs(text: &str, first_only: bool) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let (mut count, mut start, mut end) = (0usize, 0usize, 0usize);
+    for (s, e) in word_spans(text) {
+        if word_index(&text[s..e]).is_some() {
+            if count == 0 {
+                start = s;
+            }
+            count += 1;
+            end = e;
+            continue;
+        }
+        if count >= SEED_PHRASE_MIN_WORDS {
+            out.push((start, end));
+            if first_only {
+                return out;
+            }
+        }
+        count = 0;
+    }
+    if count >= SEED_PHRASE_MIN_WORDS {
+        out.push((start, end));
+    }
+    out
+}
+
+/// 낱말의 바이트 범위들: 공백 · ASCII 숫자 · ASCII 문장 부호가 낱말을 가른다 (그 밖의 글자는 낱말에 붙는다)
+fn word_spans(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let gap = |c: char| c.is_whitespace() || c.is_ascii_digit() || c.is_ascii_punctuation();
+    let mut chars = text.char_indices().peekable();
+    std::iter::from_fn(move || {
+        while chars.next_if(|&(_, c)| gap(c)).is_some() {}
+        let &(start, _) = chars.peek()?;
+        let mut end = start;
+        while let Some((i, c)) = chars.next_if(|&(_, c)| !gap(c)) {
+            end = i + c.len_utf8();
+        }
+        Some((start, end))
+    })
 }
 
 /// 엔트로피(16 · 20 · 24 · 28 · 32바이트)에서 시드 구문을 만든다
@@ -127,6 +237,67 @@ mod tests {
         let list = words();
         assert_eq!(list.len(), 2048);
         assert!(list.windows(2).all(|w| w[0] < w[1]), "이진 탐색을 위해 정렬되어 있어야 한다");
+    }
+
+    const VECTOR: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    #[test]
+    fn words_are_looked_up_in_the_official_list_ignoring_ascii_case() {
+        assert!(is_bip39_word("abandon"));
+        assert!(is_bip39_word("Abandon"));
+        assert!(is_bip39_word("ZOO"));
+        for w in ["the", "and", "is", "to", "of", "in", "abandons", "", "ab", "abandon.", " abandon", "장바구니", "zoo1", "ａｂａｎｄｏｎ"] {
+            assert!(!is_bip39_word(w), "{w:?}");
+        }
+    }
+
+    #[test]
+    fn phrases_are_validated_with_their_checksum() {
+        let twelve = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        assert_eq!(validate_phrase(twelve), Ok(()));
+        assert!(is_valid_phrase(&twelve.to_uppercase().replace(' ', "  \n ")), "대소문자 · 공백은 너그럽게");
+        // BIP-39 공식 시험 벡터: 엔트로피 0x00 × 32 → "abandon × 23 art", 0x7f × 16 → VECTOR
+        let twenty_four = phrase_from_entropy(&[0u8; 32]);
+        assert_eq!(twenty_four.split(' ').count(), 24);
+        assert!(twenty_four.ends_with(" art"));
+        assert!(is_valid_phrase(&twenty_four));
+        assert!(is_valid_phrase(VECTOR));
+        assert_eq!(validate_phrase("test test test test test test test test test test test test"), Err(PhraseError::Checksum));
+        assert_eq!(validate_phrase("abandon abandon abandon"), Err(PhraseError::WordCount));
+        assert_eq!(validate_phrase(""), Err(PhraseError::WordCount));
+        assert_eq!(
+            validate_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon 장바구니"),
+            Err(PhraseError::UnknownWord)
+        );
+    }
+
+    #[test]
+    fn seed_phrase_span_catches_bip39_runs_but_not_plain_english() {
+        let text = format!("내 시드: {VECTOR} 꼭 보관");
+        let (s, e) = detect_seed_phrase_span(&text).unwrap();
+        assert_eq!(&text[s..e], VECTOR);
+        // 지갑 앱이 보여 주는 번호 붙은 칸
+        let grid = "1. abandon 2. abandon 3. abandon 4. abandon\n5. abandon 6. abandon 7. abandon 8. abandon\n9. abandon 10. abandon 11. abandon 12. about";
+        let (s, e) = detect_seed_phrase_span(grid).unwrap();
+        assert_eq!((&grid[s..s + 7], &grid[e - 5..e]), ("abandon", "about"));
+        // 체크섬이 틀려도(옮겨 적다 틀림), 대문자로 시작해도 비밀이다
+        assert!(detect_seed_phrase_span("Test test test test test test test test test test test test").is_some());
+        // 보통 영어 문장은 단어표에 없는 낱말(the · and · your · defeat …)이 끼어 끊긴다
+        for plain in [
+            "The quick brown fox jumps over the lazy dog and then runs into the forest to hide",
+            "Please enter your password to continue and click the button below to sign in now",
+            "Defeat the boss to unlock the next level and earn a legendary sword for your hero",
+        ] {
+            assert_eq!(detect_seed_phrase_span(plain), None, "{plain}");
+        }
+        // 11낱말은 시드 구문이 아니다
+        assert_eq!(detect_seed_phrase_span("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), None);
+        // 단어표에 없는 낱말이 끼면 두 구간이다
+        let two = format!("{VECTOR} 그리고 {VECTOR}");
+        let spans = seed_phrase_spans(&two);
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|&(s, e)| &two[s..e] == VECTOR));
+        assert_eq!(seed_phrase_spans("no seed here"), vec![]);
     }
 
     #[test]

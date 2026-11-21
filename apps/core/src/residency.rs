@@ -116,11 +116,88 @@ pub trait MemoryProbe: Send + Sync {
     fn available_bytes(&self) -> Option<u64>;
 }
 
-/// Linux·Android의 /proc를 읽는다. 그 밖의 운영체제에서는 모르므로(None) 예산 판정을 건너뛰고 실측도 하지 않는다.
+/// Linux·Android의 /proc를 읽는다. Windows 에서는 Win32 `GlobalMemoryStatusEx`(가용 물리 메모리)와
+/// `K32GetProcessMemoryInfo`(작업 집합)를 부른다: 자식 프로세스(PowerShell) 없이 수 마이크로초에 끝나 주기적으로 불러도 된다.
+/// 그 밖의 운영체제에서는 모르므로(None) 예산 판정을 건너뛰고 실측도 하지 않는다.
 /// 페이지 크기(Android는 16KB 기기도 있다)에 기대지 않도록 kB 단위 항목을 읽는다.
 pub struct SystemMemory;
 
+#[cfg(windows)]
+#[allow(non_snake_case, clippy::upper_case_acronyms)]
+mod win32_memory {
+    #[repr(C)]
+    pub struct MEMORYSTATUSEX {
+        pub dwLength: u32,
+        pub dwMemoryLoad: u32,
+        pub ullTotalPhys: u64,
+        pub ullAvailPhys: u64,
+        pub ullTotalPageFile: u64,
+        pub ullAvailPageFile: u64,
+        pub ullTotalVirtual: u64,
+        pub ullAvailVirtual: u64,
+        pub ullAvailExtendedVirtual: u64,
+    }
+
+    #[repr(C)]
+    pub struct PROCESS_MEMORY_COUNTERS {
+        pub cb: u32,
+        pub PageFaultCount: u32,
+        pub PeakWorkingSetSize: usize,
+        pub WorkingSetSize: usize,
+        pub QuotaPeakPagedPoolUsage: usize,
+        pub QuotaPagedPoolUsage: usize,
+        pub QuotaPeakNonPagedPoolUsage: usize,
+        pub QuotaNonPagedPoolUsage: usize,
+        pub PagefileUsage: usize,
+        pub PeakPagefileUsage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MEMORYSTATUSEX) -> i32;
+        fn GetCurrentProcess() -> isize;
+        // Windows 7 부터 kernel32 가 내보낸다 (psapi 를 링크하지 않아도 된다)
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut PROCESS_MEMORY_COUNTERS, cb: u32) -> i32;
+    }
+
+    pub fn available_phys() -> Option<u64> {
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            dwMemoryLoad: 0,
+            ullTotalPhys: 0,
+            ullAvailPhys: 0,
+            ullTotalPageFile: 0,
+            ullAvailPageFile: 0,
+            ullTotalVirtual: 0,
+            ullAvailVirtual: 0,
+            ullAvailExtendedVirtual: 0,
+        };
+        // SAFETY: dwLength 를 채운 MEMORYSTATUSEX 를 넘긴다. 함수는 이 구조체에만 쓴다
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0).then_some(status.ullAvailPhys)
+    }
+
+    pub fn working_set() -> Option<u64> {
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            PageFaultCount: 0,
+            PeakWorkingSetSize: 0,
+            WorkingSetSize: 0,
+            QuotaPeakPagedPoolUsage: 0,
+            QuotaPagedPoolUsage: 0,
+            QuotaPeakNonPagedPoolUsage: 0,
+            QuotaNonPagedPoolUsage: 0,
+            PagefileUsage: 0,
+            PeakPagefileUsage: 0,
+        };
+        // SAFETY: GetCurrentProcess 는 닫지 않아도 되는 가짜 핸들이다. cb 를 채운 구조체에만 쓴다
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        (ok != 0).then_some(counters.WorkingSetSize as u64)
+    }
+}
+
 impl SystemMemory {
+    #[cfg_attr(windows, allow(dead_code))]
     fn kb_field(path: &str, key: &str) -> Option<u64> {
         let text = std::fs::read_to_string(path).ok()?;
         text.lines()
@@ -132,11 +209,25 @@ impl SystemMemory {
 
 impl MemoryProbe for SystemMemory {
     fn resident_bytes(&self) -> Option<u64> {
-        Self::kb_field("/proc/self/status", "VmRSS:")
+        #[cfg(windows)]
+        {
+            win32_memory::working_set()
+        }
+        #[cfg(not(windows))]
+        {
+            Self::kb_field("/proc/self/status", "VmRSS:")
+        }
     }
 
     fn available_bytes(&self) -> Option<u64> {
-        Self::kb_field("/proc/meminfo", "MemAvailable:")
+        #[cfg(windows)]
+        {
+            win32_memory::available_phys()
+        }
+        #[cfg(not(windows))]
+        {
+            Self::kb_field("/proc/meminfo", "MemAvailable:")
+        }
     }
 }
 
@@ -349,6 +440,17 @@ impl<V, A> Towers<V, A> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicI64;
+
+    // Windows 에서도 가용 메모리를 안다 (예전에는 /proc 만 읽어 None 이었다: 예산 판정과 예열 승인이 건너뛰어졌다)
+    #[cfg(windows)]
+    #[test]
+    fn windows_reports_available_and_resident_memory_without_a_child_process() {
+        let started = std::time::Instant::now();
+        let available = SystemMemory.available_bytes().expect("GlobalMemoryStatusEx");
+        let resident = SystemMemory.resident_bytes().expect("K32GetProcessMemoryInfo");
+        assert!(available > 0 && resident > 0);
+        assert!(started.elapsed() < std::time::Duration::from_millis(50), "시스템 콜 두 번이면 된다");
+    }
 
     /// 가짜 메모리: 타워를 올리면 그만큼 상주가 늘고 가용이 준다. 타워(가짜)가 버려지면 되돌린다.
     struct FakeMemory {

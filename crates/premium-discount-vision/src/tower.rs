@@ -9,6 +9,10 @@
 //! extend_sparse / merge_sparse`): only some cells of the grid go through the encoder, each with its own cell's position
 //! embedding (the holes are absent, not blacked out); cells opened later attend to every token computed so far through
 //! the keys and values the earlier pass kept. With every cell in grid order the sparse pass *is* the dense pass.
+//!
+//! 개인 화면: 인코딩 한 번은 CPU 에서 수 초 걸린다. 그사이 화면이 민감해지면(개인 화면 잠금이 세대 `privacy_epoch` 를
+//! 올리면) `*_cancellable` 패스는 다음 블록 경계에서 [`VisionAbort::PrivacyLocked`] 로 멈춰, 쌓던 토큰 · 층별 키 · 값을
+//! 바로 놓는다 ([`EpochWatch`]).
 
 use anyhow::{bail, Context, Result};
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul};
@@ -19,8 +23,65 @@ use premium_discount_quant::safetensors::SafeTensors;
 use std::collections::HashMap;
 
 use crate::layout::{Layout, Weights};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use premium_discount_sensor::naflex::PatchGrid;
+
+/// 판독을 그만둔 까닭. `anyhow::Error` 로 감싸 올라오므로 [`VisionAbort::of`] 로 알아본다
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionAbort {
+    /// 인코딩 도중 개인 화면 세대가 바뀌었다: 이 프레임은 민감한 화면일 수 있으니 결과를 내지 않는다
+    PrivacyLocked,
+}
+
+impl std::fmt::Display for VisionAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the privacy epoch changed during the vision pass")
+    }
+}
+
+impl std::error::Error for VisionAbort {}
+
+impl VisionAbort {
+    /// `err` 가 이 중단인가
+    pub fn of(err: &anyhow::Error) -> Option<VisionAbort> {
+        err.downcast_ref::<VisionAbort>().copied()
+    }
+}
+
+/// 개인 화면 세대 감시: 프레임을 받을 때 읽은 세대(`captured`)가 지금도 같은지 본다. 개인 화면 잠금이 `epoch` 를 올리면
+/// 그 전에 받은 프레임의 인코딩은 다음 경계에서 멈춘다
+#[derive(Clone, Copy, Debug)]
+pub struct EpochWatch<'a> {
+    pub epoch: &'a AtomicU64,
+    pub captured: u64,
+}
+
+impl<'a> EpochWatch<'a> {
+    pub fn new(epoch: &'a AtomicU64, captured: u64) -> EpochWatch<'a> {
+        EpochWatch { epoch, captured }
+    }
+
+    /// 지금 세대를 읽어 둔다 (프레임을 받을 때 부른다)
+    pub fn capture(epoch: &'a AtomicU64) -> EpochWatch<'a> {
+        EpochWatch {
+            epoch,
+            captured: epoch.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.epoch.load(Ordering::Acquire) == self.captured
+    }
+
+    pub fn check(&self) -> std::result::Result<(), VisionAbort> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            Err(VisionAbort::PrivacyLocked)
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisionConfig {
@@ -444,9 +505,21 @@ impl VisionTower {
 
     /// The encoder over `cells` only: they attend to each other and nothing else.
     pub fn forward_sparse(&self, grid: &PatchGrid, cells: &[u32]) -> Result<SparsePass> {
+        self.forward_sparse_gated(grid, cells, &mut || Ok(()))
+    }
+
+    /// [`VisionTower::forward_sparse`], 블록마다 `watch` 를 보며: 개인 화면 세대가 바뀌면 다음 블록에 들어가기 전에
+    /// [`VisionAbort::PrivacyLocked`] 로 멈춘다 (그때까지의 토큰 · 키 · 값은 바로 놓는다)
+    pub fn forward_sparse_cancellable(&self, grid: &PatchGrid, cells: &[u32], watch: &EpochWatch<'_>) -> Result<SparsePass> {
+        self.forward_sparse_gated(grid, cells, &mut || Ok(watch.check()?))
+    }
+
+    /// 블록에 들어가기 전마다 `gate` 를 부르는 [`VisionTower::forward_sparse`]. `gate` 가 `Err` 면 그대로 멈춘다
+    pub(crate) fn forward_sparse_gated(&self, grid: &PatchGrid, cells: &[u32], gate: &mut dyn FnMut() -> Result<()>) -> Result<SparsePass> {
         let mut x = self.cell_tokens(grid, cells)?;
         let mut kv = Vec::with_capacity(self.blocks.len());
         for b in &self.blocks {
+            gate()?;
             let (y, layer_kv) = b.forward_kv(&x, None)?;
             x = y;
             kv.push(layer_kv);
@@ -468,6 +541,28 @@ impl VisionTower {
     /// values as `first` computed them). A cell of `first` listed again is computed anew and leaves the context;
     /// `first`'s other tokens keep their features (the attention only runs one way).
     pub fn extend_sparse(&self, grid: &PatchGrid, first: &SparsePass, cells: &[u32]) -> Result<SparsePass> {
+        self.extend_sparse_gated(grid, first, cells, &mut || Ok(()))
+    }
+
+    /// [`VisionTower::extend_sparse`], 블록마다 `watch` 를 보며 ([`VisionTower::forward_sparse_cancellable`] 처럼)
+    pub fn extend_sparse_cancellable(
+        &self,
+        grid: &PatchGrid,
+        first: &SparsePass,
+        cells: &[u32],
+        watch: &EpochWatch<'_>,
+    ) -> Result<SparsePass> {
+        self.extend_sparse_gated(grid, first, cells, &mut || Ok(watch.check()?))
+    }
+
+    /// 블록에 들어가기 전마다 `gate` 를 부르는 [`VisionTower::extend_sparse`]
+    pub(crate) fn extend_sparse_gated(
+        &self,
+        grid: &PatchGrid,
+        first: &SparsePass,
+        cells: &[u32],
+        gate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<SparsePass> {
         let again: std::collections::HashSet<u32> = cells.iter().copied().collect();
         let keep: Vec<u32> = first
             .cells
@@ -487,6 +582,7 @@ impl VisionTower {
         let mut x = self.cell_tokens(grid, cells)?;
         let mut kv = Vec::with_capacity(self.blocks.len());
         for (i, b) in self.blocks.iter().enumerate() {
+            gate()?;
             let ctx = match &context {
                 None => Some(&first.kv[i]),
                 Some(v) => v.get(i),
@@ -561,6 +657,98 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
+/// 시험용 작은 탑 (체크포인트 없이, CPU).
+#[cfg(test)]
+pub(crate) mod toy {
+    use super::*;
+
+    /// 숨은 차원 `hidden`(짝수), 블록 `layers` 개. 블록 · MAP 헤드의 가중치는 0 이고 값 경로만 항등이라 아무것도 섞지
+    /// 않는다: 칸 하나의 토큰 = LayerNorm(패치의 앞 `hidden` 값), 풀링 = 토큰 평균, 칸 특징 = 그 칸의 토큰.
+    /// 그래서 시험이 패치 값으로 칸 특징을 정할 수 있다.
+    pub(crate) fn tower(hidden: usize, layers: usize) -> VisionTower {
+        let dev = Device::Cpu;
+        let (d, m, heads) = (hidden, hidden, 2);
+        let zeros = |r: usize, c: usize| Tensor::zeros((r, c), DType::F32, &dev).unwrap();
+        // `rows × cols` 에서 (offset + k, k) 칸만 1
+        let eye = |rows: usize, cols: usize, offset: usize| {
+            let mut v = vec![0f32; rows * cols];
+            for k in 0..cols.min(rows - offset) {
+                v[(offset + k) * cols + k] = 1.0;
+            }
+            Tensor::from_vec(v, (rows, cols), &dev).unwrap()
+        };
+        let proj = |w: Tensor| {
+            let out = w.dims()[0];
+            Proj {
+                inner: QMatMul::Tensor(w),
+                bias: Some(Tensor::zeros(out, DType::F32, &dev).unwrap()),
+            }
+        };
+        let norm = || LayerNorm::new(Tensor::ones(d, DType::F32, &dev).unwrap(), Tensor::zeros(d, DType::F32, &dev).unwrap(), 1e-6);
+        let blocks = (0..layers)
+            .map(|_| Block {
+                norm1: norm(),
+                qkv: proj(zeros(3 * d, d)),
+                proj: proj(zeros(d, d)),
+                norm2: norm(),
+                fc1: proj(zeros(m, d)),
+                fc2: proj(zeros(d, m)),
+                heads,
+                hd: d / heads,
+            })
+            .collect();
+        // 패치 투영: 패치의 앞 d 값을 그대로
+        let mut patch = vec![0f32; d * PatchGrid::DIM];
+        for k in 0..d {
+            patch[k * PatchGrid::DIM + k] = 1.0;
+        }
+        VisionTower {
+            layout: Layout::RaonVe,
+            patch: proj(Tensor::from_vec(patch, (d, PatchGrid::DIM), &dev).unwrap()),
+            pos: zeros(4, d),
+            blocks,
+            norm: norm(),
+            head: MapHead {
+                latent: Tensor::zeros((1, 1, d), DType::F32, &dev).unwrap(),
+                q: proj(zeros(d, d)),
+                kv: proj(eye(2 * d, d, d)),
+                proj: proj(eye(d, d, 0)),
+                norm: norm(),
+                fc1: proj(zeros(m, d)),
+                fc2: proj(zeros(d, m)),
+                heads,
+                hd: d / heads,
+            },
+            cfg: VisionConfig {
+                hidden: d,
+                heads,
+                layers,
+                mlp: m,
+                patch: 16,
+                side: 2,
+                eps: 1e-6,
+            },
+            format: WeightFormat::F32,
+            device: dev.clone(),
+            pos_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `grid_h × grid_w` 칸, 칸 `c` 의 패치 앞 값은 `class(c)` 번째만 1 인 원-핫 (나머지 패치 값 0)
+    pub(crate) fn grid(grid_h: usize, grid_w: usize, class: impl Fn(usize) -> usize) -> PatchGrid {
+        let mut patches = vec![0f32; grid_h * grid_w * PatchGrid::DIM];
+        for c in 0..grid_h * grid_w {
+            patches[c * PatchGrid::DIM + class(c)] = 1.0;
+        }
+        PatchGrid { grid_h, grid_w, patches }
+    }
+
+    /// [`tower`] 이 원-핫 `k` 칸에 주는 특징 (단위 벡터): LayerNorm 이 평균을 뺀 `e_k − 1/d`
+    pub(crate) fn feature(hidden: usize, k: usize) -> Vec<f32> {
+        unit((0..hidden).map(|i| (if i == k { 1.0 } else { 0.0 }) - 1.0 / hidden as f32).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +763,47 @@ mod tests {
         assert!((0..16).all(|i| w[i * 16 + i] == 1.0));
         let w = bilinear_weights(16, 9);
         assert!(w.chunks(16).all(|r| (r.iter().sum::<f32>() - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn the_toy_tower_gives_each_cell_its_own_feature() {
+        let t = toy::tower(8, 3);
+        let g = toy::grid(2, 3, |c| c % 4);
+        let full = t.forward_full(&g).unwrap();
+        let dense = t.dense(&full).unwrap();
+        for (c, v) in full.cells.iter().zip(&dense) {
+            assert!(cosine(v, &toy::feature(8, *c as usize % 4)) > 0.999, "cell {c}");
+        }
+        // 세대가 그대로면 감시판도 같은 답을 낸다
+        let epoch = AtomicU64::new(7);
+        let watched = t.forward_sparse_cancellable(&g, &full.cells, &EpochWatch::capture(&epoch)).unwrap();
+        assert_eq!(t.pooled(&watched).unwrap(), t.pooled(&full).unwrap());
+    }
+
+    #[test]
+    fn ps07_epoch_bump_stops_the_tower_at_the_next_block() {
+        let t = toy::tower(8, 6);
+        let g = toy::grid(3, 4, |c| c % 8);
+        let cells: Vec<u32> = (0..12).collect();
+        let epoch = AtomicU64::new(1);
+        let watch = EpochWatch::capture(&epoch);
+        // 블록 2 에 들어가기 직전 개인 화면 잠금이 세대를 1 → 2 로 올린다
+        let mut calls = 0;
+        let r = t.forward_sparse_gated(&g, &cells, &mut || {
+            calls += 1;
+            if calls == 3 {
+                epoch.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(watch.check()?)
+        });
+        let err = r.err().expect("멈춘다");
+        assert_eq!(VisionAbort::of(&err), Some(VisionAbort::PrivacyLocked));
+        assert_eq!(calls, 3, "남은 블록 4개는 돌지 않는다 (6블록 끝까지 기다리지 않음)");
+        // 이미 바뀐 세대로는 첫 블록 전에 멈춘다 (확장 패스도)
+        assert!(VisionAbort::of(&t.forward_sparse_cancellable(&g, &cells, &watch).err().unwrap()).is_some());
+        let first = t.forward_sparse(&g, &cells[..6]).unwrap();
+        assert!(VisionAbort::of(&t.extend_sparse_cancellable(&g, &first, &cells[6..], &watch).err().unwrap()).is_some());
+        // 다른 오류는 중단이 아니다
+        assert_eq!(VisionAbort::of(&anyhow::anyhow!("other")), None);
     }
 }

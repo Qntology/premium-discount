@@ -250,6 +250,106 @@ fn session_and_model_actions() {
     assert_eq!(st["app"], Value::Null, "the scripted backend has no process");
 }
 
+// Scenario 2 Part 3 (PF-07, PF-09): prewarm and evict go to the backend without an app command; under 650 MB of free
+// memory the pre-warm is deferred and nothing is spawned.
+#[test]
+fn prewarm_and_evict_actions() {
+    let (mut s, app) = server();
+    let out = s.call("pd_model_manage", &json!({"action": "prewarm", "avail_ram_mb": 2048})).unwrap();
+    assert_eq!(out["outcome"], "already_warm", "the scripted backend has nothing to warm");
+    let low = s.call("pd_model_manage", &json!({"action": "prewarm", "avail_ram_mb": 480})).unwrap();
+    assert_eq!(low["outcome"], "deferred");
+    assert!(low["reason"].as_str().unwrap().contains("480 MB"));
+    let ev = s.call("pd_model_manage", &json!({"action": "evict"})).unwrap();
+    assert_eq!(ev["stopped"], false);
+    assert!(app.calls().is_empty(), "no app command for prewarm / evict");
+    let e = format!("{:#}", s.call("pd_model_manage", &json!({"action": "boil"})).unwrap_err());
+    assert_eq!(error_kind(&e), Some("invalid_input"));
+}
+
+// FC-12: a sync without flush still reports the queued votes, so a vote queued offline keeps the host's timer on;
+// 401 turns has_work off (the host pauses instead of hammering the server).
+#[test]
+fn sync_reports_queued_votes_and_auth_holds() {
+    let (mut s, app) = server();
+    app.reply(Ok(json!([])));
+    app.reply(Ok(json!({"queued": 0, "awaiting_result": 0, "queued_votes": 2})));
+    let out = s.call("pd_flush_and_sync", &json!({"since_ms": 0, "flush": false})).unwrap();
+    assert_eq!(out["queued_votes"], 2);
+    assert_eq!(app.calls()[1].0, "cmd_queue_counts");
+
+    let (mut s, app) = server();
+    app.reply(Ok(json!({"sent": 0, "remaining": 1, "still_pending": 0, "votes_remaining": 1,
+        "stopped": "auth_required: server returned 401", "auth_required": true})));
+    app.reply(Ok(json!([])));
+    let out = s.call("pd_flush_and_sync", &json!({"since_ms": 0})).unwrap();
+    assert_eq!(out["has_work"], false, "auth hold: no timer runs");
+    assert_eq!(out["queued_votes"], 1);
+    assert_eq!(app.calls().len(), 2, "with flush the summary already has the vote count");
+}
+
+// WA-11 (MCP side): pd_analytic is the 11th tool; report runs a short sync first when the host is stale and still
+// answers from local events when that sync fails; forget takes ids and/or a time cut-off.
+#[test]
+fn wa11_pd_analytic_is_the_eleventh_tool_and_maps_its_actions() {
+    assert_eq!(TOOLS.len(), 11);
+    assert_eq!(TOOLS[10], "pd_analytic");
+    let (mut s, app) = server();
+    // First report: stale → cmd_analytic_sync (2 pages) then cmd_analytic_report.
+    app.reply(Ok(json!({"host": "shop.example.com", "pages": 1})));
+    app.reply(Ok(json!({"host": "shop.example.com", "confidence": {"kind": "insufficient_sample", "sessions": 4, "min_required": 15}})));
+    let out = s
+        .call("pd_analytic", &json!({"action": "report", "host": "https://Shop.Example.com/cart", "query": "이번 주 vs 지난주 전환율"}))
+        .unwrap();
+    let calls = app.calls();
+    assert_eq!(calls[0], ("cmd_analytic_sync".to_string(), json!({"host": "shop.example.com", "max_pages": 2})));
+    assert_eq!(calls[1].0, "cmd_analytic_report");
+    assert_eq!(calls[1].1["query"], "이번 주 vs 지난주 전환율");
+    assert_eq!(out["confidence"]["kind"], "insufficient_sample");
+    assert!(out.get("sync_error").is_none());
+    // Within 5 minutes: no second sync.
+    app.reply(Ok(json!({"host": "shop.example.com"})));
+    s.call("pd_analytic", &json!({"action": "report", "host": "shop.example.com", "query": "q"})).unwrap();
+    assert_eq!(app.calls()[2].0, "cmd_analytic_report");
+
+    // A failed sync does not fail the report.
+    let (mut s, app) = server();
+    app.reply(Err(CallError::Command { kind: "offline".into(), message: "no network".into() }));
+    app.reply(Ok(json!({"host": "shop.example.com"})));
+    let out = s.call("pd_analytic", &json!({"action": "report", "host": "shop.example.com", "query": "q"})).unwrap();
+    assert!(out["sync_error"].as_str().unwrap().contains("offline"));
+
+    // forget: ids and the time cut-off travel together; neither is an argument error.
+    let (mut s, app) = server();
+    app.reply(Ok(json!({"forgotten": 3})));
+    s.call("pd_analytic", &json!({"action": "forget", "host": "shop.example.com", "before_ms": 1_700_000_000_000i64, "ids": ["e1"]})).unwrap();
+    assert_eq!(app.calls()[0].1, json!({"host": "shop.example.com", "ids": ["e1"], "before_ms": 1_700_000_000_000i64}));
+    for bad in [json!({"action": "forget", "host": "shop.example.com"}), json!({"action": "report", "host": "app://Game.exe", "query": "q"})] {
+        let e = format!("{:#}", s.call("pd_analytic", &bad).unwrap_err());
+        assert_eq!(error_kind(&e), Some("invalid_input"), "{bad}");
+    }
+}
+
+// Scenario 3 Part 2 (CR-04): the scope boost travels to cmd_search_merged; keys are hashed like `to_key`.
+#[test]
+fn search_passes_the_scope_boost() {
+    let (mut s, app) = server();
+    app.reply(Ok(json!({"matches": [], "remote_error": null})));
+    s.call(
+        "pd_search_merged",
+        &json!({"query": "출혈 쌍곡도", "cc": "app://EldenRing.exe", "l1_checkpoint_key": "boss: 말레니아", "l2_entity_keys": ["출혈 쌍곡도"]}),
+    )
+    .unwrap();
+    let args = &app.calls()[0].1;
+    assert_eq!(args["scope"]["l1_checkpoint_to"], hash_id("boss: 말레니아").unwrap());
+    assert_eq!(args["scope"]["l2_entity_tos"], json!([hash_id("출혈 쌍곡도").unwrap()]));
+    // No scope arguments: the request is exactly as before.
+    let (mut s, app) = server();
+    app.reply(Ok(json!({"matches": [], "remote_error": null})));
+    s.call("pd_search_merged", &json!({"query": "q"})).unwrap();
+    assert!(app.calls()[0].1.get("scope").is_none());
+}
+
 /// One-shot HTTP server answering `GET /graph…`.
 fn graph_server(body: Value) -> (String, std::thread::JoinHandle<String>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -391,4 +491,60 @@ fn nav_number_uses_premium_discounts_rules() {
     let bad = premium_discount_mcp::server::nav_number(&json!({"regions": [], "tiers": {"a": "great"}}));
     assert!(bad.is_err());
     assert!(premium_discount_mcp::server::nav_number(&json!({"regions": [], "iou": 2})).is_err());
+}
+
+// Scenario 1 Part 2 through the tool (CN-04 / CN-12): with a frame context the numbers stay put across calls even when
+// a tier change would reorder them, and a locked number is not given away.
+#[test]
+fn nav_number_with_a_frame_context_keeps_numbers_across_calls() {
+    let (mut s, _app) = server();
+    let mut args = nav_screen(false);
+    args["screen_key"] = json!("0xscreen");
+    args["now_ms"] = json!(1_000);
+    let first = s.call("pd_nav_number", &args).unwrap();
+    let numbers = |v: &Value| -> Vec<(String, i64)> {
+        v["regions"].as_array().unwrap().iter().map(|r| (r["region"]["anchor"].as_str().unwrap().to_string(), r["number"].as_i64().unwrap())).collect()
+    };
+    let before = numbers(&first);
+    assert_eq!(first["session"], "default");
+    assert!(first["regions"][0].get("origin").is_some(), "sticky numbers say where they came from");
+    // The button turns premium: the stateless order would move it to 1; the sticky numbers stay.
+    args["tiers"]["btn:login"] = json!("premium");
+    args["now_ms"] = json!(1_200);
+    args["locked_numbers"] = json!(1 << 2);
+    let second = s.call("pd_nav_number", &args).unwrap();
+    let mut a = before.clone();
+    let mut b = numbers(&second);
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "no renumbering on a tier change");
+    let stateless = premium_discount_mcp::server::nav_number(&args).unwrap();
+    assert_ne!(numbers(&stateless), numbers(&second), "the stateless call would have reordered");
+    // Another session is independent.
+    args["session"] = json!("second-window");
+    assert_eq!(s.call("pd_nav_number", &args).unwrap()["session"], "second-window");
+}
+
+// Scenario 6 Part 1 through the tool: window-level signals lock the screen with no sensitive region, a toast only
+// drops the candidates under it.
+#[test]
+fn nav_number_applies_the_privacy_shield() {
+    let mut args = nav_screen(false);
+    args["os_capture_protected"] = json!(true);
+    let n = premium_discount_mcp::server::nav_number(&args).unwrap();
+    assert_eq!((n["sensitive"].as_bool(), n["record"].as_bool()), (Some(true), Some(false)));
+    assert_eq!(n["shield"]["full_lockdown"], "display_affinity_protected");
+    let anchors: Vec<&str> = n["regions"].as_array().unwrap().iter().map(|r| r["region"]["anchor"].as_str().unwrap()).collect();
+    assert!(!anchors.contains(&"vis:icon"), "tree candidates only: {anchors:?}");
+
+    let mut args = nav_screen(false);
+    args["os_notification_zones"] = json!([{"x": 0.85, "y": 0.85, "w": 0.15, "h": 0.15}]);
+    let n = premium_discount_mcp::server::nav_number(&args).unwrap();
+    assert_eq!((n["sensitive"].as_bool(), n["record"].as_bool()), (Some(false), Some(true)));
+    let anchors: Vec<&str> = n["regions"].as_array().unwrap().iter().map(|r| r["region"]["anchor"].as_str().unwrap()).collect();
+    assert!(!anchors.contains(&"vis:icon"), "the icon under the toast is dropped: {anchors:?}");
+    assert!(anchors.contains(&"link:help"));
+    assert!(n["shield"]["partial_redaction"]["zones"].is_array());
+    // No privacy arguments: clear, exactly as before.
+    assert_eq!(premium_discount_mcp::server::nav_number(&nav_screen(false)).unwrap()["shield"], "clear");
 }

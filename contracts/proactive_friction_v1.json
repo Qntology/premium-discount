@@ -1,0 +1,229 @@
+{
+  "contract": "proactive_friction_v1",
+  "scenario": 2,
+  "title": "실시간 마찰 감지 & 비간섭 선제 코칭",
+  "roadmap": "M1",
+  "source": "최종개선안: raon-zena 와 premium-discount 시나리오별 개선 개발 기획안 (24개 Part, 72개 검증 벡터)",
+  "params": {
+    "speculative_idle_ms": 45000,
+    "active_idle_ms": 300000,
+    "min_prewarm_avail_mb": 650,
+    "shutdown_grace_ms": 2000,
+    "post_defeat_ms": 1500,
+    "after_input_aborted_ms": 800,
+    "topic_cooldown_ms": 90000,
+    "fatigue_ignored_offers": 3,
+    "ephemeral_offer_ms": 45000,
+    "accept_window_ms": 5000,
+    "coach_engage": 0.2
+  },
+  "cases": [
+    {
+      "id": "PF-01",
+      "part": 1,
+      "title": "peek_live 무오염 불변성",
+      "given": "피어 10개가 쌓인 FrictionBaselines 에 진행 중 에피소드로 peek_live 50번",
+      "expect": [
+        "Welford (n, mean, m2) 비트 단위로 그대로",
+        "decide 직전 z 값과 오차 < 1e-12"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/behavior.rs",
+          "test": "pf01_"
+        }
+      ]
+    },
+    {
+      "id": "PF-02",
+      "part": 1,
+      "title": "무선택 병목 포착 & 전투 면책",
+      "given": "#1 정상 선택 뒤 #2 에서 Retried × 2 + RageClick / combat_exempt 상태에서 3연타",
+      "expect": [
+        "앞은 bottleneck_anchor == \"#2\" 이고 CoachReady",
+        "뒤는 RageClick 면책으로 Calm"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/behavior.rs",
+          "test": "pf02_"
+        }
+      ]
+    },
+    {
+      "id": "PF-03",
+      "part": 1,
+      "title": "미행동 능동 탐색 vs AFK 동결 & 콜드스타트",
+      "given": "빈 기준선(n=0)에서 포인터가 14s 움직이며 클릭 없음 + 광클 / 포인터 정지(AFK) 60s",
+      "expect": [
+        "앞은 cold_start_fallback == true 로 경보",
+        "뒤는 탐색 시계가 멈춰 Calm"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/behavior.rs",
+          "test": "pf03_"
+        }
+      ]
+    },
+    {
+      "id": "PF-04",
+      "part": 2,
+      "title": "고긴장 전투 중 보류 & 패배 직후 복기 방출",
+      "given": "tension 0.78 교전 중 CoachReady → 8s 뒤 패배 · 교전 끝 → +1,500ms",
+      "expect": [
+        "교전 중 발화 0건",
+        "패배 1,500ms 뒤 PostDefeatComfort 로 정확히 한 번"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "pf04_"
+        }
+      ]
+    },
+    {
+      "id": "PF-05",
+      "part": 2,
+      "title": "채팅(typing) 우선권 & 질문 흡수 vs 취소",
+      "given": "typing 중 보류 → A: 질문 전송(ask_epoch 증가) / B: Esc 로 닫고 800ms",
+      "expect": [
+        "A 는 보류 훅을 바로 버린다 (중복 발화 0)",
+        "B 는 AfterInputAborted 로 방출"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "pf05_"
+        }
+      ]
+    },
+    {
+      "id": "PF-06",
+      "part": 2,
+      "title": "자가 해결 자동 폐기 & 90s 쿨다운",
+      "given": "보류 중 사용자가 스스로 Submitted 통과 / 이미 코칭한 같은 (screen, anchor) 가 30s 안에 다시",
+      "expect": [
+        "자가 해결은 뒷북 발화 0건",
+        "같은 병목 재발은 쿨다운으로 막힌다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "pf06_"
+        }
+      ]
+    },
+    {
+      "id": "PF-07",
+      "part": 3,
+      "title": "비차단 예열 중 pd_nav_number 무정체 & 합류",
+      "given": "모델 로드 3,500ms 짜리 앱을 prewarm 한 직후 pd_nav_number, 2,000ms 에 검색",
+      "expect": [
+        "prewarm · pd_nav_number 응답 < 20ms",
+        "앱 시작 starts == 1",
+        "검색은 남은 ~1,500ms 만 기다린다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-mcp/src/bridge.rs",
+          "test": "pf07_"
+        }
+      ]
+    },
+    {
+      "id": "PF-08",
+      "part": 3,
+      "title": "투기적 예열 45s 조기 회수 vs 실사용 300s 유지",
+      "given": "A: prewarm 뒤 무명령 50s / B: prewarm 뒤 검색 1회 후 50s / C: 모델 내려받기 중 유휴",
+      "expect": [
+        "A 는 45s 에 cmd_shutdown 으로 정상 종료",
+        "B 는 ActiveUse 로 승격되어 계속 실행",
+        "C 는 끝내지 않는다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-mcp/src/bridge.rs",
+          "test": "pf08_"
+        }
+      ]
+    },
+    {
+      "id": "PF-09",
+      "part": 3,
+      "title": "저메모리(< 650MB) · 미설치 서킷 브레이커",
+      "given": "가용 RAM 480MB 에서 PreWarm / installed == none 에서 PreWarm 10번",
+      "expect": [
+        "저메모리는 시작 0번 (deferred)",
+        "미설치는 한 번 확인 뒤 Suppressed 로 고정 (다시 시작 0번)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-mcp/src/bridge.rs",
+          "test": "pf09_"
+        }
+      ]
+    },
+    {
+      "id": "PF-10",
+      "part": 4,
+      "title": "근거 유무 기반 Lv2/Lv3 분기 & 질문 선점",
+      "given": "A: 검증된 Premium 우회로가 있다 / B: 모두 Unrated 초행 / C: 도중에 사용자 질문",
+      "expect": [
+        "A 는 Lv3 (FrictionBrief, 프리픽스 불변)",
+        "B 는 LLM 없이 Lv2 캐시 대사",
+        "C 는 선제 스트림을 바로 취소"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "pf10_"
+        }
+      ]
+    },
+    {
+      "id": "PF-11",
+      "part": 4,
+      "title": "Dialogue 4턴 보존 & 45s 임시 제안 승격",
+      "given": "4턴이 찬 대화에서 선제 코칭 → A: 50s 무응답 / B: 10s 안에 후속 질문",
+      "expect": [
+        "A 는 기존 4턴 그대로",
+        "B 는 선제 제안이 직전 DialogueTurn 으로 승격"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "pf11_"
+        }
+      ]
+    },
+    {
+      "id": "PF-12",
+      "part": 4,
+      "title": "거절 피로도 히스테리시스 & 수용 engage(0.2)",
+      "given": "3번 연속 무시(MutedUntilAsk) 뒤 사용자 질문 / 제안 뒤 5s 안에 지목 번호 선택",
+      "expect": [
+        "무시 3번 뒤 선제 발화 0건, 사용자 질문으로 풀린다",
+        "번호를 고르면 coach 트랙 engage(0.2) 와 노출 장부 등록"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "pf12_"
+        }
+      ]
+    }
+  ]
+}

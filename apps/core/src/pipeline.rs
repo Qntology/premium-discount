@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::api::{
-    new_request_id, text_hash, EvalBackend, Match, SaveRequest, SaveResponse, SearchRequest, SearchResponse,
+    derive_idempotent_request_id, text_hash, EvalBackend, Match, SaveRequest, SaveResponse, SearchRequest, SearchResponse,
     StatusResponse,
 };
+use crate::local::{LocalRecord, LocalState};
 use crate::embedding::{check_contract, l2_normalize, Embedder};
 use crate::embeddinggemma::{check_budget, with_prompt, Input, Role};
 use crate::error::AppError;
@@ -58,6 +59,38 @@ fn outcome_from_response(resp: SaveResponse) -> Result<SubmitOutcome, AppError> 
     }
 }
 
+/// 보관함에 이미 있는 같은 저장(같은 5초 멱등 키)의 결과. 임베딩 · 필터를 다시 돌리지 않고 그 행의 상태로 답한다
+fn outcome_from_row(row: LocalRecord) -> Result<SubmitOutcome, AppError> {
+    let response = |status: &str| SaveResponse {
+        id: row.id.clone().unwrap_or_default(),
+        root: row.root.clone().unwrap_or_default(),
+        ref_: row.ref_.clone(),
+        from: row.from.clone().unwrap_or_default(),
+        status: Some(status.to_string()),
+    };
+    match row.state {
+        LocalState::Queued => Ok(SubmitOutcome::Queued { local_id: row.local_id.clone() }),
+        LocalState::Pending => Ok(SubmitOutcome::Accepted(response("pending"))),
+        // 서버 결과를 모르게 된 행(missing)도 저장 자체는 끝났다: 내 메모로 남아 있다
+        LocalState::Stored | LocalState::Missing => Ok(SubmitOutcome::Saved(response("stored"))),
+        LocalState::Rejected | LocalState::Failed => Err(AppError::Rejected(
+            row.reason.clone().unwrap_or_else(|| format!("server status {}", row.state.as_str())),
+        )),
+    }
+}
+
+/// 입력 검사만 끝난 저장 (임베딩 전). 같은 저장이 보관함에 있는지 0ms 에 찾을 수 있게 멱등 키를 먼저 만든다
+struct Checked {
+    cc: String,
+    text: String,
+    text_hash: String,
+    from: Option<String>,
+    to: Option<String>,
+    bcc: Option<String>,
+    parent: Option<ParentRef>,
+    request_id: String,
+}
+
 /// 검사와 임베딩이 끝난 저장 요청. parent는 답글일 때만 있다.
 // 값은 저장 한 건마다 하나 만들어 바로 쓰고 버린다. Box로 감싸도 얻는 것이 없다
 #[allow(clippy::large_enum_variant)]
@@ -78,6 +111,41 @@ pub struct SearchOptions {
     pub to: Option<String>,
     /// 등급 필터: premium | discount | rated. 판정은 서버에만 있으므로 이 필터가 있으면 로컬 결과를 섞지 않는다
     pub tier: Option<String>,
+    /// 스코프 부스트 (시나리오 3 Part 2): 거르지 않고 순위만 올린다. 있으면 [`merge_matches_scoped`] 로 합친다
+    pub scope: Option<ScopeBoost>,
+}
+
+/// 질의 한 번(Role::Query 임베딩 한 번)으로 세 층의 범위를 함께 보는 순위 가산 (시나리오 3 Part 2).
+/// L1 = 지금 체크포인트의 대상(to), L2 = 질문에 나온 개체들의 대상. 그 밖(앱 전역)은 가산이 없다
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScopeBoost {
+    pub l1_checkpoint_to: Option<String>,
+    pub l2_entity_tos: Vec<String>,
+}
+
+/// L1(지금 체크포인트의 대상)과 같은 글의 가산
+pub const SCOPE_BOOST_L1: f32 = 0.12;
+/// L2(질문의 개체)와 같은 글의 가산
+pub const SCOPE_BOOST_L2: f32 = 0.06;
+/// 내 글(로컬 · 양쪽)의 가산: 원문이 있어 답에 바로 쓸 수 있다
+pub const SCOPE_BOOST_MINE: f32 = 0.02;
+/// 스코프 검색에서 이 코사인보다 낮은 후보는 버린다 (억지 답을 막는다)
+pub const SCOPE_COSINE_FLOOR: f32 = 0.42;
+/// 스코프 검색이 서버에 묻는 후보 수의 바닥. 서버는 유령을 빼려고 두 배를 Vectorize 에 묻는다(상한 50): 16 이면 32 로 여유가 있다
+pub const SCOPE_REMOTE_TOP_K: u32 = 16;
+
+impl ScopeBoost {
+    /// 대상 `to` 의 가산 (L1 이 L2 보다 앞선다)
+    pub fn boost_for(&self, to: Option<&str>) -> f32 {
+        let Some(to) = to.map(str::trim).filter(|t| !t.is_empty()) else { return 0.0 };
+        if self.l1_checkpoint_to.as_deref().is_some_and(|l1| l1.eq_ignore_ascii_case(to)) {
+            SCOPE_BOOST_L1
+        } else if self.l2_entity_tos.iter().any(|t| t.eq_ignore_ascii_case(to)) {
+            SCOPE_BOOST_L2
+        } else {
+            0.0
+        }
+    }
 }
 
 /// 검색의 등급 필터 값
@@ -151,7 +219,13 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> Evaluator<B, E, F> {
     /// 원문과 벡터가 로컬 디스크에 먼저 남는다. 연결이 없으면 Queued로 돌려주고, 이후 flush_outbox로 보낸다.
     /// 욕설로 막힌 입력은 로컬에도 남기지 않는다.
     pub async fn submit_outbox(&self, input: SubmitInput, outbox: &mut Outbox) -> Result<SubmitOutcome, AppError> {
-        let (req, parent) = match self.prepare(&input)? {
+        let checked = self.check(&input)?;
+        // 같은 저장(5초 멱등 키)이 이미 보관함에 있으면 임베딩을 다시 돌리지 않고 그 행의 상태를 돌려준다 (D-03:
+        // 응답을 잃고 다시 누른 저장이 두 행이 되거나, 서버에 다른 request_id 로 두 번 가지 않는다)
+        if let Some(row) = outbox.get(&checked.request_id).await? {
+            return outcome_from_row(row);
+        }
+        let (req, parent) = match self.embed_checked_input(checked)? {
             Prepared::Blocked => return Ok(SubmitOutcome::Blocked),
             Prepared::Ready { req, parent } => (req, parent),
         };
@@ -209,6 +283,12 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> Evaluator<B, E, F> {
 
     /// 입력 검사 -> 욕설 필터 -> 임베딩. 저장 요청은 ref_를 비우고 부모는 따로 돌려준다.
     fn prepare(&self, input: &SubmitInput) -> Result<Prepared, AppError> {
+        let checked = self.check(input)?;
+        self.embed_checked_input(checked)
+    }
+
+    /// 입력 검사와 멱등 키 (모델을 쓰지 않는다)
+    fn check(&self, input: &SubmitInput) -> Result<Checked, AppError> {
         let text = non_empty("text", &input.text)?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(AppError::InvalidInput(format!(
@@ -241,30 +321,57 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> Evaluator<B, E, F> {
             (None, Some(local)) => Some(ParentRef::Local(non_empty("local_parent", local)?.to_string())),
             (None, None) => None,
         };
+        let text_hash = text_hash(text);
+        let parent_key = match &parent {
+            None => None,
+            Some(ParentRef::Server(id)) => Some(id.clone()),
+            Some(ParentRef::Local(local)) => Some(format!("local:{local}")),
+        };
+        let request_id = derive_idempotent_request_id(
+            &cc,
+            to.as_deref(),
+            bcc.as_deref(),
+            parent_key.as_deref(),
+            &text_hash,
+            crate::queue::now_ms(),
+        );
+        Ok(Checked {
+            cc,
+            text: text.to_string(),
+            text_hash,
+            from,
+            to,
+            bcc,
+            parent,
+            request_id,
+        })
+    }
 
+    /// 검사가 끝난 입력: 토큰 예산 -> 욕설 필터 -> 임베딩
+    fn embed_checked_input(&self, c: Checked) -> Result<Prepared, AppError> {
         // 저장하는 원문에는 문서 접두어를 붙여서 임베딩한다. 서버로 보내는 원문과 해시는 접두어 없이 그대로다
-        let prompted = with_prompt(Role::Document, text);
+        let prompted = with_prompt(Role::Document, &c.text);
         // 토큰 예산을 넘는 입력은 필터와 모델을 돌리기 전에 막는다
         self.check_token_budget(&prompted)?;
 
-        if self.filter.check(text)? == Verdict::Profane {
+        if self.filter.check(&c.text)? == Verdict::Profane {
             return Ok(Prepared::Blocked);
         }
 
         let vector = self.embed_normalized(&prompted)?;
         Ok(Prepared::Ready {
             req: SaveRequest {
-                request_id: new_request_id(),
-                from,
-                to,
-                bcc,
-                cc,
-                text: text.to_string(),
-                text_hash: text_hash(text),
+                request_id: c.request_id,
+                from: c.from,
+                to: c.to,
+                bcc: c.bcc,
+                cc: c.cc,
+                text: c.text,
+                text_hash: c.text_hash,
                 vector,
                 ref_: None,
             },
-            parent,
+            parent: c.parent,
         })
     }
 
@@ -328,14 +435,20 @@ impl<B: EvalBackend, E: Embedder, F: ProfanityFilter> Evaluator<B, E, F> {
         } else {
             Vec::new()
         };
-        let (remote, remote_error) = match self.backend.search(&req).await {
+        let mut remote_req = req.clone();
+        if opts.scope.is_some() {
+            // 가산으로 순위가 바뀌므로 서버에는 여유 있게 묻는다 (top_k 16, 유령 제거 여유 포함 32 ≤ 50)
+            remote_req.top_k = remote_req.top_k.max(SCOPE_REMOTE_TOP_K);
+        }
+        let (remote, remote_error) = match self.backend.search(&remote_req).await {
             Ok(resp) => (resp.matches, None),
             Err(err) => (Vec::new(), Some(err.to_string())),
         };
-        Ok(MergedSearch {
-            matches: merge_matches(local, remote, top_k),
-            remote_error,
-        })
+        let matches = match &opts.scope {
+            Some(scope) => merge_matches_scoped(local, remote, top_k, scope),
+            None => merge_matches(local, remote, top_k),
+        };
+        Ok(MergedSearch { matches, remote_error })
     }
 
     /// 토큰 예산 사전 검사 (embeddinggemma::check_budget). 입력이 모델 한도(MAX_INPUT_TOKENS)를 넘으면 모델을 돌리기 전에
@@ -394,6 +507,9 @@ pub struct MergedMatch {
     pub verdict: Option<crate::api::MatchVerdict>,
     /// 이 기기에서 한 표 (1 | -1). 앱 코어가 채운다
     pub my_vote: Option<i32>,
+    /// 스코프 검색에서 순위에 더한 값 (L1 0.12 · L2 0.06 · 내 글 0.02). 순위는 score + scope_boost 다. 스코프가 없으면 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_boost: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -409,7 +525,8 @@ pub fn merge_matches(local: Vec<LocalMatch>, remote: Vec<Match>, top_k: usize) -
     let mut remote_by_id: HashMap<String, Match> = remote.into_iter().map(|m| (m.id.clone(), m)).collect();
     let mut merged: Vec<MergedMatch> = Vec::new();
 
-    for l in local {
+    // 거부 · 실패한 내 글은 후보가 아니다 (저장소 검색이 이미 거르지만, 다른 경로로 들어와도 막는다)
+    for l in local.into_iter().filter(|l| !matches!(l.state, LocalState::Rejected | LocalState::Failed)) {
         let twin = l.id.as_ref().and_then(|id| remote_by_id.remove(id));
         merged.push(match twin {
             Some(r) => MergedMatch {
@@ -425,20 +542,23 @@ pub fn merge_matches(local: Vec<LocalMatch>, remote: Vec<Match>, top_k: usize) -
                 source: MatchSource::Both,
                 verdict: r.verdict,
                 my_vote: None,
+                scope_boost: None,
             },
+            // 로컬에만 있는 글도 행에 있는 대상 · 스레드를 그대로 싣는다 (예전에는 to 가 늘 None 이라 스코프를 볼 수 없었다)
             None => MergedMatch {
                 id: l.id,
                 request_id: Some(l.request_id),
                 score: l.score,
                 cc: Some(l.cc),
-                root: None,
-                ref_: None,
-                to: None,
+                root: l.root,
+                ref_: l.ref_,
+                to: l.to,
                 text: Some(l.text),
                 state: Some(l.state.as_str().to_string()),
                 source: MatchSource::Local,
                 verdict: None,
                 my_vote: None,
+                scope_boost: None,
             },
         });
     }
@@ -456,6 +576,7 @@ pub fn merge_matches(local: Vec<LocalMatch>, remote: Vec<Match>, top_k: usize) -
             source: MatchSource::Remote,
             verdict: r.verdict,
             my_vote: None,
+            scope_boost: None,
         });
     }
 
@@ -471,6 +592,22 @@ pub fn merge_matches(local: Vec<LocalMatch>, remote: Vec<Match>, top_k: usize) -
             .then_with(|| a.id.cmp(&b.id))
             .then_with(|| a.request_id.cmp(&b.request_id))
     });
+    merged.truncate(top_k);
+    merged
+}
+
+/// 스코프 부스트 병합 (시나리오 3 Part 2): 코사인이 [`SCOPE_COSINE_FLOOR`] 보다 낮은 후보를 버리고, 남은 후보를
+/// `S = cos + B_scope(to) + 0.02 · [내 글]` 로 다시 줄 세워 top_k 개를 남긴다. B_scope 는 L1(지금 체크포인트의 대상) 0.12,
+/// L2(질문의 개체) 0.06, 그 밖 0 ([`ScopeBoost::boost_for`]). `score` 는 원래 코사인 그대로 두고 더한 값을 `scope_boost` 에 적는다
+pub fn merge_matches_scoped(local: Vec<LocalMatch>, remote: Vec<Match>, top_k: usize, scope: &ScopeBoost) -> Vec<MergedMatch> {
+    let mut merged = merge_matches(local, remote, usize::MAX);
+    merged.retain(|m| m.score >= SCOPE_COSINE_FLOOR);
+    for m in &mut merged {
+        let mine = if matches!(m.source, MatchSource::Local | MatchSource::Both) { SCOPE_BOOST_MINE } else { 0.0 };
+        m.scope_boost = Some(scope.boost_for(m.to.as_deref()) + mine);
+    }
+    let rank = |m: &MergedMatch| m.score + m.scope_boost.unwrap_or(0.0);
+    merged.sort_by(|a, b| rank(b).total_cmp(&rank(a)).then_with(|| a.id.cmp(&b.id)).then_with(|| a.request_id.cmp(&b.request_id)));
     merged.truncate(top_k);
     merged
 }
@@ -892,7 +1029,31 @@ mod tests {
         let saved = backend.saved.lock().unwrap();
         assert_eq!(saved.len(), 2);
         assert_eq!(saved[0].request_id, saved[1].request_id);
-        assert_eq!(saved[0].request_id.len(), 32);
+        // 결정적 5초 멱등 키 (api::derive_idempotent_request_id): "idemp-" + hex 48자, 서버 형식(16 ~ 64자) 안
+        assert_eq!(saved[0].request_id.len(), 54);
+        assert!(saved[0].request_id.starts_with("idemp-"));
+    }
+
+    // FC-10 · D-03: 응답을 잃고 5초 안에 같은 평가를 다시 저장하면 큐에 한 건만 남고 서버에도 한 request_id 로만 간다.
+    // 같은 문장이라도 다른 답글(부모) · 다른 대상(to)이면 다른 키라 서버가 409 로 거부하지 않는다
+    #[tokio::test]
+    async fn fc10_resubmitting_within_five_seconds_is_one_item_and_other_parents_get_other_keys() {
+        let (ev, backend) = queued_setup(vec![Step::Offline, Step::Offline, Step::Offline], false);
+        let mut queue = OfflineQueue::default();
+        let first = ev.submit_queued(input("다시 누른 평가"), &mut queue).await.unwrap();
+        let again = ev.submit_queued(input("다시 누른 평가"), &mut queue).await.unwrap();
+        let (SubmitOutcome::Queued { local_id: a }, SubmitOutcome::Queued { local_id: b }) = (first, again) else {
+            panic!("expected Queued twice");
+        };
+        assert_eq!(a, b, "같은 5초 칸의 같은 저장은 한 항목");
+        assert_eq!(queue.len(), 1);
+        let mut reply = input("다시 누른 평가");
+        reply.ref_ = Some("0190f0a0-0000-7000-8000-0000000000aa".into());
+        ev.submit_queued(reply, &mut queue).await.unwrap();
+        assert_eq!(queue.len(), 2, "다른 부모는 다른 항목");
+        let ids: Vec<String> = queue.pending_items().map(|p| p.request_id.clone()).collect();
+        assert_ne!(ids[0], ids[1]);
+        assert!(backend.saved.lock().unwrap().iter().all(|s| s.request_id.starts_with("idemp-")));
     }
 
     #[tokio::test]
@@ -1458,9 +1619,13 @@ mod budget_bcc_and_merge_tests {
             local_id: format!("local-{request_id}"),
             id: id.map(String::from),
             cc: "example.com".into(),
+            to: None,
+            root: None,
+            ref_: None,
             state: if id.is_some() { LocalState::Stored } else { LocalState::Queued },
             text: format!("원문 {request_id}"),
             score,
+            created_at: 0,
         }
     }
     fn remote(id: &str, score: f32) -> Match {
@@ -1507,5 +1672,49 @@ mod budget_bcc_and_merge_tests {
         assert_eq!(merge_matches(vec![], vec![remote("a", 0.1)], 5).len(), 1);
         let merged = merge_matches(vec![local("r1", None, f32::NAN)], vec![remote("a", 0.4)], 5);
         assert_eq!(merged.len(), 2);
+    }
+
+    // CR-11: 거부된 내 글은 후보에서 빠지고, 서버 결과를 모르게 된 글(missing)은 내 메모로 남는다.
+    // 로컬에만 있는 글도 대상 · 스레드를 싣는다
+    #[test]
+    fn cr11_rejected_posts_never_come_back_and_missing_notes_stay() {
+        let mut rejected = local("r-bad", None, 0.99);
+        rejected.state = LocalState::Rejected;
+        let mut missing = local("r-note", None, 0.6);
+        missing.state = LocalState::Missing;
+        missing.to = Some("0x1111111111111111111111111111111111111111".into());
+        missing.root = Some("root-1".into());
+        let merged = merge_matches(vec![rejected, missing], vec![], 5);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].state.as_deref(), Some("missing"));
+        assert_eq!(merged[0].to.as_deref(), Some("0x1111111111111111111111111111111111111111"));
+        assert_eq!(merged[0].root.as_deref(), Some("root-1"));
+    }
+
+    // CR-04 (병합 쪽): 질의 임베딩 한 번의 결과를 L1(+0.12) · L2(+0.06) · 내 글(+0.02)로 다시 줄 세운다. 바닥(0.42) 아래는 버린다
+    #[test]
+    fn cr04_scope_boost_reranks_without_filtering_and_drops_weak_matches() {
+        const L1: &str = "0x1111111111111111111111111111111111111111";
+        const L2: &str = "0x2222222222222222222222222222222222222222";
+        let scope = ScopeBoost { l1_checkpoint_to: Some(L1.into()), l2_entity_tos: vec![L2.into()] };
+        let at = |id: &str, score: f32, to: Option<&str>| {
+            let mut m = remote(id, score);
+            m.to = to.map(String::from);
+            m
+        };
+        let remote_matches = vec![at("app-wide", 0.70, None), at("entity", 0.665, Some(L2)), at("checkpoint", 0.61, Some(L1)), at("weak", 0.40, Some(L1))];
+        let mut mine = local("mine", None, 0.69);
+        mine.to = Some("0x3333333333333333333333333333333333333333".into());
+        let merged = merge_matches_scoped(vec![mine], remote_matches, 10, &scope);
+        let order: Vec<String> = merged.iter().map(|m| m.id.clone().or(m.request_id.clone()).unwrap()).collect();
+        // 0.61 + 0.12 = 0.73 > 0.665 + 0.06 = 0.725 > 0.69 + 0.02 = 0.71 > 0.70
+        assert_eq!(order, vec!["checkpoint", "entity", "mine", "app-wide"]);
+        assert!(!order.contains(&"weak".to_string()), "코사인 바닥 0.42 아래는 버린다");
+        assert_eq!(merged[0].score, 0.61, "score 는 코사인 그대로");
+        assert!((merged[0].scope_boost.unwrap() - SCOPE_BOOST_L1).abs() < 1e-6);
+        assert_eq!(merged[2].scope_boost, Some(SCOPE_BOOST_MINE));
+        assert_eq!(scope.boost_for(Some(&L1.to_uppercase().replace("0X", "0x"))), SCOPE_BOOST_L1, "주소는 대소문자를 가리지 않는다");
+        // 스코프 없는 병합에는 가산이 없다
+        assert!(merge_matches(vec![], vec![remote("x", 0.5)], 5)[0].scope_boost.is_none());
     }
 }

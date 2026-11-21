@@ -1,0 +1,238 @@
+{
+  "contract": "web_analytic_v1",
+  "scenario": 5,
+  "title": "웹 퍼널 분석 · 실시간 쇼핑 코칭 & 운영자 리포트",
+  "roadmap": "M4",
+  "source": "최종개선안: raon-zena 와 premium-discount 시나리오별 개선 개발 기획안 (24개 Part, 72개 검증 벡터)",
+  "params": {
+    "visible_siblings": 16,
+    "unload_budget_bytes": 65536,
+    "first_packet_bytes": 8192,
+    "min_funnel_sessions": 15,
+    "min_element_exposures": 5,
+    "choice_sigma": 2.0,
+    "tools": 11,
+    "insight_keys": [
+      "conversion_insight",
+      "traffic_insight",
+      "general_insight"
+    ]
+  },
+  "cases": [
+    {
+      "id": "WA-01",
+      "part": 1,
+      "title": "가변 재고 · 타이머 박리 & 상품 번호 보존",
+      "given": "\"키보드 | 남은 수량 3개\" vs \"1개\" / \"상품 1\" vs \"상품 2\"",
+      "expect": [
+        "가변 재고는 같은 키",
+        "\"상품 1\" · \"상품 2\" 는 다른 키",
+        "analytic_pug_v1.json 13사례 그대로 통과"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa01_"
+        }
+      ]
+    },
+    {
+      "id": "WA-02",
+      "part": 1,
+      "title": "글 없는 아이콘 버튼의 aria-label 보존",
+      "given": "<button aria-label=\"장바구니\"><svg/></button> 와 input[value]",
+      "expect": [
+        "button | [장바구니] (4자리 이상 숫자는 # 로)",
+        "input 값은 모으지 않는다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa02_"
+        }
+      ]
+    },
+    {
+      "id": "WA-03",
+      "part": 1,
+      "title": "#/__modal/ SPA 장바구니 단계 승격",
+      "given": "URL /product/1 그대로에서 position: fixed; aria-modal=\"true\" 드로어가 열림",
+      "expect": [
+        "모달 감지",
+        "#/__modal/cart 를 거치는 cart 퍼널 체크포인트"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa03_"
+        }
+      ]
+    },
+    {
+      "id": "WA-04",
+      "part": 1,
+      "title": "이탈 시 64KB 결말 사건 우선 & 불변 사건 id",
+      "given": "무거운 형제 30개 + 마지막 leave 를 언로드 때 보내고 다시 보냄",
+      "expect": [
+        "첫 패킷(< 8KB)에 leave",
+        "같은 사건은 같은 id 라 다시 보내도 중복 0건"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa04_"
+        }
+      ]
+    },
+    {
+      "id": "WA-05",
+      "part": 2,
+      "title": "무한 스크롤 가시 뷰포트 분모 n_eff",
+      "given": "DOM 80개 중 화면에 보인 8개에서 1개 클릭",
+      "expect": [
+        "보이지 않은 72개는 외면 표 0건",
+        "n_eff = 8 로 기댓값 계산"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa05_"
+        }
+      ]
+    },
+    {
+      "id": "WA-06",
+      "part": 2,
+      "title": "상단 위치 편향 제거 & 비인기 옵션 보호",
+      "given": "상단 1번의 기저율 반영 / 마찰 없는 비인기 색상 옵션(−2.2σ)",
+      "expect": [
+        "비인기 옵션은 Discount 로 내리지 않고 BenignIgnored (Neutral)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa06_"
+        }
+      ]
+    },
+    {
+      "id": "WA-07",
+      "part": 2,
+      "title": "바로구매 단계 스킵 & 다중 탭 비교 면책",
+      "given": "상세 → 바로구매 → 완료 세션 + 같은 tab_group 비교 탭 4개 닫힘",
+      "expect": [
+        "장바구니 이탈 분모를 더럽히지 않는다 (FastTrackCourse)",
+        "닫힌 비교 탭 Abandoned 0건"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa07_"
+        }
+      ]
+    },
+    {
+      "id": "WA-08",
+      "part": 2,
+      "title": "고클릭 × 고마찰 쿠폰 칸 FrictionTrap 거부권",
+      "given": "클릭 선호 +2.8σ + 직후 광클 · 포기 마찰 z=+1.9",
+      "expect": [
+        "GoldenPath 대신 FrictionTrap (Discount)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa08_"
+        }
+      ]
+    },
+    {
+      "id": "WA-09",
+      "part": 3,
+      "title": "무확장 비동기 UIA 탭 cc 격리 & 번역 매칭",
+      "given": "크롬 탭 전환 (amazon.com 한글 번역 \"지금 구매\") + 시크릿 탭",
+      "expect": [
+        "LABEL_SPACE 로 \"Buy Now\" GoldenPath 와 1:1",
+        "시크릿 탭 기록 0건"
+      ],
+      "owners": [],
+      "pending": "raon-zena 의 비동기 UIA 브라우저 감시기(탭 cc 격리 · 시크릿 탭 차단 · LABEL_SPACE 매칭)가 아직 없다"
+    },
+    {
+      "id": "WA-10",
+      "part": 3,
+      "title": "실시간 품절 강등 & 최종 결제 CommitGuard",
+      "given": "1순위 '간편결제' disabled/품절 + '결제하기' 확정 버튼 화면",
+      "expect": [
+        "다음 경로가 #1 을 이어받는다 (영구 원장은 그대로)",
+        "확정 버튼 자동 클릭 금지, 확인 먼저 하는 말씨"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "wa10_"
+        }
+      ]
+    },
+    {
+      "id": "WA-11",
+      "part": 4,
+      "title": "pd_analytic 노출 · +37h 대칭 비교 & 표본 가드",
+      "given": "화요일 13시에 \"이번 주 vs 지난주 전환율\" + 세션 4건 구간",
+      "expect": [
+        "TOOLS 11번째 pd_analytic 이 답한다",
+        "지난주도 같은 +37시간 창으로 잘라 비교",
+        "4건 구간은 InsufficientSample (단정 어휘 없음)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa11_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-mcp/tests/server.rs",
+          "test": "wa11_"
+        },
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "wa11_"
+        }
+      ]
+    },
+    {
+      "id": "WA-12",
+      "part": 4,
+      "title": "통합 TOMBSTONE · DELTA GUARD & 19종 BLOB",
+      "given": "forget(host, before_ms) · forget(ids) 뒤 다시 받기 + 깨진 행 하나가 섞인 analytic_blob_v1.json 19사례",
+      "expect": [
+        "cutoff:<host> · id 묘비로 지운 사건 재삽입 0건",
+        "updated_at > 0 행 중복 가산 0건",
+        "19사례 복원, 불량 1건은 broken == 1 로 격리"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "apps/core/src/analytic.rs",
+          "test": "wa12_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic",
+          "test": "wa12_"
+        }
+      ]
+    }
+  ]
+}

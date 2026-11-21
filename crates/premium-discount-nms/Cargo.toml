@@ -1,6 +1,6 @@
 [package]
 name = "premium-discount-nms"
-description = "도메인 중립 NLP-NMS 코어: 조사 떼기 · 역할 · 부정 분석, 해시 · granite 임베딩, 제네릭 도메인 은행(정확 · 접두 일치 + bias/prejudice), 구간 · 시간 의미 · 공간-글 NMS. raon-zena nlp-nms-router 에서 옮김 (원 설계 Qntology/logis-center)"
+description = "도메인 중립 NLP-NMS 코어: 조사 떼기 · 역할 · 부정 분석(긴 부정 · 이중 부정 · 역접 절), 해시 · granite 임베딩, 제네릭 도메인 은행(정확 · 접두 일치 + bias/prejudice), 구간(창 + 구문 압축 구간) · 시간 의미 · 공간-글 NMS. raon-zena nlp-nms-router 에서 옮김 (원 설계 Qntology/logis-center)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

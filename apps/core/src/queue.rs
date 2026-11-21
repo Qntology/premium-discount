@@ -3,11 +3,17 @@
 //!
 //! - 답글은 부모의 서버 id가 필요하다. 부모가 아직 서버에 없으면 로컬 id(ParentRef::Local)로
 //!   기억해 두고, 부모를 보낸 뒤 서버 id로 바꿔서 보낸다.
-//! - 실패 처리:
-//!   - 연결 실패(AppError::Offline): 큐를 멈추고 항목을 그대로 둔다.
-//!   - 서버 일시 오류(5xx, 429, 408, 기타 HTTP 오류): MAX_SERVER_ATTEMPTS번까지 재시도한 뒤 버린다.
-//!   - 그 밖의 4xx: 영구 거부로 보고 바로 버린다.
+//! - 실패 처리 (다섯 갈래, [`SyncFailure`]):
+//!   - 연결 실패(AppError::Offline): 큐를 멈추고 항목을 그대로 둔다. 시도 횟수를 세지 않는다.
+//!   - 인증 보류(401 · 403): 큐를 멈추고 항목을 그대로 둔다. 시도 횟수를 세지 않는다. 다시 로그인할 때까지
+//!     보내지 않는다(`auth_required`). 예전에는 일시 오류로 세어 10초 주기 5번(50초)이면 항목을 버렸다.
+//!   - 속도 제한(429): 큐를 멈추고 항목을 그대로 둔다. 시도 횟수를 세지 않는다. `retry_after_ms` 뒤에 다시 보낸다.
+//!   - 서버 일시 오류(5xx, 408, 대상이 밝혀지지 않은 404, 기타 HTTP 오류): MAX_SERVER_ATTEMPTS번까지 재시도한 뒤 버린다.
+//!   - 그 밖의 4xx(400 · 409 · 422, 본문이 "evaluation not found"인 404): 영구 거부로 보고 바로 버린다.
 //!   - 거부된 부모의 답글도 보내지 않고 함께 버린다.
+//! - 상한: 못 보낸 항목은 [`MAX_PENDING_ITEMS`], 서버가 접수만 한 항목(결과 대기)은 [`MAX_TRACKING_ITEMS`] 까지다.
+//!   결과를 [`RETAIN_MS`](7일) 넘게 못 받았거나 상한을 넘긴 오래된 항목은 추적을 끝내고 missing 으로 알린다
+//!   (로컬 행의 원문과 벡터는 지우지 않는다: 내 메모로 남는다).
 //! - 디스크 저장은 호출하는 쪽의 몫이다. to_json()으로 문자열을 얻어 저장하고, from_json()으로 되살린다.
 //!   보낸 항목의 id 매핑도 함께 저장되므로, 재시작 뒤에도 답글이 부모 id를 찾을 수 있다.
 
@@ -27,6 +33,15 @@ pub const MAX_SERVER_ATTEMPTS: u32 = 5;
 
 /// 대기열 상한 (항목 수). 임시값이다. 오프라인이 길어져도 메모리와 저장 파일이 무한히 커지지 않게 한다.
 pub const MAX_PENDING_ITEMS: usize = 1000;
+
+/// 서버가 접수(202 pending)만 하고 결과를 아직 모르는 항목의 상한. 넘치면 가장 오래 기다린 것부터 missing 으로 끝낸다
+pub const MAX_TRACKING_ITEMS: usize = 2_000;
+
+/// 접수된 항목의 결과를 기다리는 최대 시간 (7일). 서버는 거부 기록을 7일 뒤 지우므로 그 뒤로는 물어도 알 수 없다
+pub const RETAIN_MS: i64 = 7 * 86_400_000;
+
+/// 429 에 Retry-After 가 없을 때 기다리는 시간 (서버 쓰기 제한의 창이 60초다)
+pub const DEFAULT_RETRY_AFTER_MS: u64 = 60_000;
 
 /// 답글의 부모
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +98,9 @@ pub(crate) struct Tracked {
     pub(crate) local_id: String,
     /// 서버 id
     pub(crate) id: String,
+    /// 서버가 접수한 시각 (밀리초). 이전 파일에는 없으므로 기본값 0 (0 은 기한을 따지지 않는다)
+    #[serde(default)]
+    pub(crate) since_ms: i64,
 }
 
 /// 오프라인 저장 큐. 평가 저장 요청이 서버에 닿기 전까지 여기에 머문다.
@@ -113,6 +131,10 @@ pub struct SyncReport {
     pub still_pending: usize,
     /// 연결이나 서버 일시 오류로 멈춘 이유. None이면 끝까지 확인했다.
     pub stopped: Option<String>,
+    /// 401 · 403 으로 멈췄다: 다시 로그인할 때까지 확인을 미룬다
+    pub auth_required: bool,
+    /// 429 로 멈췄다: 이만큼 뒤에 다시 확인한다 (밀리초)
+    pub retry_after_ms: Option<u64>,
     /// 디스크 저장에 실패한 이유 (메모리 상태는 이미 바뀌었다)
     pub persist_error: Option<String>,
 }
@@ -132,6 +154,10 @@ pub struct FlushReport {
     pub rejected: Vec<RejectedItem>,
     /// 연결이나 서버 일시 오류로 멈춘 이유. None이면 큐를 끝까지 비웠다.
         pub stopped: Option<String>,
+    /// 401 · 403 으로 멈췄다: 다시 로그인할 때까지 보내지 않는다 (항목은 그대로, 시도 횟수도 그대로)
+    pub auth_required: bool,
+    /// 429 로 멈췄다: 이만큼 뒤에 다시 보낸다 (밀리초, 항목과 시도 횟수는 그대로)
+    pub retry_after_ms: Option<u64>,
     /// 보내기가 끝난 뒤 남은 항목 수
     pub remaining: usize,
     /// 디스크 저장에 실패한 이유 (메모리 상태는 이미 바뀌었다)
@@ -150,13 +176,38 @@ pub struct RejectedItem {
     pub reason: String,
 }
 
-enum Failure {
-    /// 연결이 없다. 큐를 멈추고 항목은 그대로 둔다.
+/// 보내기 · 상태 확인 · 투표가 함께 쓰는 실패 갈래 (평가 큐와 투표 보관함이 같은 규칙을 쓴다)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncFailure {
+    /// 연결이 없다. 멈추고 항목은 그대로 둔다. 시도 횟수를 세지 않는다.
     Offline,
-    /// 서버 일시 오류. 횟수를 세고, 한도에 닿으면 버린다.
+    /// 401 · 403: 멈추고 항목은 그대로 둔다. 시도 횟수를 세지 않는다. 다시 로그인할 때까지 미룬다
+    AuthHold { status: u16 },
+    /// 429: 멈추고 항목은 그대로 둔다. 시도 횟수를 세지 않는다. `retry_after_ms` 뒤로 미룬다
+    RateLimited { retry_after_ms: u64 },
+    /// 서버 일시 오류 (408 · 5xx · 대상이 밝혀지지 않은 404 · 응답 오류). 횟수를 세고, 한도에 닿으면 버린다.
     Transient,
-    /// 영구 거부. 바로 버린다.
+    /// 영구 거부 (400 · 409 · 422 · 본문이 "evaluation not found"인 404). 바로 버린다.
     Permanent,
+}
+
+/// 404 본문이 대상(평가 · 부모 평가)이 서버에 없다고 밝히는가 (서버 workers/www 의 메시지)
+pub(crate) fn names_missing_target(status: u16, message: &str) -> bool {
+    status == 404 && message.contains("evaluation not found")
+}
+
+/// 오류를 다섯 갈래로 나눈다 ([`SyncFailure`])
+pub fn classify_failure(err: &AppError) -> SyncFailure {
+    match err {
+        AppError::Offline(_) => SyncFailure::Offline,
+        AppError::Http(_) | AppError::BadResponse(_) => SyncFailure::Transient,
+        AppError::Server { status: status @ (401 | 403), .. } => SyncFailure::AuthHold { status: *status },
+        AppError::Server { status: 429, .. } => SyncFailure::RateLimited { retry_after_ms: DEFAULT_RETRY_AFTER_MS },
+        AppError::Server { status, message } if names_missing_target(*status, message) => SyncFailure::Permanent,
+        // 대상이 밝혀지지 않은 404 는 설정이나 라우팅 문제일 수 있다. 데이터를 바로 버리지 않고 재시도한다
+        AppError::Server { status, .. } if matches!(*status, 404 | 408) || *status >= 500 => SyncFailure::Transient,
+        _ => SyncFailure::Permanent,
+    }
 }
 
 /// 서버 status가 거부 또는 실패인가 (pending·processing·stored는 보내기 성공으로 본다)
@@ -167,20 +218,6 @@ fn is_refused(status: Option<&str>) -> bool {
 /// 서버가 접수만 했고 처리가 끝나지 않은 status인가
 fn is_in_progress(status: Option<&str>) -> bool {
     matches!(status, Some("pending") | Some("processing"))
-}
-
-fn classify(err: &AppError) -> Failure {
-    match err {
-        AppError::Offline(_) => Failure::Offline,
-        AppError::Http(_) | AppError::BadResponse(_) => Failure::Transient,
-        // 401·403·404는 설정이나 라우팅 문제일 수 있다. 데이터를 바로 버리지 않고 재시도한다
-        AppError::Server { status, .. }
-            if matches!(*status, 401 | 403 | 404 | 408 | 429) || *status >= 500 =>
-        {
-            Failure::Transient
-        }
-        _ => Failure::Permanent,
-    }
 }
 
 impl OfflineQueue {
@@ -264,6 +301,10 @@ impl OfflineQueue {
     /// 답글이면 parent를 넘긴다. req.ref_는 비워 둬야 한다 (부모는 parent로만 전달한다).
     /// parent가 Local이면 그 항목이 큐에 있거나 이미 보내진 상태여야 한다.
     pub fn enqueue(&mut self, req: SaveRequest, parent: Option<ParentRef>) -> Result<String, AppError> {
+        // 같은 request_id 가 이미 큐에 있으면 같은 저장이다 (5초 멱등 키, api::derive_idempotent_request_id): 하나만 둔다
+        if let Some(existing) = self.pending.iter().find(|p| p.request_id == req.request_id) {
+            return Ok(existing.local_id.clone());
+        }
         if self.pending.len() >= MAX_PENDING_ITEMS {
             return Err(AppError::QueueFull(self.pending.len()));
         }
@@ -361,6 +402,7 @@ impl OfflineQueue {
                             Tracked {
                                 local_id: front.local_id.clone(),
                                 id: response.id.clone(),
+                                since_ms: now_ms(),
                             },
                         );
                     }
@@ -369,12 +411,23 @@ impl OfflineQueue {
                         response,
                     });
                 }
-                Err(err) => match classify(&err) {
-                    Failure::Offline => {
+                Err(err) => match classify_failure(&err) {
+                    SyncFailure::Offline => {
                         report.stopped = Some(err.to_string());
                                                 break;
                     }
-                    Failure::Transient => {
+                    // 인증 만료 · 속도 제한은 항목 탓이 아니다. 시도 횟수를 세지 않고 멈춘다 (예전에는 50초 만에 버렸다)
+                    SyncFailure::AuthHold { .. } => {
+                        report.auth_required = true;
+                        report.stopped = Some(format!("auth_required: {err}"));
+                        break;
+                    }
+                    SyncFailure::RateLimited { retry_after_ms } => {
+                        report.retry_after_ms = Some(retry_after_ms);
+                        report.stopped = Some(format!("rate_limited: {err}"));
+                        break;
+                    }
+                    SyncFailure::Transient => {
                         changed = true;
                         if let Some(item) = self.pending.front_mut() {
                             item.attempts += 1;
@@ -385,7 +438,7 @@ impl OfflineQueue {
                         }
                         self.reject_front(err.to_string(), &mut report);
                     }
-                    Failure::Permanent => {
+                    SyncFailure::Permanent => {
                         changed = true;
                         self.reject_front(err.to_string(), &mut report);
                     }
@@ -409,8 +462,9 @@ impl OfflineQueue {
     /// - 연결 실패, 일시 오류: 거기서 멈추고 나머지는 다음에 확인한다.
     pub async fn sync_status<B: EvalBackend + ?Sized>(&mut self, backend: &B) -> SyncReport {
         let mut report = SyncReport::default();
+        // 너무 오래 기다렸거나 상한을 넘긴 항목은 묻지 않고 missing 으로 끝낸다 (원문은 로컬 행에 남는다)
+        let mut changed = self.expire_tracking(now_ms(), &mut report.missing);
         let request_ids: Vec<String> = self.tracking.keys().cloned().collect();
-        let mut changed = false;
 
         for request_id in request_ids {
             let Some(tracked) = self.tracking.get(&request_id).cloned() else {
@@ -449,7 +503,17 @@ impl OfflineQueue {
                 }
                 Err(err) => {
                     // 연결 실패, 5xx, 401 등은 데이터를 잃지 않게 추적을 유지하고 멈춘다
-                    report.stopped = Some(err.to_string());
+                    match classify_failure(&err) {
+                        SyncFailure::AuthHold { .. } => {
+                            report.auth_required = true;
+                            report.stopped = Some(format!("auth_required: {err}"));
+                        }
+                        SyncFailure::RateLimited { retry_after_ms } => {
+                            report.retry_after_ms = Some(retry_after_ms);
+                            report.stopped = Some(format!("rate_limited: {err}"));
+                        }
+                        _ => report.stopped = Some(err.to_string()),
+                    }
                     break;
                 }
             }
@@ -500,6 +564,31 @@ impl OfflineQueue {
                 None => Err(format!("parent {local} is not resolved")),
             },
         }
+    }
+
+    /// 결과를 [`RETAIN_MS`] 넘게 못 받은 항목과, 추적이 [`MAX_TRACKING_ITEMS`] 를 넘을 때 가장 오래 기다린 항목의 추적을
+    /// 끝낸다. 끝낸 항목의 로컬 id 를 `missing` 에 넣는다. 서버에 다시 묻지 않으므로 결과는 모르지만, 로컬 행(원문 · 벡터)은
+    /// 지우지 않는다(내 메모로 남는다). 부모로는 쓸 수 없다(outbox 의 resolution_of 가 missing 을 거부로 본다)
+    pub(crate) fn expire_tracking(&mut self, now: i64, missing: &mut Vec<String>) -> bool {
+        let mut expired: Vec<String> = self
+            .tracking
+            .iter()
+            .filter(|(_, t)| t.since_ms > 0 && now - t.since_ms > RETAIN_MS)
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        let over = (self.tracking.len() - expired.len()).saturating_sub(MAX_TRACKING_ITEMS);
+        if over > 0 {
+            let mut rest: Vec<(&String, &Tracked)> = self.tracking.iter().filter(|(r, _)| !expired.contains(r)).collect();
+            rest.sort_by_key(|(r, t)| (t.since_ms, (*r).clone()));
+            expired.extend(rest.into_iter().take(over).map(|(r, _)| r.clone()));
+        }
+        for request_id in &expired {
+            if let Some(t) = self.tracking.remove(request_id) {
+                self.resolved.insert(t.local_id.clone(), Resolution::Rejected);
+                missing.push(t.local_id);
+            }
+        }
+        !expired.is_empty()
     }
 
     fn reject_front(&mut self, reason: String, report: &mut FlushReport) {
@@ -1130,5 +1219,113 @@ mod sync_tests {
         let r = q.flush(&backend).await;
         assert!(r.persist_error.is_none());
         assert!(!path.exists(), "바뀐 것이 없으면 쓰지 않는다");
+    }
+}
+
+/// 시나리오 4 Part 4 (contracts/feedback_credit_v1.json FC-10 · FC-12): 401 · 429 가 항목을 버리지 않는다, 결과 대기 상한,
+/// 같은 request_id 는 한 항목
+#[cfg(test)]
+mod lossless_tests {
+    use super::test_support::{ScriptedBackend, Step};
+    use super::*;
+
+    fn req(seed: u32) -> SaveRequest {
+        let text = format!("lossless {seed}");
+        SaveRequest {
+            bcc: None,
+            request_id: format!("lossless-request-{seed:08}"),
+            from: None,
+            to: None,
+            cc: "a.com".into(),
+            text_hash: crate::api::text_hash(&text),
+            text,
+            vector: vec![seed as f32; 4],
+            ref_: None,
+        }
+    }
+
+    #[test]
+    fn failures_split_five_ways() {
+        let server = |status: u16, message: &str| AppError::Server { status, message: message.into() };
+        assert_eq!(classify_failure(&AppError::Offline("x".into())), SyncFailure::Offline);
+        assert_eq!(classify_failure(&server(401, "")), SyncFailure::AuthHold { status: 401 });
+        assert_eq!(classify_failure(&server(403, "")), SyncFailure::AuthHold { status: 403 });
+        assert_eq!(classify_failure(&server(429, "")), SyncFailure::RateLimited { retry_after_ms: DEFAULT_RETRY_AFTER_MS });
+        assert_eq!(classify_failure(&server(503, "")), SyncFailure::Transient);
+        assert_eq!(classify_failure(&server(408, "")), SyncFailure::Transient);
+        assert_eq!(classify_failure(&server(404, "Not Found")), SyncFailure::Transient, "대상이 밝혀지지 않은 404 는 라우팅 문제일 수 있다");
+        assert_eq!(classify_failure(&server(404, r#"{"error":"parent evaluation not found"}"#)), SyncFailure::Permanent);
+        assert_eq!(classify_failure(&server(409, "")), SyncFailure::Permanent);
+        assert_eq!(classify_failure(&server(422, "")), SyncFailure::Permanent);
+        assert_eq!(classify_failure(&server(400, "")), SyncFailure::Permanent);
+    }
+
+    // FC-12: 401 · 429 상태로 10초 주기 6번(60초)이 지나도 항목은 그대로이고 시도 횟수는 0, 다시 로그인하면 바로 보낸다
+    #[tokio::test]
+    async fn fc12_auth_and_rate_limits_keep_every_item_and_never_count_attempts() {
+        let mut q = OfflineQueue::default();
+        let local = q.enqueue(req(1), None).unwrap();
+        let mut steps = vec![Step::Status(401); 6];
+        steps.extend(vec![Step::Status(429); 6]);
+        let backend = ScriptedBackend::with_steps(steps);
+        for round in 0..12 {
+            let r = q.flush(&backend).await;
+            assert!(r.sent.is_empty() && r.rejected.is_empty(), "round {round}: 버리지 않는다");
+            assert_eq!(r.remaining, 1);
+            if round < 6 {
+                assert!(r.auth_required, "round {round}");
+                assert!(r.stopped.as_deref().unwrap().starts_with("auth_required"));
+            } else {
+                assert!(!r.auth_required);
+                assert_eq!(r.retry_after_ms, Some(DEFAULT_RETRY_AFTER_MS));
+                assert!(r.stopped.as_deref().unwrap().starts_with("rate_limited"));
+            }
+            assert_eq!(q.pending_item(&local).unwrap().attempts, 0, "round {round}: 시도 횟수를 세지 않는다");
+        }
+        // 다시 로그인한 뒤: 시나리오가 비었으니 받아들인다
+        let r = q.flush(&backend).await;
+        assert_eq!(r.sent.len(), 1);
+        assert!(q.is_empty() && r.stopped.is_none() && !r.auth_required);
+    }
+
+    // FC-10: 같은 request_id(5초 멱등 키)로 다시 넣으면 같은 항목이다 (두 번 보내지 않는다)
+    #[tokio::test]
+    async fn fc10_the_same_request_id_is_one_item() {
+        let mut q = OfflineQueue::default();
+        let a = q.enqueue(req(7), None).unwrap();
+        let b = q.enqueue(req(7), None).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(q.len(), 1);
+        let c = q.enqueue(req(8), None).unwrap();
+        assert_ne!(a, c, "다른 저장은 다른 항목");
+        let backend = ScriptedBackend::default();
+        let r = q.flush(&backend).await;
+        assert_eq!(r.sent.len(), 2);
+        assert_eq!(backend.saved.lock().unwrap().len(), 2);
+    }
+
+    // E-17: 결과를 7일 넘게 못 받은 항목과, 상한을 넘긴 가장 오래된 항목은 missing 으로 끝난다 (서버에 묻지 않는다)
+    #[tokio::test]
+    async fn tracking_is_bounded_by_age_and_count() {
+        let now = now_ms();
+        let tracked = |i: usize, since_ms: i64| {
+            (format!("rq-{i:06}"), Tracked { local_id: format!("local-{i}"), id: format!("srv-{i}"), since_ms })
+        };
+        let mut entries: Vec<(String, Tracked)> = (0..MAX_TRACKING_ITEMS + 2).map(|i| tracked(i, now - 1_000 + i as i64)).collect();
+        entries.push(tracked(999_999, now - RETAIN_MS - 1));
+        entries.push(tracked(888_888, 0)); // 예전 파일: 시각이 없으면 기한을 따지지 않는다
+        let mut q = OfflineQueue::restore(0, vec![], entries, vec![]);
+        let mut missing = Vec::new();
+        assert!(q.expire_tracking(now, &mut missing));
+        // 7일 지난 1건 + 상한(2000)을 넘긴 3건(시각 0 인 항목이 가장 오래된 것으로 먼저 빠진다)
+        assert_eq!(missing.len(), 4, "{missing:?}");
+        assert!(missing.contains(&"local-999999".to_string()));
+        assert!(missing.contains(&"local-888888".to_string()));
+        assert!(missing.contains(&"local-0".to_string()) && missing.contains(&"local-1".to_string()));
+        assert_eq!(q.awaiting_result(), MAX_TRACKING_ITEMS);
+        // missing 은 부모로 쓸 수 없다
+        assert!(matches!(q.enqueue(req(1), Some(ParentRef::Local("local-0".into()))), Err(AppError::Rejected(_))));
+        let mut again = Vec::new();
+        assert!(!q.expire_tracking(now, &mut again), "다시 불러도 더 끝낼 것이 없다");
     }
 }

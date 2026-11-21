@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+# 개인 화면 잔상 지우기 (prev_log · ROI 트랙 · 패치 · 썸네일). premium-discount-identity 가 쓰는 것과 같은 crate
+zeroize = "1"
 
 [dev-dependencies]
 # event_diff.wgsl 검증 (런타임에는 wgpu 를 쓰는 앱이 셰이더를 올린다)

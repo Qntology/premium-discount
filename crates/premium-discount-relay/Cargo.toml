@@ -1,6 +1,6 @@
 [package]
 name = "premium-discount-relay"
-description = "Relay Key(고유명사 · 식별자 · 기호 · 복합 명사 · 따옴표 이름) 뽑기와 다국어 키 묶기, 문장 맞추기(이중 센터링 · 1:1), 바뀐 주장으로 신구 대체(Supersedes) · 중복 · 의미 연결 판정"
+description = "Relay Key(고유명사 · 식별자 · 기호 · 복합 명사 · 따옴표 이름) 뽑기와 다국어 키 묶기, 문장 맞추기(이중 센터링 · 1:1), 바뀐 주장(값 변경 · 부정 반전, 배타 조건 가드)으로 신구 대체(Supersedes) · 중복 · 의미 연결 판정, 같은 cc 교차 스코프 큐레이션 · 서버 보고 자격 · 자가 복권 로컬 격리 장부"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

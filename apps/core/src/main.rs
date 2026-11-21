@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use premium_discount_app::commands::{model_command, serve_lines, Fetchers};
+use premium_discount_app::commands::{model_command, serve_lines, Fetchers, SHUTDOWN_COMMAND};
 use premium_discount_app::model_fetch::{Manifest, DEFAULT_BASE_URL};
 use premium_discount_app::{
     platform, AppCore, AppError, AppInfo, AppStatus, CommandError, EmbeddingGemma, Evaluator, FilterSetting, HttpBackend, LoadOptions,
@@ -40,8 +40,9 @@ fn usage() -> &'static str {
      환경 변수: PD_MODEL_DIR(필수) PD_DATA_DIR(필수) PD_SERVER_URL PD_MODALITIES PD_QUANT PD_FILTER PD_FILTER_MODEL_DIR PD_MODEL_BASE_URL PD_OAUTH_HASH PD_OAUTH_TOKEN\n\
      요청: {\"id\":1,\"cmd\":\"cmd_search_local\",\"args\":{\"query\":\"...\"}}\n\
      명령: cmd_submit_evaluation cmd_sync_cache cmd_search_local cmd_search_remote cmd_search_merged cmd_flush_outbox\n\
-           cmd_session cmd_login_start cmd_login_status cmd_logout cmd_app_status\n\
-           cmd_model_status cmd_model_download cmd_model_download_cancel (모델이 없어도 동작)"
+           cmd_session cmd_login_start cmd_login_status cmd_logout cmd_app_status cmd_queue_counts\n\
+           cmd_model_status cmd_model_download cmd_model_download_cancel (모델이 없어도 동작)\n\
+           cmd_shutdown (코어와 GPU 풀을 놓고 끝낸다)"
 }
 
 fn required(name: &str) -> Result<String, AppError> {
@@ -151,6 +152,22 @@ struct Shell {
 }
 
 impl Shell {
+    /// 우아한 종료 (`cmd_shutdown`): 코어(모델 텐서 · LanceDB)를 먼저 놓고, GPU 가 쥔 캐시 풀을 드라이버에 돌려준다.
+    /// Windows HIP 는 풀이 남은 채 프로세스가 끝나면 종료 단계에서 멈춘다(utils::release_gpu). 답한 뒤 serve_lines 가 끝난다
+    async fn release(&self) -> Value {
+        let had_core = {
+            let mut state = self.core.lock().await;
+            let previous = std::mem::replace(&mut *state, CoreState::Empty);
+            matches!(previous, CoreState::Ready(_))
+        };
+        let released = match premium_discount_app::utils::device_from_env() {
+            Ok(device) => premium_discount_app::utils::release_gpu(&device).is_ok(),
+            Err(_) => false,
+        };
+        eprintln!("shutdown: core released ({had_core}), gpu pool released ({released})");
+        serde_json::json!({ "shutdown": true, "core_released": had_core, "gpu_released": released })
+    }
+
     async fn core(&self) -> Result<Arc<Core>, String> {
         let mut state = self.core.lock().await;
         match &*state {
@@ -207,6 +224,9 @@ impl Shell {
     }
 
     async fn handle(&self, cmd: String, args: Value) -> Result<Value, CommandError> {
+        if cmd == SHUTDOWN_COMMAND {
+            return Ok(self.release().await);
+        }
         // 필터 모델을 막 받았으면 여기서 laya로 바꾼다 (세대가 같으면 바로 돌아온다)
         self.refresh_filter().await;
         if cmd == "cmd_item_draft" {

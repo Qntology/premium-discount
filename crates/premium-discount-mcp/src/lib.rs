@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! raon-zena ──McpClient (stdio JSON-RPC 2.0)──▶ premium-discount-mcp ──serve_lines (stdio JSON lines)──▶ premium-discount-app
-//!   SyncLoop (coalesced, 10 s while work)         10 pd_* tools, cc / hashId,         LanceDB outbox (original text, votes),
+//!   SyncLoop (coalesced, 10 s while work)         11 pd_* tools, cc / hashId,         LanceDB outbox (original text, votes),
 //!                                                  GET /graph                         verdict cache, embeddinggemma-2, QR login
 //!                                                         │                                    │
 //!                                                         └──────────── HTTPS ─────────────────┴──▶ premium.discount
@@ -36,8 +36,8 @@ pub mod graph;
 pub mod lines;
 pub mod server;
 
-pub use bridge::{AppConfig, Backend, ProcessBackend};
-pub use client::{PdSyncClient, SyncLoop, SyncRunner, SyncSnapshot, SYNC_INTERVAL};
+pub use bridge::{AppConfig, Backend, PrewarmOutcome, ProcessBackend, WarmLeaseKind, MIN_PREWARM_AVAIL_MB, SPECULATIVE_IDLE};
+pub use client::{reason_code, reason_label, try_lock_for, InteractiveHoldGuard, PdSyncClient, RejectionNotice, SyncLoop, SyncRunner, SyncSnapshot, MAX_UNACKED_REJECTIONS, SYNC_INTERVAL};
 pub use lines::{CallError, LineClient};
 pub use server::{error_kind, PdSyncServer, SERVER_NAME, TIER_FILTERS, TOOLS};
 

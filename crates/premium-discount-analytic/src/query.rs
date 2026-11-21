@@ -14,6 +14,9 @@
 //!   logis-center 에는 `sales_insight` 가 없고 `conversion_insight` 다(기획서의 이름과 다름).
 //! - logis-center 의 벡터 단계(STEP 3 ~ 7: 1 ~ 6 낱말 조각, 놀람 점수, NMS)는 옮기지 않았다. 신경망 임베더를 넘기면
 //!   인사이트만 벡터로 한 번 더 본다([`QueryParser::with_embedder`]).
+//! - **기간 비교** (시나리오 5): 기간이 둘이면("이번 주 vs 지난주") 둘째를 비교 기준(`compare_key`)으로, 기간이 하나라도 비교하는
+//!   말("vs" · "대비" · "비교" · "떨어졌" · "변화" …)이 있으면 바로 앞 기간을 기준으로 비교 창(`comparison`)을 낸다
+//!   ([`crate::time::resolve_comparison_window`]). 예전 칸(`time_key` · `range`)은 그대로다.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -23,12 +26,21 @@ use premium_discount_nms::normalize::normalize;
 use premium_discount_nms::{DomainBank, DomainSpec};
 use serde::{Deserialize, Serialize};
 
-use crate::time::{self, SeasonAnchor, TimeRange};
+use crate::time::{self, ComparisonWindow, SeasonAnchor, TimeRange};
 
 /// logis-center 에서 옮긴 분석 사전 (+ PD 추가)
 pub const DICTIONARY_JSON: &str = include_str!("../data/analytic_dictionary.json");
 /// 한 번에 견주는 낱말 수 (구간 길이)
 const MAX_SPAN_WORDS: usize = 4;
+/// 기간 비교를 묻는 말. 영문은 낱말로, 그 밖은 글 안에서 찾는다
+const COMPARE_MARKERS: [&str; 19] =
+    ["vs", "vs.", "versus", "compare", "compared", "comparison", "대비", "비교", "떨어졌", "떨어진", "줄었", "늘었", "올랐", "변화", "달라졌", "比べ", "比較", "对比", "相比"];
+
+/// 질의가 기간 비교를 묻는가 ([`COMPARE_MARKERS`])
+fn asks_comparison(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    COMPARE_MARKERS.iter().any(|m| if m.is_ascii() { lower.split(|c: char| !(c.is_alphanumeric() || c == '.')).any(|w| w == *m) } else { lower.contains(m) })
+}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FilterEntry {
@@ -82,8 +94,21 @@ impl AnalyticDictionary {
     }
 
     /// URL 의 페이지 종류: `paths` 머리 중 가장 긴 것 (logis-center `page_kind_of`). 머리는 경로 조각 경계에서만 맞고,
-    /// `/` 는 첫 화면(경로가 `/` 그대로)에만 맞는다
+    /// `/` 는 첫 화면(경로가 `/` 그대로)에만 맞는다. SPA 모달 · 드로어의 가상 주소(`#/…/__modal/<slug>`)는 그 slug 의 종류다:
+    /// 종류 이름과 같거나(`cart`) 경로 머리와 같을 때(`basket` → `/basket`). 맞는 종류가 없으면 None 이다(밑의 페이지 종류를
+    /// 물려받지 않는다)
     pub fn page_kind_of(&self, url: &str) -> Option<String> {
+        if let Some(slug) = crate::event::modal_slug_of(url) {
+            if self.analytic_page_filters.contains_key(&slug) {
+                return Some(slug);
+            }
+            let path = format!("/{slug}");
+            return self
+                .analytic_page_filters
+                .iter()
+                .find(|(_, e)| e.paths.iter().any(|p| p.trim().trim_end_matches('/').eq_ignore_ascii_case(&path)))
+                .map(|(k, _)| k.clone());
+        }
         let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
         let path_start = rest.find('/').unwrap_or(rest.len());
         let path = &rest[path_start..];
@@ -148,6 +173,12 @@ pub struct AnalyticQuery {
     pub action_kinds: Vec<String>,
     pub insight: Option<String>,
     pub evidence: Vec<Evidence>,
+    /// 비교 기준 기간 키: 기간이 둘 이상이면 `time_key` 가 아닌 첫 기간 ("이번 주 vs 지난주" → `last_week`). 없으면 None
+    #[serde(default)]
+    pub compare_key: Option<String>,
+    /// 기간 비교 창: 기간이 둘이거나 비교하는 말이 있을 때 (진행 중인 기간은 같은 경과 시간으로 자른다). 비교가 아니면 None
+    #[serde(default)]
+    pub comparison: Option<ComparisonWindow>,
 }
 
 /// 한자 · 가나 (띄어 쓰지 않는 글)
@@ -294,6 +325,14 @@ impl QueryParser {
             }
         }
         let range = time::resolve(time_key.as_deref().unwrap_or(""), season_key.as_deref().unwrap_or(""), lang, SeasonAnchor::Latest, now_ms);
+        // 기간 비교: 기간이 둘 이상이면 처음 고른 것이 아닌 첫 기간과, 비교하는 말만 있으면 바로 앞 기간과 견준다 (계절만 물은 질의는
+        // 견주지 않는다)
+        let compare_key = many(Category::Time).into_iter().find(|k| Some(k) != time_key.as_ref());
+        let comparison = if (compare_key.is_some() || asks_comparison(text)) && (time_key.is_some() || season_key.is_none()) {
+            time::resolve_comparison_window(time_key.as_deref(), compare_key.as_deref(), lang, now_ms)
+        } else {
+            None
+        };
         AnalyticQuery {
             text: text.to_string(),
             lang: time::lang_code_of(lang),
@@ -305,6 +344,8 @@ impl QueryParser {
             action_kinds: many(Category::Action),
             insight,
             evidence,
+            compare_key,
+            comparison,
         }
     }
 }
@@ -374,6 +415,43 @@ mod tests {
         // 기간 말이 없으면 전 구간
         let none = parser().parse("장바구니 페이지 클릭", "ko", NOW);
         assert!(none.range.is_none() && none.time_key.is_none());
+    }
+
+    #[test]
+    fn two_periods_or_a_comparison_word_make_a_comparison_window() {
+        // 2026-11-17 (화) 13:00 KST
+        let tuesday = 1_794_841_200_000 + 13 * 3_600_000;
+        let q = parser().parse("이번 주 vs 지난주 전환율 왜 떨어졌어?", "ko", tuesday);
+        assert_eq!((q.time_key.as_deref(), q.compare_key.as_deref()), (Some("this_week"), Some("last_week")));
+        let w = q.comparison.as_ref().unwrap();
+        assert!(w.pace_matched);
+        assert_eq!(w.label, "this_week (+37.0h) vs last_week (+37.0h)");
+        // 예전 칸은 그대로: 그 주 전체
+        assert_eq!(q.range.as_ref().map(|r| r.end.to_string()).as_deref(), Some("2026-11-22"));
+        assert_eq!(q.insight.as_deref(), Some("conversion_insight"));
+        // 영어 · "vs." (런던 시계: 수요일 03:00 UTC 는 이번 주 +51시간)
+        let en = parser().parse("conversion this week vs. last week", "en", NOW);
+        assert_eq!(en.comparison.map(|w| w.label).as_deref(), Some("this_week (+51.0h) vs last_week (+51.0h)"));
+        // 기간이 하나여도 비교하는 말이 있으면 바로 앞 기간과
+        assert_eq!(parser().parse("어제 대비 전환율", "ko", tuesday).comparison.map(|w| w.label).as_deref(), Some("yesterday vs day_before"));
+        // 비교가 아니거나 계절만 물으면 없다
+        assert!(parser().parse("지난주 장바구니 페이지에서 쿠폰 클릭한 사람", "ko", tuesday).comparison.is_none());
+        assert!(parser().parse("겨울 대비 이탈률", "ko", tuesday).comparison.is_none());
+        // 예전 모양(두 칸이 없는 JSON)도 읽는다
+        let mut old = serde_json::to_value(&q).unwrap();
+        old.as_object_mut().unwrap().retain(|k, _| k != "compare_key" && k != "comparison");
+        let back: AnalyticQuery = serde_json::from_value(old).unwrap();
+        assert_eq!((back.compare_key, back.comparison), (None, None));
+    }
+
+    #[test]
+    fn modal_hrefs_take_the_page_kind_of_their_slug() {
+        let d = AnalyticDictionary::builtin();
+        assert_eq!(d.page_kind_of("https://shop.example.com/product/1#/__modal/cart").as_deref(), Some("cart"));
+        assert_eq!(d.page_kind_of("https://shop.example.com/#/product/1/__modal/checkout").as_deref(), Some("checkout"));
+        assert_eq!(d.page_kind_of("https://shop.example.com/product/1#/__modal/basket").as_deref(), Some("cart"));
+        assert_eq!(d.page_kind_of("https://shop.example.com/product/1#/__modal/size-guide"), None, "an unknown modal is not the product page");
+        assert_eq!(d.page_kind_of("https://shop.example.com/product/1").as_deref(), Some("goods_view"));
     }
 
     #[test]
