@@ -152,7 +152,8 @@ pub fn stored_verdicts_sql(n: usize) -> String {
 
 /// `storedVerdicts(env, ids)` (고침 fix-graph-similar-phantom, 원본 `verdictSummaries` 를 바꾼 것) — D1 에 행이 있는 평가 id 들과
 /// 그 가운데 판정이 있는 것의 요약(`eval_id` → `{ tier, grade, rank, evidence }`, 그 키 차례). 판정 행이 없으면 요약에 없다(원본과 같이 unrated).
-/// ids 가 비었으면 D1 을 부르지 않는다. ids 는 50개 이하로만 부른다 (D1 은 문장당 바인딩이 100개까지)
+/// ids 가 비었으면 D1 을 부르지 않는다. ids 는 100개 이하로만 부른다 (D1 은 문장당 바인딩이 100개까지 — similar 는
+/// fix-graph-similar-overfetch 뒤로 Vectorize 결과 최대 100건, 검색은 50건)
 #[cfg(target_arch = "wasm32")]
 pub async fn stored_verdicts(
     env: &premium_discount_worker_common::js::Env,

@@ -89,6 +89,15 @@ const fixedMatches = (matches) => ({ options }) => {
   const m = matches.slice(0, (options && options.topK) ?? 5);
   return { matches: m, count: m.length };
 };
+/** 이 실행(저장소)에서 몇 번째 query 인가 (1부터) — 실행마다 시험대가 새 저장소를 만든다. 묻는 topK 로 가르지 않으려고 쓴다
+ * (fix-graph-similar-overfetch 가 topK 를 바꾼다) */
+const QUERIES = new WeakMap();
+const queryCount = (store) => {
+  const n = (QUERIES.get(store) ?? 0) + 1;
+  QUERIES.set(store, n);
+  return n;
+};
+const firstQuery = (store) => queryCount(store) === 1;
 /** 작은 차원의 벡터: 축 i 에 가까운 정도를 다르게 */
 const v4 = (...xs) => xs;
 
@@ -151,6 +160,8 @@ const EDGE_SEED = [200, 201].flatMap((n, t) =>
 // fix-graph-similar-phantom: D1 에 행이 없는 결과 둘(하나는 판정 행만 남은 고아)
 const GHOST = "0190f0a0-0000-7000-8000-0000000000e1";
 const GHOST_RATED = "0190f0a0-0000-7000-8000-0000000000e2";
+const GHOST2 = "0190f0a0-0000-7000-8000-0000000000e3";
+const GHOST3 = "0190f0a0-0000-7000-8000-0000000000e4";
 
 export default [
   // ---- graph.test.ts ----
@@ -276,12 +287,13 @@ export default [
   {
     name: "graph_similar_cosine", module: M,
     fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
-    covers: ["SCENARIOS GR-10 (유사 그래프: 자기 자신 제외, 같은 cc) · topK 기본 10 → query topK 11 · topK 2 → 3 · 49 → 50"],
+    covers: ["SCENARIOS GR-10 (유사 그래프: 자기 자신 제외, 같은 cc) · topK 기본 10 → query topK 11 · topK 2 → 3 · 49 → 50 (fix-graph-similar-overfetch 뒤로 22 · 6 · 100, 결과는 같다)"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH, vectors: SMALL_VECTORS, vec: vecStore(),
     requests: [get(`/graph/similar?id=${A}`), get(`/graph/similar?id=${A}&topK=2`), get(`/graph/similar?id=${A}&topK=49`), get(`/graph/similar?id=${C}&topK=1`)],
   },
   {
     name: "graph_similar_missing", module: M,
+    fixes: ["fix-graph-similar-overfetch"],  // ORIGINAL=raw 에서는 Vectorize query 의 topK 만 다르다 (응답 · D1 · 끝 상태는 같다)
     covers: ["SCENARIOS GR-12 (D1 행은 있는데 벡터 없음 → 404 vector not found)", "평가 행이 없으면 Vectorize 를 부르지 않고 404 not found"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH,
     vectors: { [B]: { metadata: { cc: "example.com" } }, [C]: { values: null }, [ROOT]: { values: [] } },
@@ -306,9 +318,10 @@ export default [
     fixes: ["fix-graph-similar-phantom"],
     bindings: SECRET, limits: READ, sql: SEED_GRAPH,
     vectors: { [A]: { values: v4(1, 0, 0, 0), metadata: { cc: "example.com" } } },
+    // 첫 요청(topK 기본)은 자기 자신만 — 요청 차례로 가른다 (fix-graph-similar-overfetch 가 묻는 topK 를 바꾸므로 topK 로 가르지 않는다)
     vec: vecStore({
-      query: ({ options }) =>
-        options.topK === 11
+      query: (b, store) =>
+        firstQuery(store)
           ? { matches: [{ id: A, score: 1 }], count: 1 }
           : { matches: [{ id: A.toUpperCase(), score: 0.99 }, { id: B, score: 0.5 }, { id: B, score: 0.5 }, { id: A, score: 1 }, { id: C }], count: 5 },
     }),
@@ -391,6 +404,7 @@ export default [
   },
   {
     name: "graph_vector_values_shapes", module: M,
+    fixes: ["fix-graph-similar-overfetch"],  // ORIGINAL=raw 에서는 Vectorize query 의 topK 만 다르다 (응답 · D1 · 끝 상태는 같다)
     // values 가 글 · 길이 있는 객체 · 수일 때 Array.from 의 결과가 query 로 간다 (원본 그대로)
     bindings: SECRET, limits: READ, sql: SEED_GRAPH,
     vectors: { [A]: { values: "ab" }, [B]: { values: { length: 2, 0: 0.5 } }, [C]: { values: 3 }, [ROOT]: { values: [0.25, "x", null, true] } },
@@ -452,11 +466,40 @@ export default [
     name: "graph_similar_phantom_mixed", module: M,
     fixes: ["fix-graph-similar-phantom"],
     // 유령 둘(하나는 판정 행만 남음)이 저장된 결과 사이에 끼어 있다: 남은 것의 차례 · score · summary 가 맞고, 고아 판정은 되살아나지 않는다.
-    // topK 로 자른 뒤에 빼므로 결과가 topK 보다 적을 수 있다 (topK 3 → 둘)
+    // fix-graph-similar-phantom 만으로는 topK 로 자른 뒤에 빼 결과가 topK 보다 적었다 (topK 3 → 둘). fix-graph-similar-overfetch 뒤로는
+    // 두 배를 받아 빼고 자르므로 topK 3 → 셋 (LONE · B · C)
+    fixes: ["fix-graph-similar-overfetch"],
     bindings: SECRET, limits: READ,
     sql: [...SEED_GRAPH, verdict({ eval_id: GHOST_RATED, tier: "premium", grade: 2 })],
     vectors: { [A]: { values: unitVector(2) } },
     vec: vecStore({ query: fixedMatches([A, GHOST, LONE, GHOST_RATED, B, C, ROOT].map((id, i) => ({ id, score: 1 - i / 10 }))) }),
     requests: [get(`/graph/similar?id=${A}&topK=3`), get(`/graph/similar?id=${A}`), get(`/graph/similar?id=${A}&topK=1`)],
+  },
+
+  // ---- fix-graph-similar-overfetch ----
+  {
+    name: "graph_similar_overfetch", module: M,
+    fixes: ["fix-graph-similar-phantom", "fix-graph-similar-overfetch"],
+    // 유령 넷이 자기 자신 바로 뒤에 몰려 있다. query topK = min(2 × (topK + 1), 100), 자기 자신 · 유령을 뺀 뒤 topK 로 자른다(차례 그대로):
+    // topK 3 → 8건을 받아 LONE · B · C 로 다 찬다 · topK 2 → 6건을 받아 LONE 하나(여유를 넘는 유령: 짧다) · topK 1 → 4건이 자기 자신 + 유령이라 빈 그래프 ·
+    // topK 49 → 100건(상한, values · metadata 를 받지 않는 query) 을 받아 저장된 넷 전부. 자기 자신이 가운데에 있어도 빠진다
+    bindings: SECRET, limits: READ,
+    sql: [...SEED_GRAPH, verdict({ eval_id: GHOST_RATED, tier: "premium", grade: 2 })],
+    vectors: { [A]: { values: unitVector(2) }, [B]: { values: unitVector(3) } },
+    // 다섯째(B 의 similar)만 다른 차례: 유령 둘 · 자기 자신(B) · LONE · 유령 · C · ROOT — topK 기본 10 → 22건, 자기 자신 · 유령을 빼고 LONE · C · ROOT
+    vec: vecStore({
+      query: (b, store) =>
+        fixedMatches(
+          (queryCount(store) < 5 ? [A, GHOST, GHOST_RATED, GHOST2, GHOST3, LONE, B, C, ROOT] : [GHOST, GHOST2, B, LONE, GHOST3, C, ROOT])
+            .map((id, i) => ({ id, score: 1 - i / 20 }))
+        )(b),
+    }),
+    requests: [
+      get(`/graph/similar?id=${A}&topK=3`),
+      get(`/graph/similar?id=${A}&topK=2`),
+      get(`/graph/similar?id=${A}&topK=1`),
+      get(`/graph/similar?id=${A}&topK=49`),
+      get(`/graph/similar?id=${B}`),
+    ],
   },
 ];

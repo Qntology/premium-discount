@@ -75,6 +75,8 @@ const fakeQuery = (matches) => ({ query: (body) => {
   const m = matches.slice(0, body.options?.topK ?? 5);
   return { matches: m, count: m.length };
 } });
+/** 요청 차례로 답하는 가짜 query 의 셈 (실행마다 새 저장소가 키) */
+const QUERY_STEP = new WeakMap();
 const search = (path, over = {}, headers = {}) => post(path, { vector: unitVector(), ...over }, headers);
 
 // ---- 투표 ----
@@ -203,6 +205,7 @@ export default [
   },
   {
     name: N("search_uses_read_limiter"), module: M,
+    fixes: ["fix-graph-similar-overfetch"],  // ORIGINAL=raw 에서는 Vectorize query 의 topK 만 다르다 (응답 · D1 · 끝 상태는 같다)
     covers: ["evaluations.test.ts: 검색은 읽기 제한기를 쓰고, 저장 제한기와 서로 영향을 주지 않는다", "SCENARIOS RL-02"],
     bindings: SECRETS, limits: { EVAL_WRITE_LIMITER: false, EVAL_READ_LIMITER: (n) => n <= 2 },
     requests: [search("/evaluations/search"), search("/public/evaluations/search"), search("/evaluations/search")],
@@ -551,7 +554,8 @@ export default [
     fixes: ["fix-graph-similar-phantom"],  // ORIGINAL=raw 에서는 D1 문장 글만 다르다 (응답 · 끝 상태는 같다)
     covers: ["SCENARIOS SR-07 · SR-08 · SR-09 (cc · root · ref · to 조건이 Vectorize filter 로, 그 차례) · SR-12 (결과 0건)"],
     bindings: SECRETS, sql: SEARCH_SQL,
-    vec: { query: (body) => (body.options.topK === 7 ? { matches: [], count: 0 } : { matches: SEARCH_MATCHES.slice(0, 2), count: 2 }) },
+    // 결과 0건은 cc 하나만 거는 둘째 요청 (topK 로 가르지 않는다: fix-graph-similar-overfetch 가 묻는 topK 를 바꾼다)
+    vec: { query: (body) => (Object.keys(body.options.filter || {}).join() === "cc" ? { matches: [], count: 0 } : { matches: SEARCH_MATCHES.slice(0, 2), count: 2 }) },
     requests: [
       search("/evaluations/search", { to: "0x" + "2".repeat(40), ref: A.toUpperCase(), root: A, cc: " Example.com" }),
       search("/evaluations/search", { topK: 7, cc: "example.com" }),
@@ -561,6 +565,7 @@ export default [
   },
   {
     name: N("search_metadata_shapes"), module: M,
+    fixes: ["fix-graph-similar-overfetch"],  // ORIGINAL=raw 에서는 Vectorize query 의 topK 만 다르다 (응답 · D1 · 끝 상태는 같다)
     // 메타데이터가 없거나 모양이 다른 결과 (md.x ?? null), 같은 id 가 두 번, 판정 행이 두 번 읽혀도 하나
     bindings: SECRETS, sql: SEARCH_SQL,
     vec: { query: () => ({ matches: [
@@ -576,6 +581,7 @@ export default [
   },
   {
     name: N("search_match_without_id"), module: M,
+    fixes: ["fix-graph-similar-overfetch"],  // ORIGINAL=raw 에서는 Vectorize query 의 topK 만 다르다 (응답 · D1 · 끝 상태는 같다)
     // id 가 없는 결과는 undefined 를 묶어 D1 이 거절한다 → 500 (원본 그대로)
     bindings: SECRETS, sql: SEARCH_SQL,
     vec: { query: () => ({ matches: [{ id: A, score: 0.9 }, { score: 0.3 }], count: 2 }) },
@@ -583,10 +589,13 @@ export default [
   },
   {
     name: N("search_vectorize_errors"), module: M,
+    fixes: ["fix-graph-similar-overfetch"],  // ORIGINAL=raw 에서는 Vectorize query 의 topK 만 다르다 (응답 · D1 · 끝 상태는 같다)
     // Vectorize 장애 · 모양이 다른 답은 500 (console 에 오류 글 — TypeError 글까지 같게)
     bindings: SECRETS,
-    vec: { query: (body) => {
-      const k = body.options.topK;
+    // 답은 요청 차례로 (실행마다 처음부터: 시험대가 실행마다 새로 만드는 저장소에 매단다). topK 로 가르지 않는다(fix-graph-similar-overfetch 가 바꾼다)
+    vec: { query: (body, store) => {
+      const k = (QUERY_STEP.get(store) ?? 0) + 1;
+      QUERY_STEP.set(store, k);
       if (k === 1) return { fail: "vectorize unavailable" };
       if (k === 2) return {};
       if (k === 3) return { matches: null };
@@ -618,6 +627,40 @@ export default [
       search("/evaluations/search", { tier: "premium", topK: 1 }),
       search("/evaluations/search", { tier: "rated", topK: 2 }),
       search("/public/evaluations/search", { topK: 3 }),
+    ],
+  },
+  {
+    name: N("search_overfetch"), module: M,
+    fixes: ["fix-graph-similar-phantom", "fix-graph-similar-overfetch"],
+    // fix-graph-similar-overfetch: 유령 넷이 맨 앞쪽에 몰려 있다. Vectorize 에 창(topK, 등급 조건이면 세 배 · 최대 50)의 두 배(최대 50)를 묻고
+    // 유령을 뺀 뒤 창으로 자른다 — topK 5 는 다섯이 다 찬다(fix-graph-similar-phantom 까지는 D 하나), 등급 조건은 원본처럼 창 안에서.
+    // 여유를 넘는 유령: topK 2 는 넷을 받아 D 하나뿐(짧다), topK 1 은 둘을 받아 모두 유령이라 빈 결과
+    bindings: SECRETS, sql: SEARCH_SQL,
+    vec: fakeQuery(["0190f0a0-0000-7000-8000-0000000000e1", "0190f0a0-0000-7000-8000-0000000000e2", "0190f0a0-0000-7000-8000-0000000000e3", D, "0190f0a0-0000-7000-8000-0000000000e4", X, A, C, B]
+      .map((id, i) => ({ id, score: 1 - i / 20, metadata: { cc: "example.com", root: id } }))),
+    requests: [
+      search("/evaluations/search", { topK: 5 }),
+      search("/evaluations/search", { tier: "rated", topK: 2 }),
+      search("/evaluations/search", { tier: "premium", topK: 1 }),
+      search("/evaluations/search", { topK: 2 }),
+      search("/evaluations/search", { topK: 1 }),
+      search("/public/evaluations/search", { topK: 4 }),
+    ],
+  },
+  {
+    name: N("search_overfetch_cap"), module: M,
+    fixes: ["fix-graph-similar-phantom", "fix-graph-similar-overfetch"],
+    // returnMetadata 를 받으므로 Vectorize 상한 50: topK 25 → 50 · 26 → 50(여유 24) · 50 → 50(여유 없음), 등급 조건 topK 9 → 창 27 · 50 ·
+    // topK 17 → 창 50 · 50. 유령이 없으면(평가 행이 모두 있음) 응답은 원본과 같다 — 여기서는 60건 중 앞의 것들이 모두 저장된 평가다
+    bindings: SECRETS,
+    sql: Array.from({ length: 60 }, (_, i) => evaluation({ id: `0190f0a4-0000-7000-8000-${i.toString(16).padStart(12, "0")}`, created_at: i })),
+    vec: fakeQuery(Array.from({ length: 60 }, (_, i) => ({ id: `0190f0a4-0000-7000-8000-${i.toString(16).padStart(12, "0")}`, score: 1 - i / 100, metadata: { cc: "example.com" } }))),
+    requests: [
+      search("/evaluations/search", { topK: 25 }),
+      search("/evaluations/search", { topK: 26 }),
+      search("/evaluations/search", { topK: 50 }),
+      search("/evaluations/search", { topK: 9, tier: "rated" }),
+      search("/evaluations/search", { topK: 17, tier: "rated" }),
     ],
   },
 

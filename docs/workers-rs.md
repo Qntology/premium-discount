@@ -5,7 +5,8 @@
 같은 예외 경계(무엇을 잡고 무엇이 새는지). 원본의 버그까지 그대로 옮겨 같음을 확인한 뒤(커밋 56705a3) 버그를 고쳤습니다(아래 "고친 버그").
 원본은 커밋 `0538044` 의 `workers/cron/src/*.ts` 입니다. www 워커도 두 단계로 옮겼습니다: 1단계(뼈대 · 세션 · 인증 · 요청 제한 ·
 레거시 처리기 · 차분 시험대)와 2단계(큰 모듈 넷: evaluations · navtrials · graph · analytic). 그 뒤 www 에 보안 · 경합 고침 둘(지갑 서명 한 번만 쓰기 ·
-타임트라이얼의 조건 건 쓰기)과 동작 고침 셋(스레드 그래프의 창 · 유령 결과 빼기 · 다시 보내기의 내용 비교)을 더했습니다 (아래 "www" 절 · "고친 버그").
+타임트라이얼의 조건 건 쓰기)과 동작 고침 셋(스레드 그래프의 창 · 유령 결과 빼기 · 다시 보내기의 내용 비교)을 더했고, 그 뒤 하나(유령을 빼고도
+topK 가 차도록 더 받기)를 더했습니다 (아래 "www" 절 · "고친 버그").
 
 ## 구조
 
@@ -54,7 +55,7 @@ scripts/workers-diff/       차분 시험대 (아래)
 
 ```
 cd workers
-cargo test -j 2                                         # common(12 + aws_eth 5 + pako 1) · cron(12) · www(41 + contracts 8)
+cargo test -j 2                                         # common(12 + aws_eth 5 + pako 1) · cron(12) · www(46 + contracts 8)
 cargo check -j 2 --target wasm32-unknown-unknown        # 경고 없음
 cd cron && worker-build --release                       # build/index.js(20 KiB) · index_bg.wasm(329 KiB)
 ```
@@ -113,7 +114,8 @@ JSON 아닌 본문 · 429 · 서버 오류 · fetch 거부 · 키 없음 · 주�
 파일 하나씩 갈아 끼운 것입니다. 옮기면서 찾은 원본 버그 일곱(1단계 하나 · evaluations 하나 · analytic 다섯)을 고쳤고, 그 뒤 보안 · 경합 고침 둘
 (fix-wallet-replay · fix-nav-lost-update)을 더했습니다. 이 둘은 D1 호출 자체가 원본과 다릅니다(새 표 `wallet_nonces` · 조건 건 쓰기).
 그 뒤 남겨 두었던 동작 결정 셋(fix-graph-local-window · fix-graph-similar-phantom · fix-eval-replay-mismatch)을 고쳤습니다. 이 셋도 D1 문장의 글이
-원본과 다릅니다(재귀 CTE · LEFT JOIN · 더 읽는 칸 — 왕복 수는 같다). 아래 "고친 버그".
+원본과 다릅니다(재귀 CTE · LEFT JOIN · 더 읽는 칸 — 왕복 수는 같다). 그 뒤 fix-graph-similar-overfetch(유령을 빼고도 topK 가 차도록 Vectorize 에
+두 배를 묻는다 — 바뀌는 것은 query 의 topK 와 판정 요약 IN 의 묶은 값)를 더했습니다. 아래 "고친 버그".
 
 ### 구조 (`workers/www`, premium-discount-worker-www)
 
@@ -187,9 +189,9 @@ MODULE=wallet ORIGINAL=raw node www.mjs       # 고치지 않은 원본 vs Rust 
 | session | 23 | session.test.ts (마지막 단언 "로그인한 앱이 저장하면 from 이…" 은 evaluations 에서) |
 | auth | 14 | auth.test.ts — verifiedAddress 의 단언을 GET /session 으로 |
 | legacy | 10 | 레거시 처리기(418 의 차례 · console) · assets. tracker.test.ts 의 tracker.js 는 워커 앞의 assets 가 그대로 낸다(`legacy_assets_first`) |
-| evaluations | 76 | evaluations · votes · supersedes(www 쪽) 시험과 session.test.ts 마지막 단언, SCENARIOS.md 의 R · V · GA · ID · PR · SR · RL, 가장자리(BOM · 잘못된 UTF-8 · 중복 키 · -0 표 · Vectorize 장애 · D1 장애 · 경합), fix-eval-replay-mismatch 2 (`save_replay_content` · `save_race_different_text`) · fix-graph-similar-phantom 1 (`search_phantom`) |
+| evaluations | 78 | evaluations · votes · supersedes(www 쪽) 시험과 session.test.ts 마지막 단언, SCENARIOS.md 의 R · V · GA · ID · PR · SR · RL, 가장자리(BOM · 잘못된 UTF-8 · 중복 키 · -0 표 · Vectorize 장애 · D1 장애 · 경합), fix-eval-replay-mismatch 2 (`save_replay_content` · `save_race_different_text`) · fix-graph-similar-phantom 1 (`search_phantom`) · fix-graph-similar-overfetch 2 (`search_overfetch` · `search_overfetch_cap`) |
 | navtrials | 45 | navtrials.test.ts 의 단언 전부와 가장자리 38, fix-nav-lost-update 의 경합 · 장애 7 (`race_*` · `batch_fault_releases_registration`) |
-| graph | 32 | graph.test.ts, SCENARIOS GR-01~16 · R-06~08 · RL-04 · RL-05, premium-discount-mcp 의 GET /graph* 요청 그대로, fix-graph-local-window 3 (`graph_local_window_*`: 깊은 사슬 · 200 넘는 사슬 · 200/201 경계) · fix-graph-similar-phantom 1 (`graph_similar_phantom_mixed`) |
+| graph | 33 | graph.test.ts, SCENARIOS GR-01~16 · R-06~08 · RL-04 · RL-05, premium-discount-mcp 의 GET /graph* 요청 그대로, fix-graph-local-window 3 (`graph_local_window_*`: 깊은 사슬 · 200 넘는 사슬 · 200/201 경계) · fix-graph-similar-phantom 1 (`graph_similar_phantom_mixed`) · fix-graph-similar-overfetch 1 (`graph_similar_overfetch`) |
 | analytic | 26 | analytic.test.ts, tracker.js 의 실제 요청, 가장자리(본문 형식 · gzip · 크기 · 요청 제한 · CORS · 메서드 · 주인 인증 · 커서 · D1 장애), 고친 버그 6 |
 | wallet | 8 | fix-wallet-replay: 같은 요청 · 다른 쿼리 · 새 서명 · 기한 경계 · 다른 서명 꼴 · 동시 둘 · 기한 지난 키 지우기 · D1 장애 (navtrials · analytic 의 지갑 경로) |
 
@@ -205,12 +207,12 @@ wallet.test.ts(계약 · 위조 · 5분)는 `workers/www/tests/contracts.rs` 가
 
 | 무엇 | 결과 |
 | --- | --- |
-| 고친 원본 vs Rust (`node www.mjs`) | 234/234 동일 (session 23 · auth 14 · legacy 10 · evaluations 76 · navtrials 45 · graph 32 · analytic 26 · wallet 8) |
-| 고치지 않은 원본 vs Rust (`ORIGINAL=raw`) | 126 동일 · 108 다름 — 다른 것은 모두 fixes 칸이 있는 시나리오(예상 밖 0). 앞의 62 에 동작 고침 셋의 46 이 더해졌다: 새 시나리오 7, 동작이 바뀌는 기존 셋(`graph_limit_200` · `graph_similar_phantom` · `graph_similar_empty`), D1 문장 글만 다른 기존 36 (findReplay 까지 가는 저장 20 · 검색 5 · graph 11). 그 전(동작 고침 셋 앞): 165 동일 · 62 다름 — 다른 것은 모두 fixes 칸이 있는 시나리오(예상 밖 0). 앞 고침들의 10 (session_web_email_padded · session_states · save_address_forms · search_to_forms · analytic `fix_*` 6)에 fix-wallet-replay 28(새 8 + 지갑 서명을 받는 navtrials 13 · analytic 7) · fix-nav-lost-update 35(새 7 + navtrials 28)가 더해졌다(둘 다인 것 · 앞 고침과 겹치는 것이 있다) |
-| 동작 고침 셋의 기존 36 | D1 문장 글 · 묶은 값 · all 의 행 수를 빼면 응답 · console · 호출 차례 · 끝 상태가 원본과 같다 (200건 이하 스레드의 /graph/local 행 차례 · 같은 시각의 차례 포함 — `graph_local_window_boundary` 의 200건 요청도 같다). 기존 시나리오의 씨앗 · 장애 칸을 바꾼 것: 검색 씨앗 `SEARCH_SQL` 에 평가 행(D · X · A · C · B, 없으면 모두 유령), `save_replay_queue_states` 의 processing 항목 · `save_race_same_request` 의 경합 항목을 같은 내용(같은 글의 해시 · bcc 없음)으로, `search_verdicts_fail` · `graph_d1_faults` 의 판정 요약 장애 글을 두 문장에 다 있는 `"grade", "rank", "evidence" FROM ` 으로 |
+| 고친 원본 vs Rust (`node www.mjs`) | 237/237 동일 (session 23 · auth 14 · legacy 10 · evaluations 78 · navtrials 45 · graph 33 · analytic 26 · wallet 8). 그 전(fix-graph-similar-overfetch 앞) 234/234 |
+| 고치지 않은 원본 vs Rust (`ORIGINAL=raw`) | 120 동일 · 117 다름 — 다른 것은 모두 fixes 칸이 있는 시나리오(예상 밖 0). fix-graph-similar-overfetch 가 더한 9: 새 시나리오 3(`search_overfetch` · `search_overfetch_cap` · `graph_similar_overfetch`)과 Vectorize query 의 topK 만 다른 기존 6(`search_uses_read_limiter` · `search_metadata_shapes` · `search_match_without_id` · `search_vectorize_errors` · `graph_similar_missing` · `graph_vector_values_shapes` — query 를 부르지만 판정 요약까지는 가지 않아 앞 고침의 fixes 칸이 없던 것, topK 를 지운 뒤 견주면 원본과 같다). query 를 부르고 판정 요약까지 가는 나머지 similar · 검색 시나리오는 이미 fix-graph-similar-phantom 으로 달랐다. 그 전(fix-graph-similar-overfetch 앞): 126 동일 · 108 다름 — 앞의 62 에 동작 고침 셋의 46 이 더해졌다: 새 시나리오 7, 동작이 바뀌는 기존 셋(`graph_limit_200` · `graph_similar_phantom` · `graph_similar_empty`), D1 문장 글만 다른 기존 36 (findReplay 까지 가는 저장 20 · 검색 5 · graph 11). 그 전(동작 고침 셋 앞): 165 동일 · 62 다름 — 다른 것은 모두 fixes 칸이 있는 시나리오(예상 밖 0). 앞 고침들의 10 (session_web_email_padded · session_states · save_address_forms · search_to_forms · analytic `fix_*` 6)에 fix-wallet-replay 28(새 8 + 지갑 서명을 받는 navtrials 13 · analytic 7) · fix-nav-lost-update 35(새 7 + navtrials 28)가 더해졌다(둘 다인 것 · 앞 고침과 겹치는 것이 있다) |
+| 동작 고침 셋의 기존 36 | D1 문장 글 · 묶은 값 · all 의 행 수를 빼면 응답 · console · 호출 차례 · 끝 상태가 원본과 같다 (200건 이하 스레드의 /graph/local 행 차례 · 같은 시각의 차례 포함 — `graph_local_window_boundary` 의 200건 요청도 같다). 기존 시나리오의 씨앗 · 장애 칸을 바꾼 것: 검색 씨앗 `SEARCH_SQL` 에 평가 행(D · X · A · C · B, 없으면 모두 유령), `save_replay_queue_states` 의 processing 항목 · `save_race_same_request` 의 경합 항목을 같은 내용(같은 글의 해시 · bcc 없음)으로, `search_verdicts_fail` · `graph_d1_faults` 의 판정 요약 장애 글을 두 문장에 다 있는 `"grade", "rank", "evidence" FROM ` 으로. fix-graph-similar-overfetch 가 바꾼 기존 시나리오의 칸: query 의 topK 로 답을 가르던 가짜 Vectorize 셋(`search_filters` · `search_vectorize_errors` · `graph_similar_empty`)을 요청 차례 · filter 로 가르게(묻는 topK 가 바뀌므로), `graph_similar_phantom_mixed` 에 fixes 칸 fix-graph-similar-overfetch (topK 3 이 이제 셋) |
 | 위 62 중 앞 고침 둘만 닿는 기존 시나리오 37 (10 + 새 15 + 37 = 62) | 원본과 응답(상태 · 머리글 · 본문) · console · D1 끝 상태(wallet_nonces 빼고)가 모두 같다 — 다른 것은 D1 호출뿐이다. 하나만 끝 상태가 다르다: `stored_rows_odd`(D1 에 직접 넣은 premium `'x'` 를 원본 JS 는 "x1", 고친 판은 SQL 산술로 1) |
 | cron 시험대 (`node cron.mjs`, mocks 에 before · batch after 를 더한 뒤) | 47/47 동일 |
-| `cargo test -j 2` (workers) | common 12 + aws_eth 5 + pako_array 1, cron 12, www 단위 44 + contracts 8 (한 번만 쓰기 키 · 스레드 창 SQL · 유령 빼기 · 다시 보내기 비교 시험 더함) |
+| `cargo test -j 2` (workers) | common 12 + aws_eth 5 + pako_array 1, cron 12, www 단위 46 + contracts 8 (한 번만 쓰기 키 · 스레드 창 SQL · 유령 빼기 · 다시 보내기 비교 시험, 그 뒤 더 받기의 topK 시험 둘 더함) |
 | `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
 | node 시험 (www · cron, TS 원본) | 98 · 41 통과 (그대로) |
 
@@ -238,11 +240,19 @@ wallet.test.ts(계약 · 위조 · 5분)는 `workers/www/tests/contracts.rs` 가
   duplicate 라 합계에는 그 런이 끝내 들어가지 않는다(`race_retry_exhausted`). 등록 되돌리기는 batch 가 던졌을 때 하므로, D1 이 batch 를 실제로는 쓰고
   답만 잃은 경우에는 되돌리기가 틀린다(그 사용자의 다음 런이 한 번 더 셀 수 있다). 밀어내기를 다시 할 때는 이 요청이 쓴 행을 빼고 가장 오래된 것을 고른다.
   D1 에 직접 넣은 숫자 아닌 수(`premium = 'x'`)는 이제 SQL 산술이다(원본 JS 는 `"x" + 1` = "x1", 고친 판은 1 — `stored_rows_odd`).
-- **동작 고침 셋의 결과**: fix-graph-local-window — 조상 사슬이 200보다 길면 고른 평가에 가까운 200개만 넣어 뿌리가 빠진다(`graph_local_window_long_chain`).
+- **동작 고침(셋 · 그 뒤 하나)의 결과**: fix-graph-local-window — 조상 사슬이 200보다 길면 고른 평가에 가까운 200개만 넣어 뿌리가 빠진다(`graph_local_window_long_chain`).
   200건 넘는 스레드에서는 가장 새 것들의 부모가 응답에 없으면 reply 엣지가 없다(원본의 GR-06 과 같은 규칙). 뷰(`graph/view.rs` 의 "같은 스레드 보기")는
-  nodes · edges 만 그리고 엣지는 응답 안의 노드끼리라 그대로 돈다. fix-graph-similar-phantom — 유령은 topK 로 자른 뒤에 빼므로 결과가 topK 보다
-  적을 수 있다(더 받아 채우지 않는다, 검색의 tier 조건도 세 배 안에서). fix-eval-replay-mismatch — 저장(evaluations)으로 옮겨진 평가는 원문 · 해시를
+  nodes · edges 만 그리고 엣지는 응답 안의 노드끼리라 그대로 돈다. fix-graph-similar-phantom — 유령은 이제 두 배를 받아 뺀 뒤 자른다
+  (fix-graph-similar-overfetch). 남은 것: 유령이 여유(원래 요청 수: similar 는 topK + 1, 검색은 창)보다 많이 끼면 여전히 topK 보다 적다
+  (`graph_similar_overfetch` 의 topK 1 · 2, `search_overfetch` 의 topK 1 · 2). 검색은 Vectorize 상한 50 때문에 창이 25를 넘으면 여유가 줄고
+  (등급 조건 없는 topK 26 ~ 50, 등급 조건 있는 topK 9 이상) 창이 50이면(topK 50, 등급 조건 있는 topK 17 이상) 여유가 없어 예전과 같다. 검색의 tier
+  조건은 원본처럼 창(세 배) 안에서만 거른다 — 더 받은 결과로 등급 조건을 채우지는 않는다(유령이 없으면 응답이 원본과 같게). similar 의 판정 요약 IN 은
+  받은 결과 전부라 최대 100개를 묶는다(D1 의 문장당 바인딩 상한). 유령이 없을 때의 같음은 Vectorize 가 더 큰 topK 에도 같은 앞부분을 준다는 가정
+  위에 있다(근사 검색이라 보장은 아니다). fix-eval-replay-mismatch — 저장(evaluations)으로 옮겨진 평가는 원문 · 해시를
   남기지 않아 글을 직접 견줄 수 없다: bcc(콘텐츠 해시 주소)를 보낸 저장만 글이 다른 것을 409 로 가르고, bcc 가 없으면 cc · ref · to 만 본다.
+  **그래서 bcc 없이 저장된 평가에 같은 request_id 로 다른 글을 다시 보내면 200(처음 항목)이고, 이것은 일부러 둔 것이다**: PD 의 개인정보 규칙은
+  평가(evaluations)가 원문도 그 해시도 남기지 않는 것이다(`workers/cron/test/queue.test.ts` 의 "evaluations에는 원문과 해시를 담는 컬럼이 아예 없다").
+  저장된 평가에 text_hash 를 남겨 가르는 안(fix-eval-text-hash-stored, 0011 마이그레이션)은 이 규칙을 깨므로 넣지 않았다.
   거부 · 실패한 항목은 cron 이 해시를 덮고 bcc 를 지워 cc · ref · to 만 보고 그 상태로 200 이다. from 은 견주지 않는다(재시도 사이에 세션이 바뀔 수 있다).
   to 가 다른 다시 보내기도 이제 409 다.
 
@@ -265,12 +275,15 @@ wallet.test.ts(계약 · 위조 · 5분)는 `workers/www/tests/contracts.rs` 가
 | fix-graph-local-window | **www** graph.ts 127 (`localGraph`) | 스레드를 `ORDER BY created_at ASC LIMIT 200` 으로 읽어 200건 넘는 스레드에서는 가장 오래된 200건만 나왔다 — 새 평가를 고르면 그 평가와 그 뒤의 답글이 응답에 없었다(뷰의 "같은 스레드 보기"가 고른 노드를 잃음) → 문장 하나(`local_thread_sql`, 묶음 ?1 root · ?2 200 · ?3 고른 id): 재귀 CTE `chain` 이 고른 평가에서 `ref` 를 따라 root 까지(같은 root 의 행만, 깊이 200까지), `newest` 가 사슬에 없는 스레드 평가를 `created_at DESC, id DESC` 로 남은 칸(200 − 사슬 수)만큼, 바깥 SELECT 는 스레드가 200건 이하면 원본처럼 전부, 넘으면 사슬 ∪ newest 를 원본과 같은 `created_at ASC LIMIT 200` 으로. 200건 이하 스레드는 행 · 차례(같은 시각의 차례까지)와 응답 모양이 원본 그대로다 | `graph_limit_200` · `graph_local_window_deep` · `graph_local_window_long_chain` · `graph_local_window_boundary` · /graph/local 을 부르는 기존 시나리오(문장 글만 다름) |
 | fix-graph-similar-phantom | **www** graph.ts 152 (`similarGraph`) · evaluations.ts 504 (`searchEvaluations`) · 544 (`verdictSummaries`) | Vectorize 결과의 판정 요약만 읽고(`FROM eval_verdicts WHERE "eval_id" IN …`) 평가 행이 있는지는 보지 않아, D1 에 행이 없는 벡터(유령 — cron 의 되돌리기 사이 · 지운 평가)가 /graph/similar 의 unrated 노드와 검색 결과로 나왔다(판정 행만 남은 고아는 판정까지 붙어) → 같은 IN 한 번을 `SELECT e."id", "eval_id", "tier", "grade", "rank", "evidence" FROM evaluations e LEFT JOIN eval_verdicts ON "eval_id" = e."id" WHERE e."id" IN (…)` 로 바꿔(왕복 그대로) 행이 있는 결과만 그 차례대로 남긴다. 검색은 tier 조건보다 먼저 뺀다. summary · 엣지는 남은 노드로. 유령이 없으면 응답은 원본과 바이트까지 같다 | `graph_similar_phantom` · `graph_similar_empty`(대문자 id) · `graph_similar_phantom_mixed` · `www_evaluations_search_phantom` · similar · 검색이 D1 까지 가는 기존 시나리오(문장 글 · 행 수만 다름) |
 | fix-eval-replay-mismatch | **www** evaluations.ts 200 (`findReplay`) | 같은 request_id 의 다시 보내기를 cc · ref 로만 견줘 글이 다른 평가도 처음 항목으로 200 이었다(주석은 "다른 내용이면 409") → 같은 SELECT 에 `"to", "bcc"`(대기열은 `"text_hash"` 도)를 더 읽어 찾은 행이 아직 쥔 내용을 모두 견준다: cc · ref · to 는 늘, bcc 는 저장된 평가와 pending · processing 대기열, text_hash 는 pending · processing 대기열(cron 이 rejected · failed 에서 해시를 `MASKED_HASH` 로 덮고 bcc 를 지운다). 다르면 다른 409 들과 같은 `{ error: 'request_id was already used for a different evaluation' }` 409. 경합(INSERT 가 유니크 제약에 걸린 뒤) 갈래도 같다 | `www_evaluations_save_replay_content` · `www_evaluations_save_race_different_text` · findReplay 까지 가는 저장 시나리오(문장 글만 다름) |
+| fix-graph-similar-overfetch | **www** graph.ts 147 (`similarGraph`) · evaluations.ts 500 (`searchEvaluations`) | fix-graph-similar-phantom 이 유령을 Vectorize 의 topK 로 자른 뒤에 빼, 유령이 끼면 /graph/similar · 검색 결과가 topK 보다 적었다 → Vectorize 에 원래 요청 수의 두 배를 묻고(여유 = 원래 요청 수) 유령을 뺀 뒤 원래 요청 수로 자른다. similar: `min(2 × (topK + 1), 100)`(`similar_query_top_k`) — values · metadata 를 받지 않는 query 의 상한 100, topK 가 49 이하라 닿지 않는다(49 → 100) · 자기 자신 · 유령을 뺀 뒤 `slice(0, topK)`, 판정 요약 IN 은 받은 결과 전부(최대 100, D1 의 바인딩 상한). 검색: 창(원본의 요청 수: 등급 조건이면 `min(50, 3 × topK)`, 아니면 topK)의 두 배를 `returnMetadata: true` 의 상한 50 안에서(`search_query_top_k`), 유령을 뺀 뒤 창으로 자르고 등급 조건은 원본처럼 그 창 안에서. 상한의 출처는 developers.cloudflare.com/vectorize/platform/limits · reference/client-api (V2: values · metadata 없이 100, `returnValues` 나 `returnMetadata: 'all'` 이면 50, V1 은 20 — 인덱스는 README 의 `vectorize create` 라 V2). 유령이 없으면 응답은 바이트까지 같다(Vectorize 결과는 점수 차례라 더 받아도 앞부분이 같다 — 근사 검색이 topK 에 따라 다른 앞부분을 줄 수는 있다) | `graph_similar_overfetch` · `graph_similar_phantom_mixed`(topK 3 이 이제 셋) · `www_evaluations_search_overfetch` · `www_evaluations_search_overfetch_cap` · query 를 부르는 기존 시나리오(Vectorize 호출의 topK 만 다름) |
 
 수정마다 Rust 와 `scripts/workers-diff/fixes/*.mjs`(cron · www · www_analytic · www_behaviour · www_evaluations · www_security)의 글 패치(같은 id, 공백 무시 · 정해진 횟수만큼
 맞아야 적용, 정규식이면 그대로)가 짝입니다. www 의 마지막 둘(fix-wallet-replay · fix-nav-lost-update)은 원본에 없는 D1 호출을 더하므로 `ORIGINAL=raw` 에서
 지갑 서명을 받거나 타임트라이얼을 쓰는 시나리오가 모두 다르다(D1 호출만 — 응답 · 끝 상태는 "www · 결과" 의 확인대로 같다, `stored_rows_odd` 하나만 빼고).
 동작 고침 셋(fix-graph-local-window · fix-graph-similar-phantom · fix-eval-replay-mismatch, `fixes/www_behaviour.mjs`)도 문장 글을 바꾸므로 /graph/local ·
 판정 요약(similar · 검색) · findReplay 까지 가는 시나리오는 `ORIGINAL=raw` 에서 모두 다르다 — 동작이 바뀌는 것 밖에는 문장 글 · 묶은 값 · 행 수만 다르다.
+그 뒤 fix-graph-similar-overfetch 도 같은 파일에 덧댄다: Vectorize query 의 topK 를 바꾸므로 query 를 부르는 시나리오가 모두 다르다(유령이 없으면
+그 topK 와 판정 요약 IN 의 묶은 값만).
 
 ## 알려진 차이 (관찰되지 않거나 www 가 막는 것)
 
