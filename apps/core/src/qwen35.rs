@@ -61,29 +61,19 @@ fn rms_norm_1p(x: &Tensor, w_plus_one: &Tensor) -> Result<Tensor> {
     x.broadcast_div(&(ms + EPS)?.sqrt()?)?.broadcast_mul(w_plus_one)
 }
 
-fn silu(v: f32) -> f32 {
-    v / (1.0 + (-v).exp())
-}
-
-fn softplus(v: f32) -> f32 {
-    if v > 20.0 {
-        v
-    } else {
-        (1.0 + v.exp()).ln()
-    }
-}
-
 struct Gdn {
     in_qkv: Lin,
     in_z: Lin,
     in_b: Lin,
     in_a: Lin,
-    /// (CONV_DIM, CONV_K)
-    conv_w: Vec<f32>,
-    /// -exp(A_log)
-    neg_a: Vec<f32>,
-    dt_bias: Vec<f32>,
-    norm_w: Vec<f32>,
+    /// `[CONV_DIM, CONV_K]` (F32, fused_gated_delta_rule 용)
+    conv_w: Tensor,
+    /// `[LIN_HEADS]` (`-exp(A_log)`)
+    neg_a: Tensor,
+    /// `[LIN_HEADS]`
+    dt_bias: Tensor,
+    /// `[LIN_DIM]` (게이트 RMSNorm 가중치)
+    norm_w: Tensor,
     out: Lin,
 }
 
@@ -112,10 +102,10 @@ struct Layer {
 
 /// 한 시퀀스의 상태 (프롬프트를 넣고 한 토큰씩 이어 간다)
 pub struct State {
-    /// GDN 층별: 직전 CONV_K-1개 입력 (행 우선, (CONV_K-1) x CONV_DIM)
-    conv: Vec<Vec<f32>>,
-    /// GDN 층별: 헤드마다 S (k 128 x v 128)
-    ssm: Vec<Vec<f32>>,
+    /// GDN 층별: `[1, CONV_DIM, CONV_K - 1]` 인과 합성곱 상태
+    conv: Vec<Option<Tensor>>,
+    /// GDN 층별: `[1, LIN_HEADS, LIN_DIM, LIN_DIM]` 순환 상태
+    ssm: Vec<Option<Tensor>>,
     /// 전역 층별: 지금까지의 k, v (위치 x KV_HEADS x HEAD_DIM)
     keys: Vec<Vec<f32>>,
     values: Vec<Vec<f32>>,
@@ -191,16 +181,17 @@ impl Qwen35 {
             } else {
                 let g = l.pp("linear_attn");
                 // 제어 텐서는 F32 그대로 (양자화하지 않는다)
-                let a_log: Vec<f32> = g.get(LIN_HEADS, "A_log")?.to_vec1()?;
+                let a_log = g.get(LIN_HEADS, "A_log")?;
+                let neg_a = a_log.exp()?.neg()?;
                 Mixer::Linear(Gdn {
                     in_qkv: lin(&g.pp("in_proj_qkv"), (CONV_DIM, HIDDEN))?,
                     in_z: lin(&g.pp("in_proj_z"), (KEY_DIM, HIDDEN))?,
                     in_b: Lin::new(g.pp("in_proj_b").get((LIN_HEADS, HIDDEN), "weight")?, None, Kernel::default())?,
                     in_a: Lin::new(g.pp("in_proj_a").get((LIN_HEADS, HIDDEN), "weight")?, None, Kernel::default())?,
-                    conv_w: g.pp("conv1d").get((CONV_DIM, 1, CONV_K), "weight")?.flatten_all()?.to_vec1()?,
-                    neg_a: a_log.iter().map(|v| -v.exp()).collect(),
-                    dt_bias: g.get(LIN_HEADS, "dt_bias")?.to_vec1()?,
-                    norm_w: g.pp("norm").get(LIN_DIM, "weight")?.to_vec1()?,
+                    conv_w: g.pp("conv1d").get((CONV_DIM, 1, CONV_K), "weight")?.reshape((CONV_DIM, CONV_K))?,
+                    neg_a,
+                    dt_bias: g.get(LIN_HEADS, "dt_bias")?,
+                    norm_w: g.pp("norm").get(LIN_DIM, "weight")?,
                     out: lin(&g.pp("out_proj"), (HIDDEN, KEY_DIM))?,
                 })
             };
@@ -224,8 +215,8 @@ impl Qwen35 {
         let gdn = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Linear(_))).count();
         let full = LAYERS - gdn;
         State {
-            conv: vec![vec![0.0; (CONV_K - 1) * CONV_DIM]; gdn],
-            ssm: vec![vec![0.0; LIN_HEADS * LIN_DIM * LIN_DIM]; gdn],
+            conv: vec![None; gdn],
+            ssm: vec![None; gdn],
             keys: vec![Vec::new(); full],
             values: vec![Vec::new(); full],
             pos: 0,
@@ -309,91 +300,44 @@ impl Qwen35 {
         Ok(x)
     }
 
-    fn gdn(&self, g: &Gdn, h: &Tensor, conv: &mut [f32], ssm: &mut [f32]) -> Result<Tensor> {
+    fn gdn(&self, g: &Gdn, h: &Tensor, conv: &mut Option<Tensor>, ssm: &mut Option<Tensor>) -> Result<Tensor> {
         let t = h.dim(0)?;
-        let mixed: Vec<f32> = g.in_qkv.forward(h)?.flatten_all()?.to_vec1()?;
-        let z: Vec<f32> = g.in_z.forward(h)?.flatten_all()?.to_vec1()?;
-        let b: Vec<f32> = g.in_b.forward(h)?.flatten_all()?.to_vec1()?;
-        let a: Vec<f32> = g.in_a.forward(h)?.flatten_all()?.to_vec1()?;
-        // 인과 합성곱: out[i] = sum_j w[j] * x[i - 3 + j] (앞의 3개는 이전 상태)
-        let prev = CONV_K - 1;
-        let mut ext = Vec::with_capacity((prev + t) * CONV_DIM);
-        ext.extend_from_slice(conv);
-        ext.extend_from_slice(&mixed);
-        let mut qkv = vec![0f32; t * CONV_DIM];
-        for i in 0..t {
-            for c in 0..CONV_DIM {
-                let mut s = 0f32;
-                for j in 0..CONV_K {
-                    s += g.conv_w[c * CONV_K + j] * ext[(i + j) * CONV_DIM + c];
-                }
-                qkv[i * CONV_DIM + c] = silu(s);
-            }
-        }
-        conv.copy_from_slice(&ext[t * CONV_DIM..]);
-
-        let scale = 1.0 / (LIN_DIM as f32).sqrt();
-        let mut core = vec![0f32; t * KEY_DIM];
-        let l2 = |v: &mut [f32]| {
-            let inv = 1.0 / (premium_discount_cpu_kernels::dot_f32_simd(v, v) + 1e-6).sqrt();
-            v.iter_mut().for_each(|x| *x *= inv);
+        let mixed = g.in_qkv.forward(h)?.unsqueeze(0)?;
+        let z = g.in_z.forward(h)?.reshape((t * LIN_HEADS, LIN_DIM))?;
+        let b = g.in_b.forward(h)?.unsqueeze(0)?;
+        let a = g.in_a.forward(h)?.unsqueeze(0)?;
+        let cfg = candle_core::delta_rule::GdnConfig::new(LIN_HEADS, LIN_HEADS, LIN_DIM, LIN_DIM);
+        let gdn_out = candle_core::delta_rule::fused_gated_delta_rule(
+            &mixed,
+            &g.conv_w,
+            None,
+            conv.as_ref(),
+            &a,
+            &b,
+            &g.neg_a,
+            &g.dt_bias,
+            ssm.as_ref(),
+            &cfg,
+        )?;
+        *conv = Some(gdn_out.conv_state);
+        *ssm = Some(gdn_out.recurrent_state);
+        let core_2d = gdn_out.out.reshape((t * LIN_HEADS, LIN_DIM))?;
+        let gated = if !core_2d.device().is_cpu()
+            && crate::utils::accel_op_ok(core_2d.device(), crate::utils::AccelOp::DecoderOps)
+        {
+            candle_core::decoder_ops::rmsnorm_fused(&core_2d, &g.norm_w, EPS as f32, false)
+                .and_then(|normed| candle_core::decoder_ops::silu_mul(&z, &normed))
+                .or_else(|_| {
+                    let ms = core_2d.sqr()?.mean_keepdim(D::Minus1)?;
+                    let normed = core_2d.broadcast_div(&(ms + EPS)?.sqrt()?)?.broadcast_mul(&g.norm_w)?;
+                    &normed * &z.silu()?
+                })?
+        } else {
+            let ms = core_2d.sqr()?.mean_keepdim(D::Minus1)?;
+            let normed = core_2d.broadcast_div(&(ms + EPS)?.sqrt()?)?.broadcast_mul(&g.norm_w)?;
+            (&normed * &z.silu()?)?
         };
-        // Stack-allocated scratch buffers reused across every (t, head): zero per-head heap allocs.
-        let mut q_buf = [0f32; LIN_DIM];
-        let mut k_buf = [0f32; LIN_DIM];
-        let mut kv_buf = [0f32; LIN_DIM];
-        let mut delta_buf = [0f32; LIN_DIM];
-        for i in 0..t {
-            let base = i * CONV_DIM;
-            for hd in 0..LIN_HEADS {
-                q_buf.copy_from_slice(&qkv[base + hd * LIN_DIM..base + (hd + 1) * LIN_DIM]);
-                k_buf.copy_from_slice(&qkv[base + KEY_DIM + hd * LIN_DIM..base + KEY_DIM + (hd + 1) * LIN_DIM]);
-                let v = &qkv[base + 2 * KEY_DIM + hd * LIN_DIM..base + 2 * KEY_DIM + (hd + 1) * LIN_DIM];
-                l2(&mut q_buf);
-                l2(&mut k_buf);
-                for x in &mut q_buf {
-                    *x *= scale;
-                }
-                let beta = 1.0 / (1.0 + (-b[i * LIN_HEADS + hd]).exp());
-                let decay = (g.neg_a[hd] * softplus(a[i * LIN_HEADS + hd] + g.dt_bias[hd])).exp();
-                let s = &mut ssm[hd * LIN_DIM * LIN_DIM..(hd + 1) * LIN_DIM * LIN_DIM];
-                for x in s.iter_mut() {
-                    *x *= decay;
-                }
-                // kv = k^T S, delta = (v - kv) * beta, S += k ⊗ delta, out = q^T S
-                kv_buf.fill(0.0);
-                for (r, &kr) in k_buf.iter().enumerate() {
-                    let row = &s[r * LIN_DIM..(r + 1) * LIN_DIM];
-                    for (acc, &sv) in kv_buf.iter_mut().zip(row) {
-                        *acc = kr.mul_add(sv, *acc);
-                    }
-                }
-                for j in 0..LIN_DIM {
-                    delta_buf[j] = (v[j] - kv_buf[j]) * beta;
-                }
-                for (r, &kr) in k_buf.iter().enumerate() {
-                    let row = &mut s[r * LIN_DIM..(r + 1) * LIN_DIM];
-                    for (sv, &d) in row.iter_mut().zip(&delta_buf) {
-                        *sv = kr.mul_add(d, *sv);
-                    }
-                }
-                let out = &mut core[i * KEY_DIM + hd * LIN_DIM..i * KEY_DIM + (hd + 1) * LIN_DIM];
-                for (r, &qr) in q_buf.iter().enumerate() {
-                    let row = &s[r * LIN_DIM..(r + 1) * LIN_DIM];
-                    for (o, &sv) in out.iter_mut().zip(row) {
-                        *o = qr.mul_add(sv, *o);
-                    }
-                }
-                // 게이트 RMSNorm: x / sqrt(mean(x^2) + eps) * w * silu(z)
-                let ms = premium_discount_cpu_kernels::dot_f32_simd(out, out) / LIN_DIM as f32;
-                let inv = 1.0 / (ms + EPS as f32).sqrt();
-                let zrow = &z[i * KEY_DIM + hd * LIN_DIM..i * KEY_DIM + (hd + 1) * LIN_DIM];
-                for ((o, &w), &zz) in out.iter_mut().zip(&g.norm_w).zip(zrow) {
-                    *o = *o * inv * w * silu(zz);
-                }
-            }
-        }
-        g.out.forward(&Tensor::from_vec(core, (t, KEY_DIM), &self.device)?)
+        g.out.forward(&gated.reshape((t, KEY_DIM))?)
     }
 
     fn rope_rows(&self, pos0: usize, t: usize) -> (Vec<f32>, Vec<f32>) {
@@ -441,35 +385,16 @@ impl Qwen35 {
         keys.extend_from_slice(&k);
         values.extend_from_slice(&v);
         let n = keys.len() / (KV_HEADS * HEAD_DIM);
-        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
         let mut out = vec![0f32; t * HEADS * HEAD_DIM];
-        let mut scores = vec![0f32; n];
-        for i in 0..t {
-            let limit = pos0 + i + 1; // 인과: 자기 위치까지
-            for hd in 0..HEADS {
-                let kvh = hd / (HEADS / KV_HEADS);
-                let qv = &q[(i * HEADS + hd) * HEAD_DIM..(i * HEADS + hd + 1) * HEAD_DIM];
-                let mut max = f32::NEG_INFINITY;
-                for (p, sc) in scores.iter_mut().enumerate().take(limit) {
-                    let kv = &keys[(p * KV_HEADS + kvh) * HEAD_DIM..(p * KV_HEADS + kvh + 1) * HEAD_DIM];
-                    *sc = premium_discount_cpu_kernels::dot_f32_simd(qv, kv) * scale;
-                    max = max.max(*sc);
-                }
-                let mut sum = 0f32;
-                for sc in scores.iter_mut().take(limit) {
-                    *sc = (*sc - max).exp();
-                    sum += *sc;
-                }
-                let o = &mut out[(i * HEADS + hd) * HEAD_DIM..(i * HEADS + hd + 1) * HEAD_DIM];
-                for (p, sc) in scores.iter().enumerate().take(limit) {
-                    let w = sc / sum;
-                    let vv = &values[(p * KV_HEADS + kvh) * HEAD_DIM..(p * KV_HEADS + kvh + 1) * HEAD_DIM];
-                    for (ov, x) in o.iter_mut().zip(vv) {
-                        *ov += w * x;
-                    }
-                }
-            }
-        }
+        let cfg = premium_discount_cpu_kernels::CpuStreamAttnCfg {
+            num_heads: HEADS,
+            num_kv_heads: KV_HEADS,
+            head_dim: HEAD_DIM,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            causal: true,
+            past_offset: pos0,
+        };
+        premium_discount_cpu_kernels::stream_attention_f32(&q, keys, values, t, n, &cfg, &mut out);
         let out = Tensor::from_vec(out, (t, HEADS * HEAD_DIM), &self.device)?;
         let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
         a.o.forward(&out)

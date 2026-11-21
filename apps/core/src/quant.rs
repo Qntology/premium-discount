@@ -305,12 +305,17 @@ impl Lin {
         match (bits, kernel) {
             (None, _) => Ok(Self::Dense(Linear::new(weight, None))),
             (Some(b), Kernel::Native) => Ok(Self::Quant(QMatMul::from_qtensor(QTensor::quantize(&weight, b.ggml())?)?)),
-            (Some(b), Kernel::Dequant) => Ok(Self::Packed(QTensor::quantize(&weight, b.ggml())?)),
+            (Some(b), Kernel::Dequant) => Self::from_qtensor(QTensor::quantize(&weight, b.ggml())?, Kernel::Dequant),
         }
     }
 
     /// 캐시에서 읽은(이미 한 번 양자화된) 텐서로 만든다. 다시 양자화하지 않는다.
     pub fn from_qtensor(q: QTensor, kernel: Kernel) -> Result<Self> {
+        // On Vulkan (`candle@b90b12c`), `GpuQuant` runs Q8_0/Q4_0/Q4K/Q5K/Q6K directly in
+        // DEVICE_LOCAL VRAM with exact F32 activations, so prefer QMatMul over full F32 dequantize.
+        if q.device().is_vulkan() {
+            return Ok(Self::Quant(QMatMul::from_qtensor(q)?));
+        }
         match kernel {
             Kernel::Native => Ok(Self::Quant(QMatMul::from_qtensor(q)?)),
             Kernel::Dequant => Ok(Self::Packed(q)),

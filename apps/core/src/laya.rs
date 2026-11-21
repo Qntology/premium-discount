@@ -198,6 +198,20 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Resul
             return Tensor::from_vec(out, (t, HEADS, HEAD_DIM), q.device())?.transpose(0, 1);
         }
     }
+    if mask.is_none()
+        && !q.device().is_cpu()
+        && crate::utils::accel_op_ok(q.device(), crate::utils::AccelOp::FlashAttn)
+    {
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(1.0 / (HEAD_DIM as f32).sqrt());
+        if let Ok(out) = candle_nn::flash_attn::flash_attn_bhsd(
+            &q.unsqueeze(0)?.contiguous()?,
+            &k.unsqueeze(0)?.contiguous()?,
+            &v.unsqueeze(0)?.contiguous()?,
+            &cfg,
+        ) {
+            return out.squeeze(0);
+        }
+    }
     let scores = (q.matmul(&k.t()?)? / (HEAD_DIM as f64).sqrt())?;
     let scores = match mask {
         Some(m) => scores.broadcast_add(m)?,
