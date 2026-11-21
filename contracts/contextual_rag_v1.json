@@ -1,0 +1,249 @@
+{
+  "contract": "contextual_rag_v1",
+  "scenario": 3,
+  "title": "문맥 복원 투트랙 RAG & 신구 대체 로컬 격리",
+  "roadmap": "M2",
+  "source": "최종개선안: raon-zena 와 premium-discount 시나리오별 개선 개발 기획안 (24개 Part, 72개 검증 벡터)",
+  "params": {
+    "soft_deadline_ms": 600,
+    "scope_boost": {
+      "l1": 0.12,
+      "l2": 0.06,
+      "mine": 0.02
+    },
+    "cosine_floor": 0.42,
+    "remote_top_k": 16,
+    "hash_floor": 0.5,
+    "graph_quick_timeout_ms": 200,
+    "graph_min_budget_ms": 250,
+    "scene_cache_ttl_ms": 120000,
+    "mirror_per_cc": 256,
+    "exposure_window_ms": 300000,
+    "claim_max_chars": 38,
+    "verdict_slots": 3
+  },
+  "cases": [
+    {
+      "id": "CR-01",
+      "part": 1,
+      "title": "공간 지시 vs 대화 대명사 분리",
+      "given": "\"출혈 쌍곡도\" 대화 직후 \"여기서 주의할 거?\" vs \"그거 방패로 막아?\"",
+      "expect": [
+        "앞은 DeicticScreen (지금 체크포인트의 L1 to)",
+        "뒤는 AnaphoricDialogue (\"출혈 쌍곡도\" 복원)"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cr01_"
+        }
+      ]
+    },
+    {
+      "id": "CR-02",
+      "part": 1,
+      "title": "창(cc) 전환 토픽 오염 차단",
+      "given": "eldenring.exe 대화 직후 steampowered.com 에서 \"이거 할인율 어때?\"",
+      "expect": [
+        "게임 토픽 가중치 0.0",
+        "브라우저 cc 스코프만 조회"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cr02_"
+        }
+      ]
+    },
+    {
+      "id": "CR-03",
+      "part": 1,
+      "title": "복수 선행사 동점 → 되묻기",
+      "given": "두 무기를 함께 말한 직후 \"그거 지력 제한 몇이야?\"",
+      "expect": [
+        "ambiguous_pair == Some(…)",
+        "Situation.context 에 단정 금지 · 되묻기 가드"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cr03_"
+        }
+      ]
+    },
+    {
+      "id": "CR-04",
+      "part": 2,
+      "title": "단일 임베딩 3계층 백오프 & 구문 스팬",
+      "given": "L1 0건 · L2 2건 · L3 5건 + 긴 수식어가 붙은 바꿔 말한 질문",
+      "expect": [
+        "Role::Query 768d 인코딩 한 번",
+        "L2(+0.06) · L1(+0.12) 가산으로 다시 줄 세움, 코사인 바닥 0.42",
+        "구문 압축 스팬이 맞는다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "apps/core/src/pipeline.rs",
+          "test": "cr04_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nms/src",
+          "test": "cr04_"
+        }
+      ]
+    },
+    {
+      "id": "CR-05",
+      "part": 2,
+      "title": "0ms PreThink & 600ms 미러 응답 + SyncLoop 양보",
+      "given": "앱 냉기동(3.5s) 중 질문, SyncSnapshot 에 내 원문 2건(stored 1, rejected 1)",
+      "expect": [
+        "0ms 에 PreThink",
+        "SyncLoop 대화형 홀드",
+        "600ms 에 미러에서 stored 1건만 (rejected 0건) 으로 1차 발화",
+        "3.5s 결과는 캐시에"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-mcp/src/client.rs",
+          "test": "cr05_"
+        }
+      ],
+      "pending": "SyncLoop 양보(hold_for_interactive)만 확인한다. 0ms PreThink · 600ms LocalMirrorIndex 응답 · 캐시 적재는 raon-zena 앱(pd_bridge) 연결에서 남았다"
+    },
+    {
+      "id": "CR-06",
+      "part": 2,
+      "title": "연타 정정 세대 취소 & 프라이버시 캐시 격리",
+      "given": "질문 A(epoch 1) 뒤 300ms 만에 질문 B(epoch 2) / 검색 중 privacy_epoch 증가",
+      "expect": [
+        "epoch 1 검색 · 토큰 생성 폐기, 말풍선은 epoch 2 만",
+        "privacy_epoch 가 다른 늦은 결과는 캐시에 넣지 않는다"
+      ],
+      "owners": [],
+      "pending": "raon-zena 앱의 ask_epoch × privacy_epoch 레이스(pd_bridge)가 아직 없다"
+    },
+    {
+      "id": "CR-07",
+      "part": 3,
+      "title": "교차 스코프 다국어 대체 & 400 방어",
+      "given": "한글 옛 공략(to: None, \"20%\") + 영문 새 공략(to: L1, \"15%\")",
+      "expect": [
+        "로컬 Confirmed { value_diff: (\"20%\", \"15%\") }",
+        "old.to != new.to 면 서버 pd_supersede 를 부르지 않는다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-relay",
+          "test": "cr07_"
+        }
+      ]
+    },
+    {
+      "id": "CR-08",
+      "part": 3,
+      "title": "조건부 병존 보호 & 부정 반전",
+      "given": "\"1페이즈 20%\" vs \"2페이즈 15%\" / \"회피 가능\" → \"회피 불가\"",
+      "expect": [
+        "앞은 둘 다 Active",
+        "뒤는 Duplicate 로 합치지 않고 Supersedes"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-relay",
+          "test": "cr08_"
+        }
+      ]
+    },
+    {
+      "id": "CR-09",
+      "part": 3,
+      "title": "제3자 로컬 격리 & 자가 복권",
+      "given": "남의 옛 버전을 감지(403 회피) 뒤 새 글이 전역 Discount 로 떨어진다",
+      "expect": [
+        "감지 즉시 로컬 grade −2 격리",
+        "새 글이 떨어지면 옛 버전을 자동 복권"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-relay",
+          "test": "cr09_"
+        }
+      ]
+    },
+    {
+      "id": "CR-10",
+      "part": 4,
+      "title": "무원문 무블로킹 3단 역해석",
+      "given": "원격 Premium 3건 (NavMap 해시 일치 1, ref_ 가 내 미러 노트와 일치 1, 미일치 1)",
+      "expect": [
+        "15초 블로킹 그래프 호출 0번",
+        "화면 라벨 1 · 내 스레드 1 복원 + 1건은 [서버 여론] 한 줄 (지어낸 글 0)",
+        "그래프를 묻더라도 200ms 안에 포기"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cr10_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-mcp/src/graph.rs",
+          "test": "cr10_"
+        }
+      ]
+    },
+    {
+      "id": "CR-11",
+      "part": 4,
+      "title": "rejected 영구 배제 · missing 보존 & FactsOnly",
+      "given": "rejected 내 기록 1 + missing 개인 메모 1 + 모두 Unrated(E = 1.2) 인 후보",
+      "expect": [
+        "rejected 는 빠진다",
+        "missing 은 로컬 메모로 남는다",
+        "미판정 후보는 [사실기록-판정전] (\"추천\" 없음)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "apps/core/src/pipeline.rs",
+          "test": "cr11_"
+        },
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cr11_"
+        }
+      ]
+    },
+    {
+      "id": "CR-12",
+      "part": 4,
+      "title": "송출 대사 대조 노출 장부 & 프리픽스 불변",
+      "given": "Slot 1(회피) · Slot 2(항아리) · Slot 3(대방패, 경고) 를 넣고 실제로는 회피 · 대방패만 말함",
+      "expect": [
+        "Slot 1 만 RecommendedSolution(1.0)",
+        "Slot 3 은 WarnedTrap",
+        "말하지 않은 Slot 2 는 등록하지 않는다",
+        "프리픽스 바이트 그대로"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cr12_"
+        }
+      ]
+    }
+  ]
+}

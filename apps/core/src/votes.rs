@@ -7,9 +7,13 @@
 //! - `verdicts_cache`: 서버가 계산한 판정(GET /evaluations/verdicts)을 그대로 둔다. 앱은 판정을 다시 계산하지 않는다.
 //!   판정 규칙은 서버 cron과 raon-zena가 계산하고, 계약은 contracts/verdict_v1.json이다.
 //!
-//! 재시도 규칙은 평가 보관함(`queue.rs`)과 같고, 다른 점은 두 가지다.
-//! - 투표끼리는 순서가 없다. 일시 오류는 그 항목만 미루고 다음 항목을 보낸다. 연결이 없을 때만 멈춘다.
+//! 재시도 규칙은 평가 보관함(`queue.rs` 의 [`crate::queue::SyncFailure`] 다섯 갈래)과 같고, 다른 점은 두 가지다.
+//! - 투표끼리는 순서가 없다. 일시 오류는 그 항목만 미루고 다음 항목을 보낸다. 연결이 없거나, 401 · 403(다시 로그인할
+//!   때까지) · 429(Retry-After 뒤까지)일 때만 멈춘다. 이 셋은 시도 횟수를 세지 않는다(예전에는 50초 만에 실패로 끝냈다).
 //! - 본문이 "evaluation not found"인 404는 평가가 서버에 없다는 뜻이라 바로 거부한다. 다른 404는 설정 문제일 수 있어 재시도한다.
+//!
+//! 못 보낸 표는 [`MAX_QUEUED_VOTES`] 까지 둔다. 넘치면 가장 오래된 결과 표(`vote_outcome`, 자동)부터 지우고,
+//! 사용자가 직접 누른 표(`vote`)는 지우지 않는다(그것만 남았으면 새 표를 받지 않는다: queue_full).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -27,9 +31,11 @@ use serde::Serialize;
 use crate::api::{new_request_id, EvalBackend, VerdictDto, VoteRequest, VoteResponse};
 use crate::error::AppError;
 use crate::local::{signature, sql_str, storage};
-use crate::queue::{now_ms, MAX_SERVER_ATTEMPTS};
+use crate::queue::{classify_failure, now_ms, SyncFailure, MAX_SERVER_ATTEMPTS};
 
 pub const VOTES_TABLE: &str = "votes_local";
+/// 못 보낸 표의 상한 (서로 다른 평가 수. 같은 (평가, 종류)는 이미 한 행으로 합쳐진다)
+pub const MAX_QUEUED_VOTES: usize = 2_000;
 pub const VERDICTS_TABLE: &str = "verdicts_cache";
 /// 캐시에 없던 평가를 대체로 표시할 때 적는 판정 규칙 (서버 cron 의 RECIPE 와 같음)
 const SUPERSEDED_RECIPE: &str = "pd-verdict/1";
@@ -131,6 +137,10 @@ pub struct VoteFlushReport {
     pub remaining: usize,
     /// 연결이 없어 멈춘 이유
     pub stopped: Option<String>,
+    /// 401 · 403 으로 멈췄다: 다시 로그인할 때까지 보내지 않는다
+    pub auth_required: bool,
+    /// 429 로 멈췄다: 이만큼 뒤에 다시 보낸다 (밀리초)
+    pub retry_after_ms: Option<u64>,
     /// 로컬 저장소에 상태를 쓰지 못한 이유
     pub persist_error: Option<String>,
 }
@@ -329,12 +339,14 @@ fn in_list(column: &str, values: &[String]) -> String {
 
 /// 404 본문이 "평가 없음"인지 (서버 workers/www/src/evaluations.ts의 메시지)
 fn is_missing_evaluation(status: u16, message: &str) -> bool {
-    status == 404 && message.contains("evaluation not found")
+    crate::queue::names_missing_target(status, message)
 }
 
 pub struct VoteStore {
     votes: Table,
     verdicts: Table,
+    /// 못 보낸 표의 상한 ([`MAX_QUEUED_VOTES`], 시험에서만 줄인다)
+    max_queued: usize,
 }
 
 impl VoteStore {
@@ -349,7 +361,14 @@ impl VoteStore {
         Ok(Self {
             votes: open_table(&conn, VOTES_TABLE, votes_schema()).await?,
             verdicts: open_table(&conn, VERDICTS_TABLE, verdicts_schema()).await?,
+            max_queued: MAX_QUEUED_VOTES,
         })
+    }
+
+    #[cfg(test)]
+    fn with_cap(mut self, max_queued: usize) -> Self {
+        self.max_queued = max_queued;
+        self
     }
 
     async fn fetch_votes(&self, filter: String) -> Result<Vec<VoteRecord>, AppError> {
@@ -378,6 +397,8 @@ impl VoteStore {
     }
 
     /// 표를 남긴다. 같은 (평가, 종류)에 아직 못 보낸 표가 있으면 그 행을 지우고 새 request_id로 새 행을 만든다.
+    /// 못 보낸 표가 [`MAX_QUEUED_VOTES`] 에 닿았으면 가장 오래된 결과 표(vote_outcome)를 지워 자리를 만든다.
+    /// 직접 누른 표만 남았으면 받지 않는다 (queue_full).
     pub async fn put_vote(&self, eval_id: &str, kind: VoteKind, value: i32) -> Result<VoteRecord, AppError> {
         if !matches!(value, -1..=1) {
             return Err(AppError::InvalidInput(format!("value must be 1, -1 or 0, got {value}")));
@@ -392,6 +413,23 @@ impl VoteStore {
             ))
             .await
             .map_err(storage)?;
+        let queued = self.queued_count().await?;
+        if queued >= self.max_queued {
+            let oldest_outcomes = self
+                .fetch_votes(format!(
+                    "state = {} AND kind = {}",
+                    sql_str(VoteState::Queued.as_str()),
+                    sql_str(VoteKind::VoteOutcome.as_str())
+                ))
+                .await?;
+            let need = queued + 1 - self.max_queued;
+            if oldest_outcomes.len() < need {
+                return Err(AppError::QueueFull(queued));
+            }
+            // fetch_votes 는 created_at 순이다: 앞쪽이 가장 오래된 표
+            let ids: Vec<String> = oldest_outcomes.into_iter().take(need).map(|r| r.request_id).collect();
+            self.votes.delete(&in_list("request_id", &ids)).await.map_err(storage)?;
+        }
         let rec = VoteRecord {
             request_id: new_request_id(),
             eval_id: eval_id.to_string(),
@@ -410,6 +448,14 @@ impl VoteStore {
 
     pub async fn queued(&self) -> Result<Vec<VoteRecord>, AppError> {
         self.fetch_votes(format!("state = {}", sql_str(VoteState::Queued.as_str()))).await
+    }
+
+    /// 못 보낸 표의 수 (행을 읽지 않고 센다). 보내기 없이도 SyncLoop 가 투표만 남은 상태를 알 수 있게 한다
+    pub async fn queued_count(&self) -> Result<usize, AppError> {
+        self.votes
+            .count_rows(Some(format!("state = {}", sql_str(VoteState::Queued.as_str()))))
+            .await
+            .map_err(storage)
     }
 
     pub async fn get(&self, request_id: &str) -> Result<Option<VoteRecord>, AppError> {
@@ -492,6 +538,21 @@ impl VoteStore {
                     let reason = format!("server returned {status}: {message}");
                     self.persist(&mut rec, VoteState::Rejected, None, Some(reason.clone()), &mut report).await;
                     report.rejected.push(VoteRejected { request_id: rec.request_id.clone(), eval_id: rec.eval_id.clone(), reason });
+                }
+                // 401 · 403 · 429 는 표 탓이 아니다: 시도 횟수를 세지 않고 멈춘다 (남은 표는 그대로 다음에)
+                Err(e) if matches!(classify_failure(&e), SyncFailure::AuthHold { .. } | SyncFailure::RateLimited { .. }) => {
+                    match classify_failure(&e) {
+                        SyncFailure::AuthHold { .. } => {
+                            report.auth_required = true;
+                            report.stopped = Some(format!("auth_required: {e}"));
+                        }
+                        SyncFailure::RateLimited { retry_after_ms } => {
+                            report.retry_after_ms = Some(retry_after_ms);
+                            report.stopped = Some(format!("rate_limited: {e}"));
+                        }
+                        _ => {}
+                    }
+                    report.remaining += 1;
                 }
                 Err(e) => {
                     rec.attempts += 1;
@@ -682,6 +743,59 @@ mod tests {
         let r = store.flush(&server).await;
         assert_eq!((r.remaining, r.rejected.len()), (0, 1));
         assert_eq!(store.get(&b.request_id).await.unwrap().unwrap().state, VoteState::Failed);
+    }
+
+    // FC-12 (투표 쪽): 401 · 429 는 시도 횟수를 세지 않고 멈춘다. 60초가 지나도 표는 그대로 남고, 풀리면 바로 보낸다
+    #[tokio::test]
+    async fn fc12_auth_and_rate_limits_never_fail_a_vote() {
+        let store = VoteStore::open(temp_dir("votes-auth-hold")).await.unwrap();
+        let a = store.put_vote(EVAL, VoteKind::Vote, 1).await.unwrap();
+        store.put_vote(OTHER, VoteKind::Vote, -1).await.unwrap();
+        assert_eq!(store.queued_count().await.unwrap(), 2);
+        let server = VoteServer::default();
+        for round in 0..6 {
+            let status = if round < 3 { 401 } else { 429 };
+            *server.script.lock().unwrap() = vec![Err(AppError::Server { status, message: "scripted".into() })];
+            let r = store.flush(&server).await;
+            assert_eq!((r.sent.len(), r.rejected.len(), r.remaining), (0, 0, 2), "round {round}");
+            if status == 401 {
+                assert!(r.auth_required && r.stopped.as_deref().unwrap().starts_with("auth_required"));
+            } else {
+                assert_eq!(r.retry_after_ms, Some(crate::queue::DEFAULT_RETRY_AFTER_MS));
+            }
+            let rec = store.get(&a.request_id).await.unwrap().unwrap();
+            assert_eq!((rec.state, rec.attempts), (VoteState::Queued, 0), "round {round}");
+        }
+        let r = store.flush(&server).await;
+        assert_eq!((r.sent.len(), r.remaining), (2, 0));
+        assert_eq!(store.queued_count().await.unwrap(), 0);
+    }
+
+    // E-17 (투표 쪽): 상한에 닿으면 가장 오래된 결과 표(vote_outcome)부터 지우고, 직접 누른 표는 지우지 않는다
+    #[tokio::test]
+    async fn the_vote_queue_is_bounded_and_manual_votes_are_kept() {
+        assert_eq!(MAX_QUEUED_VOTES, 2_000);
+        // 2,000 행을 채우면 느리므로 상한을 3 으로 줄여 같은 규칙을 시험한다
+        let store = VoteStore::open(temp_dir("votes-cap")).await.unwrap().with_cap(3);
+        let id = |i: usize| format!("0190f0a0-0000-7000-8000-{i:012}");
+        let old_outcome = store.put_vote(&id(1), VoteKind::VoteOutcome, 1).await.unwrap();
+        let new_outcome = store.put_vote(&id(2), VoteKind::VoteOutcome, -1).await.unwrap();
+        let manual = store.put_vote(&id(3), VoteKind::Vote, 1).await.unwrap();
+        // 같은 (평가, 종류)는 한 행으로 합쳐지므로 상한에 닿아도 지울 것이 없다
+        let changed = store.put_vote(&id(3), VoteKind::Vote, -1).await.unwrap();
+        assert_eq!(store.queued_count().await.unwrap(), 3);
+        assert!(store.get(&manual.request_id).await.unwrap().is_none(), "바뀐 표는 새 request_id");
+        // 넷째 평가: 가장 오래된 결과 표가 자리를 비운다
+        store.put_vote(&id(4), VoteKind::Vote, 1).await.unwrap();
+        assert_eq!(store.queued_count().await.unwrap(), 3);
+        assert!(store.get(&old_outcome.request_id).await.unwrap().is_none());
+        assert!(store.get(&new_outcome.request_id).await.unwrap().is_some());
+        store.put_vote(&id(5), VoteKind::Vote, 1).await.unwrap();
+        assert!(store.get(&new_outcome.request_id).await.unwrap().is_none());
+        // 직접 누른 표만 남았다: 새 표를 받지 않는다 (지우지 않는다)
+        assert!(matches!(store.put_vote(&id(6), VoteKind::Vote, 1).await, Err(AppError::QueueFull(3))));
+        assert!(store.get(&changed.request_id).await.unwrap().is_some());
+        assert_eq!(store.queued_count().await.unwrap(), 3);
     }
 
     #[tokio::test]

@@ -339,6 +339,38 @@ pub fn new_request_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 같은 저장을 같은 키로 묶는 시간 칸 (5초). 응답을 잃고 다시 누른 저장(D-03)이 두 건이 되지 않게 한다
+pub const IDEMPOTENT_WINDOW_MS: i64 = 5_000;
+
+/// 저장의 결정적 멱등 키 (D-03): `"idemp-"` + `hex(SHA-256(cc \0 to \0 bcc \0 부모 \0 text_hash \0 ⌊now / 5초⌋))` 앞 48자 = 54자.
+///
+/// - 5초 칸 안에서 같은 곳(cc) · 같은 대상(to) · 같은 콘텐츠 주소(bcc) · 같은 부모에 같은 원문을 다시 저장하면 같은 키다.
+///   그래서 응답을 잃고 다시 누른 저장은 보관함에 한 행만 남고, 서버도 같은 request_id 로 처음 결과를 돌려준다.
+/// - 서버는 같은 request_id 를 다른 내용(cc · ref · to · bcc)으로 보내면 409 로 거부한다(fix-eval-replay-mismatch).
+///   그 칸이 모두 키에 들어가므로, 다른 답글 · 다른 대상에 같은 문장을 쓰면 다른 키가 되어 409 가 나지 않는다.
+/// - 형식은 서버 검사(16 ~ 64자, `[A-Za-z0-9_-]`)를 지킨다: 소문자 hex 와 `-` 만 쓴다.
+///
+/// `parent_key` 는 서버 부모 UUID 또는 `local:<로컬 id>`, `text_hash_hex` 는 [`text_hash`] 다.
+pub fn derive_idempotent_request_id(
+    cc: &str,
+    to: Option<&str>,
+    bcc: Option<&str>,
+    parent_key: Option<&str>,
+    text_hash_hex: &str,
+    now_ms: i64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let bucket = now_ms.div_euclid(IDEMPOTENT_WINDOW_MS);
+    let mut h = Sha256::new();
+    for part in [cc, to.unwrap_or(""), bcc.unwrap_or(""), parent_key.unwrap_or(""), text_hash_hex] {
+        h.update(part.as_bytes());
+        h.update([0u8]);
+    }
+    h.update(bucket.to_string().as_bytes());
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("idemp-{}", &hex[..48])
+}
+
 /// 원문의 SHA-256 (hex 소문자 64자). 서버는 받은 원문으로 같은 값을 계산해 비교한다.
 pub fn text_hash(text: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -547,6 +579,30 @@ mod tests {
         assert!(v.get("from").is_none());
         assert!(v.get("to").is_none());
         assert!(v.get("ref_").is_none());
+    }
+
+    // D-03 · FC-10: 5초 칸 안의 같은 저장은 같은 키, 서버가 재전송에서 맞춰 보는 칸(cc · 부모 · to · bcc)이 하나라도 다르면 다른 키
+    #[test]
+    fn idempotent_request_ids_follow_the_five_second_window_and_every_replay_field() {
+        let h = text_hash("같은 문장");
+        let key = |cc: &str, to: Option<&str>, bcc: Option<&str>, parent: Option<&str>, now: i64| {
+            derive_idempotent_request_id(cc, to, bcc, parent, &h, now)
+        };
+        let base = key("example.com", None, None, None, 10_000);
+        assert_eq!(base.len(), 54);
+        assert!(base.starts_with("idemp-") && base[6..].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_eq!(base, key("example.com", None, None, None, 14_999), "같은 5초 칸");
+        assert_ne!(base, key("example.com", None, None, None, 15_000), "다음 칸");
+        let to = "0x1111111111111111111111111111111111111111";
+        let bcc = "0x2222222222222222222222222222222222222222";
+        assert_ne!(base, key("example.org", None, None, None, 10_000));
+        assert_ne!(base, key("example.com", Some(to), None, None, 10_000));
+        assert_ne!(base, key("example.com", None, Some(bcc), None, 10_000));
+        assert_ne!(base, key("example.com", None, None, Some("local:local-1"), 10_000));
+        assert_ne!(key("example.com", None, None, Some("local:local-1"), 10_000), key("example.com", None, None, Some("local:local-2"), 10_000));
+        // 칸 경계가 섞이지 않는다: to 와 bcc 를 바꿔 넣으면 다른 키
+        assert_ne!(key("example.com", Some(to), Some(bcc), None, 10_000), key("example.com", Some(bcc), Some(to), None, 10_000));
+        assert_ne!(base, derive_idempotent_request_id("example.com", None, None, None, &text_hash("다른 문장"), 10_000));
     }
 
     #[test]

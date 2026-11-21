@@ -8,14 +8,23 @@
 //!
 //! 기준은 premium-discount 의 `contracts/wallet_v1.json`(ethers 로 뽑은 값)이다. 시험이 그 값을 그대로 낸다.
 //! 서버(TypeScript)는 같은 계약으로 `workers/www/src/auth.ts` 의 `verifyWalletRequest` 를 시험한다.
+//!
+//! 개인 화면 보호도 이 crate 의 단어표와 지우개를 쓴다: [`detect_seed_phrase_span`] 은 글 속 시드 구문을 공식 2048단어표로
+//! 찾고(영어 문장 12낱말은 걸리지 않는다), [`is_bip39_word`] · [`validate_phrase`] 는 낱말 하나 · 구문 하나(체크섬 포함)를
+//! 본다. [`secret`] 은 지갑이 쓰는 `zeroize` 로 민감한 글을 0 으로 덮는다 ([`redact_seed_phrases`] 는 시드 구문만 가린다).
 
 mod bip32;
-mod bip39;
+pub mod bip39;
 mod eth;
 mod request;
+pub mod secret;
 mod wallet;
 
-pub use bip39::{generate_phrase, normalize_phrase, PhraseError, PHRASE_WORDS};
+pub use bip39::{
+    detect_seed_phrase_span, generate_phrase, is_bip39_word, is_valid_phrase, normalize_phrase, seed_phrase_spans, validate_phrase,
+    PhraseError, PHRASE_LENGTHS, PHRASE_WORDS, SEED_PHRASE_MIN_WORDS,
+};
 pub use eth::{address_of, hash_id, hash_message, recover_address};
 pub use request::{request_message, SignedRequest, HEADER_ADDRESS, HEADER_SIGNATURE, HEADER_TIME, MAX_SKEW_MS, REQUEST_VERSION};
+pub use secret::{redact_seed_phrases, redact_span, wipe_bytes, wipe_string, Zeroize, Zeroizing};
 pub use wallet::{Wallet, DERIVATION_PATH};

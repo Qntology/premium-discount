@@ -224,6 +224,33 @@ impl LineClient {
             p.remove(&id);
         }
     }
+
+    /// Stops the app gracefully: `cmd_shutdown` (it drops its core and returns the GPU's cached pool to the driver
+    /// before exiting — a Windows HIP process that exits holding the pool hangs in teardown), then closes its stdin
+    /// (which also ends an older app without the command) and waits up to `grace` for the process to exit. Only an
+    /// app that does not exit in time is killed (by `Drop`). True when it exited by itself.
+    pub fn shutdown(mut self, grace: Duration) -> bool {
+        let deadline = std::time::Instant::now() + grace;
+        if self.is_alive() {
+            let _ = self.call("cmd_shutdown", Value::Null, grace);
+        }
+        if let Ok(mut w) = self.writer.lock() {
+            *w = Box::new(std::io::sink());
+        }
+        let Some(child) = self.child.as_mut() else {
+            return true;
+        };
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.child = None;
+                    return true;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                _ => return false,
+            }
+        }
+    }
 }
 
 impl Drop for LineClient {

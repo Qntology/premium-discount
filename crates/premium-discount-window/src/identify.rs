@@ -4,18 +4,24 @@
 //!   드롭한 곳이 어느 프로그램인지 알 때 쓴다. 좌표는 화면의 물리 픽셀이다.
 //! * [`foreground_window`] – `GetForegroundWindow`. 지금 사용자가 쓰고 있는 프로그램.
 //! * [`exclude_self`] – 찾은 창이 이 프로세스 것이면 `None`. 오버레이가 자기를 알아보는 일을 막는다.
+//! * [`visible_windows_intersecting`] – `EnumWindows` 로 캡처 모니터와 겹치는 보이는 최상위 창을 모두 Z 순서(위부터)로.
+//!   창 자리(DWM 확장 프레임) · 확장 스타일 · 캡처 보호(`GetWindowDisplayAffinity`)를 함께 준다. 개인 화면 판정은
+//!   [`crate::surface::assess_surfaces`] 가 이 목록으로 한다. 픽셀은 하나도 읽지 않는다.
 //!
 //! 실행 파일은 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `QueryFullProcessImageNameW` 로 읽는다.
 //! 보호 프로세스처럼 열 수 없으면 경로 · 이름만 비고 나머지는 채운다. 어떤 실패에도 패닉하지 않는다.
 //!
 //! 제목(`GetWindowTextW`)은 다른 프로세스의 창이면 메시지 없이 읽는다. 이 프로세스의 창이면 그 창의 UI 스레드로
-//! `WM_GETTEXT` 가 가므로, 그 스레드가 멈춰 있는 동안에는 기다린다.
+//! `WM_GETTEXT` 가 가므로, 그 스레드가 멈춰 있는 동안에는 기다린다 ([`visible_windows_intersecting`] 은 이 프로세스의
+//! 창을 제목을 읽기 전에 뺀다).
 //!
-//! Windows 가 아니거나 `win32` 기능을 끄면 두 함수는 늘 `None` 이다.
+//! Windows 가 아니거나 `win32` 기능을 끄면 찾는 함수는 늘 `None` (목록은 빈 목록)이다.
 //!
 //! 찾은 창을 평가 대상(`cc`)으로 쓰려면 [`WindowInfo::app_uri`] 를 premium-discount-schema 의
 //! `envelope::normalize_cc` 에 넘긴다 (`app://code - insiders.exe` → `code-insiders.exe`).
 
+use crate::layer::{WS_EX_LAYERED, WS_EX_TOPMOST, WS_EX_TRANSPARENT};
+use crate::surface::{PxRect, WDA_NONE};
 use std::path::PathBuf;
 
 /// 찾은 최상위 창.
@@ -65,22 +71,71 @@ pub fn foreground_window() -> Option<WindowInfo> {
     imp::foreground_window()
 }
 
+/// 캡처 모니터와 겹치는 보이는 최상위 창 하나 ([`visible_windows_intersecting`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleWindowEntry {
+    pub info: WindowInfo,
+    /// 창 클래스 이름 (`Chrome_WidgetWin_1`, `Windows.UI.Core.CoreWindow` …).
+    pub class_name: String,
+    /// 화면에 그려진 자리, 물리 픽셀. DWM 확장 프레임(보이지 않는 크기 조절 테두리 · 그림자를 뺀 것), 안 되면
+    /// `GetWindowRect`.
+    pub rect: PxRect,
+    /// 확장 창 스타일 (`GWL_EXSTYLE`).
+    pub ex_style: u32,
+    /// `GetWindowDisplayAffinity` 의 값: [`crate::WDA_NONE`] · [`crate::WDA_MONITOR`] ·
+    /// [`crate::WDA_EXCLUDEFROMCAPTURE`].
+    pub display_affinity: u32,
+}
+
+impl VisibleWindowEntry {
+    /// 늘 맨 위 창 (`WS_EX_TOPMOST`).
+    pub fn is_topmost(&self) -> bool {
+        self.ex_style & WS_EX_TOPMOST != 0
+    }
+
+    /// 창이 스스로 화면 캡처를 막았다 (`WDA_MONITOR` · `WDA_EXCLUDEFROMCAPTURE`).
+    pub fn capture_protected(&self) -> bool {
+        self.display_affinity != WDA_NONE
+    }
+
+    /// 밑의 창을 가리는 보통 창인가. 층 창(`WS_EX_LAYERED`: 반투명일 수 있다) · 클릭 통과 창은 덮개로 치지 않는다.
+    pub fn is_opaque(&self) -> bool {
+        self.ex_style & (WS_EX_LAYERED | WS_EX_TRANSPARENT) == 0
+    }
+}
+
+/// 캡처 사각형(물리 픽셀, 보통 DXGI 출력의 `DesktopCoordinates`)과 1픽셀 이상 겹치는 최상위 창들. 보이고
+/// (`IsWindowVisible`) 최소화되지 않았고(`IsIconic`) DWM 이 가려 두지 않은(다른 가상 데스크톱 · 멈춘 UWP 앱) 창만,
+/// Z 순서 위부터(`EnumWindows` 가 주는 차례) 준다. 이 프로세스의 창(오버레이)은 뺀다. 픽셀은 하나도 읽지 않는다.
+///
+/// 결과는 [`crate::surface::assess_surfaces`] 에 넘긴다. Windows 가 아니거나 `win32` 기능을 끄면 늘 빈 목록이다.
+pub fn visible_windows_intersecting(capture: PxRect) -> Vec<VisibleWindowEntry> {
+    imp::visible_windows(capture)
+}
+
 #[cfg(all(windows, feature = "win32"))]
 mod imp {
-    use super::WindowInfo;
-    use std::ffi::OsString;
+    use super::{VisibleWindowEntry, WindowInfo};
+    use crate::surface::{PxRect, WDA_NONE};
+    use std::collections::HashMap;
+    use std::ffi::{c_void, OsString};
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
+    use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, POINT,
+        CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM, POINT, RECT,
+    };
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetAncestor, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, WindowFromPoint, GA_ROOT,
+        EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowDisplayAffinity,
+        GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
     };
 
     pub fn window_at(x: i32, y: i32) -> Option<WindowInfo> {
@@ -180,11 +235,124 @@ mod imp {
         buf.truncate(n.clamp(0, len) as usize);
         String::from_utf16_lossy(&buf)
     }
+
+    pub fn visible_windows(capture: PxRect) -> Vec<VisibleWindowEntry> {
+        let mut hwnds: Vec<HWND> = Vec::new();
+        // SAFETY: 콜백은 아래 collect 이고 lparam 은 hwnds 의 주소다. EnumWindows 는 돌아오기 전에만 콜백을
+        // 부르며, 그동안 hwnds 는 이 함수 안에 살아 있다.
+        unsafe { EnumWindows(Some(collect), &mut hwnds as *mut Vec<HWND> as LPARAM) };
+        let me = std::process::id();
+        let mut images: HashMap<u32, Option<PathBuf>> = HashMap::new();
+        let mut out = Vec::new();
+        for hwnd in hwnds {
+            // SAFETY: hwnd 를 넘기기만 한다 (그 사이 닫힌 창이면 FALSE 를 돌려줄 뿐이다).
+            let shown = unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 };
+            if !shown || cloaked(hwnd) {
+                continue;
+            }
+            let Some(rect) = frame_rect(hwnd) else {
+                continue;
+            };
+            if !rect.intersects(capture) {
+                continue;
+            }
+            let mut pid = 0u32;
+            // SAFETY: pid 는 이 함수의 지역 변수이고 호출 동안 살아 있다.
+            if unsafe { GetWindowThreadProcessId(hwnd, &mut pid) } == 0 || pid == me {
+                continue; // 그 사이 닫힌 창, 또는 이 프로세스의 창 (제목을 읽으면 이 UI 스레드로 WM_GETTEXT 가 간다)
+            }
+            let exe_path = images
+                .entry(pid)
+                .or_insert_with(|| if pid == 0 { None } else { image_path(pid) })
+                .clone();
+            let exe_name = exe_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned());
+            let mut affinity = WDA_NONE;
+            // SAFETY: affinity 는 지역 변수다. 실패하면(닫힌 창) 아무것도 막지 않은 것으로 둔다.
+            if unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) } == 0 {
+                affinity = WDA_NONE;
+            }
+            // SAFETY: hwnd 를 넘기기만 한다. 확장 스타일은 32비트 값이라 GetWindowLongW 로 충분하다.
+            let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+            out.push(VisibleWindowEntry {
+                info: WindowInfo {
+                    hwnd: hwnd as isize,
+                    pid,
+                    exe_path,
+                    exe_name,
+                    title: title(hwnd),
+                },
+                class_name: class_name(hwnd),
+                rect,
+                ex_style,
+                display_affinity: affinity,
+            });
+        }
+        out
+    }
+
+    /// EnumWindows 콜백: 창 핸들을 모은다.
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: lparam 은 visible_windows 의 hwnds 를 가리키고, 이 콜백은 EnumWindows 가 도는 동안만 불린다.
+        let list = unsafe { &mut *(lparam as *mut Vec<HWND>) };
+        list.push(hwnd);
+        1 // 계속
+    }
+
+    /// DWM 이 가려 둔 창: 보인다고 하지만 그려지지 않는다 (다른 가상 데스크톱, 멈춘 UWP 앱).
+    fn cloaked(hwnd: HWND) -> bool {
+        let mut v = 0u32;
+        // SAFETY: v 는 지역 u32 이고 그 크기를 넘긴다.
+        let hr = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED as u32,
+                &mut v as *mut u32 as *mut c_void,
+                size_of::<u32>() as u32,
+            )
+        };
+        hr == 0 && v != 0
+    }
+
+    /// 화면에 그려진 자리: DWM 확장 프레임(늘 물리 픽셀). 안 되면 GetWindowRect. 빈 사각형이면 `None`.
+    fn frame_rect(hwnd: HWND) -> Option<PxRect> {
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: r 은 지역 RECT 이고 그 크기를 넘긴다.
+        let hr = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                &mut r as *mut RECT as *mut c_void,
+                size_of::<RECT>() as u32,
+            )
+        };
+        // SAFETY: 위와 같다.
+        if hr != 0 && unsafe { GetWindowRect(hwnd, &mut r) } == 0 {
+            return None;
+        }
+        let rect = PxRect::new(r.left, r.top, r.right, r.bottom);
+        (!rect.is_empty()).then_some(rect)
+    }
+
+    fn class_name(hwnd: HWND) -> String {
+        let mut buf = [0u16; 256];
+        // SAFETY: buf 는 256 칸이고 그 크기를 넘긴다. 함수는 널을 포함해 그 안에만 쓴다.
+        let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        String::from_utf16_lossy(&buf[..n.clamp(0, 255) as usize])
+    }
 }
 
 #[cfg(not(all(windows, feature = "win32")))]
 mod imp {
-    use super::WindowInfo;
+    use super::{VisibleWindowEntry, WindowInfo};
+    use crate::surface::PxRect;
 
     pub fn window_at(_x: i32, _y: i32) -> Option<WindowInfo> {
         None
@@ -192,6 +360,10 @@ mod imp {
 
     pub fn foreground_window() -> Option<WindowInfo> {
         None
+    }
+
+    pub fn visible_windows(_capture: PxRect) -> Vec<VisibleWindowEntry> {
+        Vec::new()
     }
 }
 
@@ -302,5 +474,30 @@ mod win32_tests {
             Some(w) => check(&format!("window_at({cx}, {cy})"), &w),
             None => println!("window_at({cx}, {cy}): 창이 없다"),
         }
+    }
+
+    #[test]
+    fn visible_windows_on_the_whole_desktop() {
+        // 모든 모니터를 덮는 사각형: 보이는 창을 모두 받는다 (서비스 세션이면 빈 목록일 수 있다)
+        let desktop = PxRect::new(-32_768, -32_768, 32_767, 32_767);
+        let list = visible_windows_intersecting(desktop);
+        for w in &list {
+            assert!(!w.info.is_current_process(), "이 프로세스의 창은 뺀다");
+            assert!(!w.rect.is_empty() && w.rect.intersects(desktop));
+            assert_ne!(w.info.hwnd, 0);
+        }
+        let verdict = crate::assess_surfaces(&list, desktop);
+        println!(
+            "{} visible windows; signals {:?}",
+            list.len(),
+            verdict
+                .hits
+                .iter()
+                .map(|h| (h.signal, h.exe_name.as_deref(), h.occluded))
+                .collect::<Vec<_>>()
+        );
+        // 어느 모니터에도 없는 사각형에는 창이 없다
+        let nowhere = PxRect::new(i32::MIN, i32::MIN, i32::MIN + 1, i32::MIN + 1);
+        assert!(visible_windows_intersecting(nowhere).is_empty());
     }
 }

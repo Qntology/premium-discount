@@ -282,6 +282,11 @@ fn host_filter(host: &str) -> String {
     format!("host = {}", sql_str(&host.trim().to_ascii_lowercase()))
 }
 
+/// 시각 컷오프 묘비의 id (사건 id 묘비와 같은 표에 둔다). 사건 id 는 UUID 라 겹치지 않는다
+pub fn cutoff_key(host: &str) -> String {
+    format!("cutoff:{}", host.trim().to_ascii_lowercase())
+}
+
 fn range_filter(range: Option<(i64, i64)>) -> String {
     match range {
         Some((s, e)) => format!(" AND created_at >= {s} AND created_at <= {e}"),
@@ -358,16 +363,64 @@ impl AnalyticStore {
         Ok(self.query(format!("id IN ({list})"), false, None).await?.into_iter().map(|r| (r.id, r.updated_at)).collect())
     }
 
-    /// 서버의 원시 행을 넣는다. 지운 사건(묘비)은 다시 들이지 않고, 구조화된 행은 덮어쓰지 않는다
+    /// 사이트의 시각 컷오프 묘비 (`cutoff:<host>` 행의 deleted_at): 이 시각 이하에 생긴 사건은 다시 들이지 않는다
+    pub async fn cutoff(&self, host: &str) -> Result<Option<i64>, AppError> {
+        let key = cutoff_key(host);
+        let batches: Vec<RecordBatch> = self
+            .tombstones
+            .query()
+            .only_if(format!("id = {}", sql_str(&key)))
+            .execute()
+            .await
+            .map_err(storage)?
+            .try_collect()
+            .await
+            .map_err(storage)?;
+        let mut out: Option<i64> = None;
+        for b in &batches {
+            let col = b
+                .column_by_name("deleted_at")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| AppError::Storage("tombstone table is missing deleted_at".into()))?;
+            for i in 0..b.num_rows() {
+                out = Some(out.map_or(col.value(i), |o| o.max(col.value(i))));
+            }
+        }
+        Ok(out)
+    }
+
+    /// 사이트의 사건 중 `before_ms` 이하에 생긴 것을 모두 지우고 시각 컷오프 묘비를 남긴다 (시나리오 5 WA-12).
+    /// 묘비는 사건 id 묘비와 같은 표에 `id = "cutoff:<host>"`, `deleted_at = max(전 값, before_ms)` 로 둔다: 표의 모양을 바꾸지
+    /// 않으므로 예전 폴더를 그대로 연다. 다음 받기([`AnalyticStore::ingest`])가 이 시각 이하의 사건을 막는다. 지운 수를 돌려준다
+    pub async fn forget_before(&self, host: &str, before_ms: i64) -> Result<usize, AppError> {
+        let host = host.trim().to_ascii_lowercase();
+        let keep = self.cutoff(&host).await?.map_or(before_ms, |c| c.max(before_ms));
+        let batch = RecordBatch::try_new(
+            tombstone_schema(),
+            vec![Arc::new(StringArray::from(vec![cutoff_key(&host)])), Arc::new(Int64Array::from(vec![keep]))],
+        )
+        .map_err(storage)?;
+        let reader = RecordBatchIterator::new(vec![Ok::<_, ArrowError>(batch)], tombstone_schema());
+        let mut merge = self.tombstones.merge_insert(&["id"]);
+        merge.when_matched_update_all(None).when_not_matched_insert_all();
+        merge.execute(Box::new(reader)).await.map_err(storage)?;
+        let filter = format!("{} AND created_at <= {keep}", host_filter(&host));
+        let before = self.table.count_rows(Some(filter.clone())).await.map_err(storage)?;
+        self.table.delete(&filter).await.map_err(storage)?;
+        Ok(before)
+    }
+
+    /// 서버의 원시 행을 넣는다. 지운 사건(id 묘비)과 시각 컷오프 이하의 사건은 다시 들이지 않고, 구조화된 행은 덮어쓰지 않는다
     pub async fn ingest(&self, host: &str, rows: &[RawEventRow]) -> Result<IngestReport, AppError> {
         let host = host.trim().to_ascii_lowercase();
         let mut report = IngestReport { received: rows.len(), ..Default::default() };
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         let tombs = self.tombstoned(&ids).await?;
+        let cutoff = self.cutoff(&host).await?;
         let existing = self.existing_updated(&ids).await?;
         let mut fresh: Vec<AnalyticRow> = Vec::new();
         for r in rows {
-            if tombs.contains(&r.id) {
+            if tombs.contains(&r.id) || cutoff.is_some_and(|c| r.created_at <= c) {
                 report.blocked_tombstoned += 1;
                 continue;
             }
@@ -412,15 +465,20 @@ impl AnalyticStore {
         Ok(report)
     }
 
-    /// 다음 받기의 커서: 이 사이트에서 받은 가장 늦은 (시각, id). 묘비만 남은 사건도 커서를 넘긴다
+    /// 다음 받기의 커서: 이 사이트에서 받은 가장 늦은 (시각, id). 묘비만 남은 사건도 커서를 넘긴다.
+    /// 시각 컷오프가 그보다 늦으면 컷오프부터 받는다 (지운 구간을 다시 내려받지 않는다)
     pub async fn cursor(&self, host: &str) -> Result<Cursor, AppError> {
         let rows = self.query(host_filter(host), false, None).await?;
-        Ok(rows
+        let seen = rows
             .iter()
             .map(|r| (r.created_at, r.id.clone()))
             .max()
             .map(|(since, after_id)| Cursor { since, after_id })
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok(match self.cutoff(host).await? {
+            Some(c) if c > seen.since => Cursor { since: c, after_id: String::new() },
+            _ => seen,
+        })
     }
 
     /// 아직 구조화하지 않은 행 (updated_at = 0)
@@ -561,6 +619,9 @@ pub struct AnalyticReport {
     pub matches: Vec<AnalyticMatch>,
     /// 사람이 읽는 몇 줄 (raon-zena 의 [참고] 줄로도 쓴다)
     pub lines: Vec<String>,
+    /// 표본 신뢰도 (시나리오 5 WA-11): 세션이 premium-discount-analytic 의 `MIN_FUNNEL_SESSIONS` 보다 적으면
+    /// InsufficientSample 이고, 줄에는 오르내림을 단정하는 말 대신 표본이 모자라다고 적는다
+    pub confidence: premium_discount_analytic::report::ReportConfidence,
 }
 
 /// 해석한 질의와 그 기간의 사건으로 리포트를 만든다 (모델 없음). `matches` 는 부르는 쪽이 벡터 검색한 결과
@@ -625,7 +686,11 @@ pub fn build_report(host: &str, query: AnalyticQuery, events: &[WebEvent], match
     for c in choices.iter().take(3) {
         lines.push(format!("선택 '{}': {} ({}/{}번 골라짐)", c.label, c.mark, c.picks, c.exposures));
     }
-    AnalyticReport { host: host.to_string(), query, events: events.len(), sessions: site.sessions, funnel, bottlenecks, choices, matches, lines }
+    let confidence = premium_discount_analytic::report::ReportConfidence::of(site.sessions, None);
+    if let premium_discount_analytic::report::ReportConfidence::InsufficientSample { sessions, min_required } = &confidence {
+        lines.push(format!("표본 부족: 세션 {sessions}건 (최소 {min_required}건)이라 변화는 판단하지 않습니다"));
+    }
+    AnalyticReport { host: host.to_string(), query, events: events.len(), sessions: site.sessions, funnel, bottlenecks, choices, matches, lines, confidence }
 }
 
 /// 사전 일치 해석기 (한 번 만든다)
@@ -713,6 +778,45 @@ mod tests {
         let hits = store.search(&q, 5, "shop.example.com", None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].score > 0.99, "{:?}", hits[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // WA-12: 시각 컷오프 묘비(cutoff:<host>)와 사건 id 묘비가 한 표에서 함께 막는다. 다시 받아도 지운 구간 · 지운 사건은 0건,
+    // 구조화된 행은 덮지 않고, 깨진 행은 broken 으로 세고 나머지는 넣는다
+    #[tokio::test]
+    async fn wa12_cutoff_and_id_tombstones_block_reinsertion_together() {
+        let dir = crate::local::test_support::temp_dir("analytic-cutoff");
+        let store = AnalyticStore::open(&dir).await.unwrap();
+        let rows = vec![
+            raw("e1", 1_000, click(1, "간편결제")),
+            raw("e2", 2_000, click(2, "주문하기")),
+            raw("e3", 3_000, click(3, "쿠폰")),
+            raw("e4", 4_000, click(4, "결제")),
+            RawEventRow { data: "!!".into(), ..raw("e5", 5_000, click(5, "x")) },
+        ];
+        let r = store.ingest("shop.example.com", &rows).await.unwrap();
+        assert_eq!((r.inserted, r.broken), (4, 1));
+        assert_eq!(store.structure(&HashEmbedder, Some("shop.example.com"), 10, 9_000).await.unwrap(), 4);
+
+        // forget(host, before_ms): 2,000 이하 사건 둘을 지우고 컷오프를 남긴다. forget(ids): e4 를 지운다
+        assert_eq!(store.forget_before("Shop.Example.com", 2_000).await.unwrap(), 2);
+        assert_eq!(store.cutoff("shop.example.com").await.unwrap(), Some(2_000));
+        assert_eq!(store.forget(&["e4".to_string()], 9_500).await.unwrap(), 1);
+        // 더 이른 컷오프로 다시 불러도 컷오프는 줄지 않는다
+        store.forget_before("shop.example.com", 1_500).await.unwrap();
+        assert_eq!(store.cutoff("shop.example.com").await.unwrap(), Some(2_000));
+        assert_eq!(store.cutoff("other.example.com").await.unwrap(), None, "사이트마다 따로");
+
+        // 서버가 같은 다섯 행을 다시 보낸다
+        let again = store.ingest("shop.example.com", &rows).await.unwrap();
+        assert_eq!(again.inserted, 0, "{again:?}");
+        assert_eq!(again.blocked_tombstoned, 3, "컷오프 이하 둘 + id 묘비 하나");
+        assert_eq!(again.kept_structured, 1, "e3 는 구조화되어 있어 덮지 않는다");
+        assert_eq!(again.broken, 1);
+        assert_eq!(store.count().await.unwrap(), 1);
+        assert_eq!(store.get("e3").await.unwrap().unwrap().updated_at, 9_000);
+        // 커서는 컷오프보다 앞으로 돌아가지 않는다
+        assert!(store.cursor("shop.example.com").await.unwrap().since >= 2_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

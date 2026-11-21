@@ -13,6 +13,10 @@
 //! * [`text`]      – the text tower and SigLIP2 tokenizer, used when the dictionary changes to compute anchors.
 //! * [`bank`]      – zero-shot screen domains from the dictionary's `vision` nodes and their anchors.
 //! * [`screen`]    – one screen reading: encode, score, locate.
+//!
+//! 개인 화면 보호: 천공 패스의 확장 씨앗에는 개인 화면 도메인의 최고점이 늘 들어가고([`screen::seed_labels`]),
+//! [`screen::read_pass_cancellable`] 은 프레임을 받을 때의 개인 화면 세대가 바뀌면 다음 블록 경계에서 멈춰 패치를 0 으로
+//! 지우고 아무것도 내지 않는다 ([`EpochWatch`] · [`VisionAbort`]). 가린 알림 토스트 칸은 [`PassGuard::masked`] 로 뺀다.
 
 pub mod bank;
 pub mod layout;
@@ -30,8 +34,8 @@ pub use bank::{Acceptance, AnchorBank, VisionDomainSpec, VisionKind, VisionScore
 pub use layout::Layout;
 pub use premium_discount_sensor::naflex::{Preprocess, Resample};
 pub use perforate::{ExpandCfg, PerfPattern, PerfReport, PerforatedCfg};
-pub use screen::{ScreenConfig, ScreenEncoder, ScreenReading};
-pub use tower::{VisionTower, WeightFormat};
+pub use screen::{PassGuard, ScreenConfig, ScreenEncoder, ScreenReading};
+pub use tower::{EpochWatch, VisionAbort, VisionTower, WeightFormat};
 
 /// The checkpoint file of a Raon-VisionEncoder directory (or the file itself).
 pub fn checkpoint(path: &Path) -> PathBuf {

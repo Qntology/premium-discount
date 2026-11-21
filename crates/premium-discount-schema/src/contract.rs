@@ -120,6 +120,18 @@ pub struct SearchArgs {
     /// 등급 필터: premium | discount | rated (빈 문자열은 없음)
     #[serde(default)]
     pub tier: Option<String>,
+    /// 스코프 부스트 (시나리오 3 Part 2): 거르지 않고 순위만 올린다. 없으면 예전과 같은 병합이다
+    #[serde(default)]
+    pub scope: Option<SearchScope>,
+}
+
+/// `cmd_search_merged` 의 스코프 부스트: 지금 체크포인트의 대상(L1, +0.12)과 질문에 나온 개체들의 대상(L2, +0.06)
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct SearchScope {
+    #[serde(default)]
+    pub l1_checkpoint_to: Option<String>,
+    #[serde(default)]
+    pub l2_entity_tos: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -190,10 +202,61 @@ pub struct AnalyticReportArgs {
     pub top_k: Option<u32>,
 }
 
-/// 웹 행동 분석: 사건 지우기 (`cmd_analytic_forget`). 지운 id 는 다시 받지 않는다(묘비)
-#[derive(Debug, Clone, Deserialize)]
+/// 웹 행동 분석: 사건 지우기 (`cmd_analytic_forget`). 지운 사건은 다시 받지 않는다(묘비). 두 가지를 함께 받는다:
+/// 사건 id 목록(`ids`, 데스크톱 화면이 쓰는 예전 모양)과 사이트의 어느 시각까지 모두(`host` + `before_ms`, MCP `pd_analytic`).
+/// 예전 JSON(`{"ids": [...]}`)은 그대로 읽힌다
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AnalyticForgetArgs {
+    /// 하나씩 지울 사건 id
+    #[serde(default)]
     pub ids: Vec<String>,
+    /// 기간을 지울 사이트 (`shop.example.com`, 주소를 넣어도 호스트만 쓴다). `before_ms` 와 함께 쓴다
+    #[serde(default)]
+    pub host: Option<String>,
+    /// 이 시각(epoch ms) 이하의 그 사이트 사건을 모두 지우고 `cutoff:<host>` 묘비를 남긴다 (지금보다 늦으면 지금으로)
+    #[serde(default)]
+    pub before_ms: Option<i64>,
+    /// true 면 서버의 원시 사건도 지운다 (`DELETE /analytic/events` 의 host · before). 기본은 기기에서만
+    #[serde(default)]
+    pub flush_remote: bool,
+}
+
+impl AnalyticForgetArgs {
+    /// id 목록으로 지우기 (예전 모양)
+    pub fn by_ids(ids: Vec<String>) -> Self {
+        AnalyticForgetArgs { ids, ..Default::default() }
+    }
+
+    /// 사이트의 `before_ms` 이하를 모두 지우기
+    pub fn before(host: impl Into<String>, before_ms: i64) -> Self {
+        AnalyticForgetArgs { host: Some(host.into()), before_ms: Some(before_ms), ..Default::default() }
+    }
+
+    /// 지울 id (공백을 떼고 빈 것은 뺀다)
+    pub fn id_list(&self) -> Vec<&str> {
+        self.ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+    }
+
+    /// 기간 지우기: (호스트, 컷오프 시각). 컷오프는 `now_ms` 보다 늦지 않다(앞으로 올 사건을 막지 않게). 기간 지우기가 아니면 None.
+    /// 호스트는 공백만 뗀다 (호스트 검사 · 소문자는 앱이 한다)
+    pub fn range(&self, now_ms: i64) -> Option<(&str, i64)> {
+        let host = blank_ref(self.host.as_deref())?;
+        Some((host, self.before_ms?.min(now_ms)))
+    }
+
+    /// 모양 검사: 호스트와 시각은 함께 와야 하고 시각은 양수다. 빈 요청(`{"ids": []}`)은 예전처럼 지울 것이 없는 요청이다
+    pub fn validate(&self) -> Result<(), String> {
+        match (blank_ref(self.host.as_deref()), self.before_ms) {
+            (Some(_), None) => Err("before_ms is required with host".into()),
+            (None, Some(_)) => Err("host is required with before_ms".into()),
+            (_, Some(t)) if t <= 0 => Err("before_ms must be a positive epoch ms".into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn blank_ref(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// 저장 결과. `status`로 구분한다.
@@ -288,6 +351,13 @@ pub struct FlushSummary {
     pub votes_rejected: Vec<VoteRejectedDto>,
     /// 투표 전송이 멈춘 이유
     pub votes_stopped: Option<String>,
+    /// 401 · 403 으로 멈췄다 (평가 · 상태 확인 · 투표 중 하나라도). 다시 로그인할 때까지 주기 동기화를 멈춘다.
+    /// 항목은 지우지 않고 시도 횟수도 세지 않는다
+    #[serde(default)]
+    pub auth_required: bool,
+    /// 429 로 멈췄다: 이만큼(밀리초) 뒤에 다시 보낸다. 항목은 지우지 않고 시도 횟수도 세지 않는다
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 /// 앱이 쓰는 경로와 서버 (화면의 안내문에 보여 준다)
@@ -423,5 +493,35 @@ mod tests {
         assert_eq!(e, serde_json::json!({"kind": "offline", "message": "no network"}));
         assert!(ERROR_KINDS.contains(&"unavailable"));
         assert_eq!(blank_to_none(Some("  ".into())), None);
+    }
+
+    /// WA-12 (인자 쪽): 예전 id 모양과 새 기간 모양을 함께 받는다
+    #[test]
+    fn wa12_forget_args_accept_the_id_form_and_the_range_form() {
+        // 예전 JSON (데스크톱 화면 · 계약 파일) 은 그대로
+        let old: AnalyticForgetArgs = serde_json::from_value(serde_json::json!({"ids": [" e1 ", "", "e2"]})).unwrap();
+        assert_eq!(old.id_list(), ["e1", "e2"]);
+        assert_eq!((old.range(10_000), old.flush_remote), (None, false));
+        assert!(old.validate().is_ok());
+        // MCP pd_analytic 의 기간 모양 (ids 없음)
+        let range: AnalyticForgetArgs = serde_json::from_value(serde_json::json!({"host": " shop.example.com ", "before_ms": 5_000, "flush_remote": true})).unwrap();
+        assert!(range.id_list().is_empty() && range.flush_remote);
+        assert_eq!(range.range(10_000), Some(("shop.example.com", 5_000)));
+        // 지금보다 늦은 컷오프는 지금으로 (앞으로 올 사건을 막지 않는다)
+        assert_eq!(range.range(4_000), Some(("shop.example.com", 4_000)));
+        // 둘을 함께
+        let both: AnalyticForgetArgs = serde_json::from_value(serde_json::json!({"ids": ["e9"], "host": "shop.example.com", "before_ms": 1})).unwrap();
+        assert_eq!((both.id_list(), both.range(9)), (vec!["e9"], Some(("shop.example.com", 1))));
+        // 짝이 맞지 않으면 잘못된 인자
+        assert!(AnalyticForgetArgs { host: Some("shop.example.com".into()), ..Default::default() }.validate().is_err());
+        assert!(AnalyticForgetArgs { before_ms: Some(5), ..Default::default() }.validate().is_err());
+        assert!(AnalyticForgetArgs::before("shop.example.com", 0).validate().is_err());
+        assert!(AnalyticForgetArgs::before("shop.example.com", 5).validate().is_ok());
+        // 빈 요청은 예전처럼 지울 것이 없는 요청이다
+        let empty: AnalyticForgetArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.validate().is_ok() && empty.id_list().is_empty() && empty.range(1).is_none());
+        // 다시 직렬화해도 같은 모양 (MCP 가 앱에 넘긴다)
+        let back: AnalyticForgetArgs = serde_json::from_value(serde_json::to_value(AnalyticForgetArgs::by_ids(vec!["e1".into()])).unwrap()).unwrap();
+        assert_eq!(back.id_list(), ["e1"]);
     }
 }

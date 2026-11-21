@@ -42,6 +42,8 @@ fn ev(kind: EventKind, href: &str, sid: &str, seq: u32, t_ms: i64) -> WebEvent {
         sid: sid.into(),
         seq,
         t_ms,
+        surface: None,
+        tab_group: None,
         target: None,
         item: None,
         related: vec![],

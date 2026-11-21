@@ -45,6 +45,9 @@ pub struct Word {
     /// Universal POS and dependency relation when an analyzer gave them (empty otherwise).
     pub upos: String,
     pub deprel: String,
+    /// 구문 머리: 이 낱말이 기대는 낱말의 번호(0부터, 같은 발화 안). 뿌리이거나 구문 분석이 없으면 None.
+    /// Stanza 분석기가 채우고([`crate::span::unit_heads`]), 모델 없이 시험할 때는 손으로 채운다.
+    pub head: Option<usize>,
     pub role: Role,
     /// Inside the scope of a negation ("앱 끄지 마": 앱, 끄지 and 마).
     pub negated: bool,

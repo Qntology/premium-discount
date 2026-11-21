@@ -1,0 +1,263 @@
+{
+  "contract": "course_nav_v1",
+  "scenario": 1,
+  "title": "타임트라이얼 코스 내비게이션 & 고스트 코칭",
+  "roadmap": "M1",
+  "source": "최종개선안: raon-zena 와 premium-discount 시나리오별 개선 개발 기획안 (24개 Part, 72개 검증 벡터)",
+  "params": {
+    "max_steps": 10,
+    "split_unit_ms": 100,
+    "max_detour_loop_ms": 60000,
+    "tier_min_decided": 3,
+    "sticky": {
+      "occlusion_grace_ms": 600,
+      "min_survival_ratio": 0.3,
+      "rect_ema_alpha": 0.35,
+      "snap_move": 0.12,
+      "contain_ratio": 0.7,
+      "transient_scans": 2,
+      "transient_ms": 250,
+      "row_band": 0.045,
+      "row_overlap": 0.45,
+      "max_numbered": 9
+    },
+    "ghost": {
+      "tier_score": {
+        "premium": 2.0,
+        "neutral": 0.0,
+        "unrated": 0.0,
+        "discount": -3.0
+      },
+      "upgrade_min_ratio": 0.15,
+      "upgrade_min_ms": 1500
+    },
+    "brief": {
+      "split_deadband_ms": 1000,
+      "max_lines": 2,
+      "overlay_iou": 0.05,
+      "viewport": [
+        350,
+        450
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "CN-01",
+      "part": 1,
+      "title": "비인접 서브루프 선축약 & 경과 시간 보존",
+      "given": "S0(0s) → S1(5s) → Modal(8s) → S1(15s) → S2(20s), committed 없음",
+      "expect": [
+        "정규 스텝 [S0, S1, S2]",
+        "course_hash 가 직행 [S0, S1, S2] 와 같다",
+        "S2.split_ms == 20_000 (루프에서 쓴 시간이 사라지지 않는다)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn01_"
+        }
+      ]
+    },
+    {
+      "id": "CN-02",
+      "part": 1,
+      "title": "11스텝 초과 시 기점 · 총시간 보존 & route_marks 생존",
+      "given": "S0(0s) 출발, 경유지 13개, S_goal(95s) 결승 + 고스트 [S0, G1, G2, S_goal]",
+      "expect": [
+        "steps.len() == 10",
+        "steps[0] == S0 이고 split_ms 0",
+        "total_ms == 95_000 (앞을 잘라 시계가 줄지 않는다)",
+        "route_marks(run, ghost) 가 Some"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn02_"
+        }
+      ]
+    },
+    {
+      "id": "CN-03",
+      "part": 1,
+      "title": "committed 순환 동선 보호 & 인접 중복 제거",
+      "given": "Hub(0s) → Shop(10s, committed) → Hub(20s) → Boss(30s), 그리고 12스텝 솎아내기 경계",
+      "expect": [
+        "Shop 스텝을 지우지 않는다",
+        "압축 뒤 잇달아 같은 체크포인트 0건 (서버 검증 통과)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn03_"
+        }
+      ]
+    },
+    {
+      "id": "CN-04",
+      "part": 2,
+      "title": "등급 변동 & 줄 경계 진동 시 번호 불변",
+      "given": "같은 screen_key 에서 A=1, B=2, C=3 배정 뒤 C 가 Premium 으로 오르고 A · B 의 cy 가 ±0.004 흔들린다",
+      "expect": [
+        "A=1, B=2, C=3 그대로 (점멸 0)",
+        "C.tier == Premium 만 바뀐다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/order.rs",
+          "test": "cn04_"
+        }
+      ]
+    },
+    {
+      "id": "CN-05",
+      "part": 2,
+      "title": "비전 격자(cell:*) 표류 계승 & 1틱 파티클 차단",
+      "given": "비전 버튼이 cell:2,3 → cell:2,4 로 0.02 이동 + 빈 배경에 1틱 단독 이벤트(roi:0)",
+      "expect": [
+        "비전 버튼은 번호를 이어받는다",
+        "1틱 단독 이벤트는 번호를 받지 않는다",
+        "영역 안의 작은 이벤트는 부모를 changed 로 표시한다(포함률 ≥ 0.70)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/order.rs",
+          "test": "cn05_"
+        }
+      ]
+    },
+    {
+      "id": "CN-06",
+      "part": 2,
+      "title": "일시 가림 600ms 유예 vs 스크롤 즉시 회수",
+      "given": "정지 화면에서 2번이 300ms 안 보였다 다시 나옴 / scrolled=true 로 1 · 2번이 화면 밖으로, 아래 새 버튼 등장",
+      "expect": [
+        "가림은 원래 2번으로 돌아온다",
+        "스크롤 이탈 번호는 바로 비고 새 버튼이 받는다",
+        "민감 화면이 되면 비전 트랙 0건"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/order.rs",
+          "test": "cn06_"
+        }
+      ]
+    },
+    {
+      "id": "CN-07",
+      "part": 3,
+      "title": "이원 3트랙 결속 & 습관 경로 대비 지름길 승격",
+      "given": "내 코스 [S0, M1, S_goal](Discount, best 30s) + 공개 A(40명, Discount, avg 28s) + 공개 B(15명, Premium, avg 12s), S0 진입",
+      "expect": [
+        "Discount 인 A 를 버리고 B 를 고른다 (next == P2)",
+        "vs_best · vs_record · vs_average 모두 Some",
+        "upgrade_over_habit_ms == Some(18_000)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn07_"
+        }
+      ]
+    },
+    {
+      "id": "CN-08",
+      "part": 3,
+      "title": "우회 이탈(Detouring) 뒤 본선 재합류(Rejoined) & Run.ghost 보존",
+      "given": "고스트 [S0(0s), G1(5s), G2(12s), S_goal(20s)] 를 따라가다 S0 → Alt(3s) → G2(9s) → S_goal(16s)",
+      "expect": [
+        "Alt 에서 Detouring (고스트 핀 유지)",
+        "G2 에서 Rejoined { ghost_index: 2, skipped_steps: 1 }, vs_average == Some(-3_000)",
+        "완주 Run.ghost 에 고스트 해시, route_marks 가 (G1 Discount, G2 Premium)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn08_"
+        }
+      ]
+    },
+    {
+      "id": "CN-09",
+      "part": 3,
+      "title": "제자리 정체 실시간 감지 & 인증 동결 차감",
+      "given": "S0(0s) → G1(4s) (고스트 G1=5s, G2=10s), t=25s 까지 다음 스텝 없음, 그 사이 [10s, 20s] 본인 인증 잠금",
+      "expect": [
+        "vs_record == Some(-1_000) 유지",
+        "동결 10s 를 뺀 유효 경과 15s 로 live_overrun_ms == 5_000"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn09_"
+        }
+      ]
+    },
+    {
+      "id": "CN-10",
+      "part": 4,
+      "title": "창 오프셋 극좌표 · 시선 보정 & 자기 가림 회피",
+      "given": "보조 위치 창 (800, 200, 960×540) 안의 버튼 (0.9, 0.9) + 그 위에 오버레이 창",
+      "expect": [
+        "데스크톱 절대 좌표로 avatar_look · arrow_angle_deg 가 맞는다",
+        "occluded_by_overlay == true"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cn10_"
+        }
+      ]
+    },
+    {
+      "id": "CN-11",
+      "part": 4,
+      "title": "무라벨 해시 무환각 & Unrated FactsOnly",
+      "given": "화면에 없는 다음 StepRef(0xabc…) + 코스 등급 Unrated (decided 2 < 3)",
+      "expect": [
+        "프롬프트에 \"0xabc\" 없음",
+        "[주행 기록-판정전] 머리글",
+        "\"추천\" 낱말 없음"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cn11_"
+        }
+      ]
+    },
+    {
+      "id": "CN-12",
+      "part": 4,
+      "title": "프리픽스 캐시 불변 & 발화 번호 잠금(SpokenSlotLock)",
+      "given": "CourseBrief 를 넣은 뒤 LLM 이 \"2번 성문으로 가자!\" 를 스트리밍하는 중 만석에 새 Premium 진입",
+      "expect": [
+        "system + tools + <think></think> 프리픽스 바이트 100% 같다",
+        "locked_numbers 비트 2 로 2번 슬롯 교체 차단"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "cn12_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/order.rs",
+          "test": "cn12_"
+        }
+      ]
+    }
+  ]
+}

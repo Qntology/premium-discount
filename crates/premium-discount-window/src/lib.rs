@@ -7,8 +7,12 @@
 //! * [`layer`] – 확장 창 스타일(`WS_EX_*`) 비트, 불투명도(알파), 프레임 간격. raon-zena `zena-core::window` 에서 가져왔고,
 //!   그쪽 타입(`WindowLayerMode` · `ReactionLevel`) 대신 [`LayerFlags`] · [`Activity`] 를 받는다.
 //! * [`dock`] – 끌어 둔 창이 제자리(작업 영역 오른쪽 아래)로 돌아가는 0.45초 움직임 (cubic ease-out).
-//! * [`identify`] – 점 아래 창([`window_at`])과 앞 창([`foreground_window`])의 프로세스 · 실행 파일 · 제목.
-//!   Windows 에서 `win32` 기능(기본으로 켜짐)일 때만 실제로 찾고, 그 밖에는 늘 `None` 이다.
+//! * [`identify`] – 점 아래 창([`window_at`])과 앞 창([`foreground_window`])의 프로세스 · 실행 파일 · 제목, 그리고
+//!   캡처 모니터와 겹치는 보이는 창 모두([`visible_windows_intersecting`], Z 순서 위부터).
+//!   Windows 에서 `win32` 기능(기본으로 켜짐)일 때만 실제로 찾고, 그 밖에는 늘 `None` · 빈 목록이다.
+//! * [`surface`] – 그 창 목록으로 보는 개인 화면 신호 ([`assess_surfaces`]): 캡처 보호(`WDA_EXCLUDEFROMCAPTURE`) 창 ·
+//!   결제 오버레이 · 민감 제목은 화면 전체 잠금, 알림 토스트는 그 자리만 가림. 위 창에 남김없이 가린 창은 치지 않는다.
+//!   Win32 없이 돈다.
 //!
 //! 비동기 런타임 · Tauri · winit 에 의존하지 않는다. 창을 실제로 옮기고 스타일을 바꾸는 것은 부르는 쪽이다
 //! (앱은 `main.ts` 의 "단계 창", raon-zena 는 `apps/raon-zena` 의 `SetWindowLongPtrW` · `SetWindowPos`).
@@ -28,9 +32,13 @@ pub mod dock;
 pub mod identify;
 pub mod layer;
 pub mod stage;
+pub mod surface;
 
 pub use dock::{dock_step, ease_out_cubic, DOCK_DURATION};
-pub use identify::{exclude_self, foreground_window, window_at, WindowInfo};
+pub use identify::{
+    exclude_self, foreground_window, visible_windows_intersecting, window_at, VisibleWindowEntry,
+    WindowInfo,
+};
 pub use layer::{
     alpha_u8, ex_style, frame_interval, Activity, LayerFlags, HOVER_ALPHA, HOVER_OPACITY,
     PILL_ALPHA, PILL_OPACITY, VIEWPORT, VIEWPORT_H, VIEWPORT_W, WS_EX_LAYERED, WS_EX_NOACTIVATE,
@@ -40,4 +48,8 @@ pub use stage::{
     classify_pointer, dock_position, effective_stage, grows_to, layout_mode, next_stage,
     place_window, Anchor, LayoutMode, Platform, PointerAction, Position, Size, Stage, StageEvent,
     WorkArea, DOCK_MARGIN, DRAG_THRESHOLD, STAGE_SIZE,
+};
+pub use surface::{
+    assess_surfaces, classify_window, covered_by, sensitive_title, OsSurfaceVerdict, PxRect,
+    SurfaceHit, SurfaceSignal, WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WDA_NONE,
 };

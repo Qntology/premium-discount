@@ -1,6 +1,6 @@
 [package]
 name = "premium-discount-identity"
-description = "익명 계정(사용자가 시드 구문을 보관하는 ethers 지갑)과 hashId · EIP-191 서명 · 요청 서명. 기준은 contracts/wallet_v1.json"
+description = "익명 계정(사용자가 시드 구문을 보관하는 ethers 지갑)과 hashId · EIP-191 서명 · 요청 서명, 글 속 시드 구문 감지 · 비밀 지우기(zeroize). 기준은 contracts/wallet_v1.json"
 version = "0.1.0"
 edition = "2021"
 

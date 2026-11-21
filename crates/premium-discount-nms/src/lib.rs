@@ -6,10 +6,14 @@
 //!
 //! 1. [`korean`] / [`normalize`] – 호출어 떼기([`normalize::set_wake_words`] 로 정함), 받침 조화를 보는 조사 · 서술격 떼기.
 //! 2. [`analyze`] – 역할 분석([`analyze::Analyzer`]): 규칙 분석기, (기능 `stanza`) Stanza 분석기, 부정 범위 표시.
+//!    긴 부정("-지 않- · -지 못하-") · 이중 부정 수([`analyze::negation_counts`]), 역접 · 양보 절 나누기([`analyze::clauses`]),
+//!    구간의 절 위치 · 부정 수([`analyze::read_span`]).
 //! 3. [`embed`]   – [`embed::TextEmbedder`]: 의존 없는 384차원 글자 · 자모 해시 임베더, (기능 `neural`) granite 임베더.
 //! 4. [`domain`]  – [`domain::DomainBank`]`<M, E>`: 정확 · 교착어 접두 일치 먼저, 그다음 bias / prejudice 최대 코사인.
 //!    항목의 내용 `M` 은 부르는 쪽 타입이다.
-//! 5. [`span`]    – 구간 NMS (v1 그리디, v2 이중 센터링 + 마진 게이트 1:1 배정 + SDS 혼동 장부 동점 깨기).
+//! 5. [`span`]    – 구간 NMS (v1 그리디, v2 이중 센터링 + 마진 게이트 1:1 배정 + SDS 혼동 장부 동점 깨기). 창 구간에 더해
+//!    구문 압축 구간([`span::syntactic_spans`]: 의존 구문 머리-논항, 모델이 없으면 조사 뗀 명사구 + 끝 서술어)을 겨루게 한다
+//!    ([`span::span_assign_with`]). 토픽 명사구는 [`span::noun_phrases`].
 //! 6. [`semantic`]– 시간 창 안의 의미 NMS, 적응 중복 하한 `clamp(μ + 3σ, τ, 0.995)`.
 //! 7. [`spatial`] – 공간-글 NMS: 글 유사도 신뢰도, snap / twin IoU 규칙의 상자 억제, 1:1 배타 배정.
 

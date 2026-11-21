@@ -1,0 +1,276 @@
+{
+  "contract": "feedback_credit_v1",
+  "scenario": 4,
+  "title": "화용 피드백 · 이중 센터링 크레딧 & 무손실 동기화",
+  "roadmap": "M0 · M3",
+  "source": "최종개선안: raon-zena 와 premium-discount 시나리오별 개선 개발 기획안 (24개 Part, 72개 검증 벡터)",
+  "params": {
+    "idempotent_window_ms": 5000,
+    "request_id_prefix": "idemp-",
+    "request_id_len": 54,
+    "max_server_attempts": 5,
+    "max_pending_items": 1000,
+    "max_tracking_items": 2000,
+    "retain_ms": 604800000,
+    "max_queued_votes": 2000,
+    "default_retry_after_ms": 60000,
+    "max_unacked_rejections": 32,
+    "maintain_every_ms": 1800000,
+    "retraction_window_ms": 300000,
+    "synergy_split": [
+      0.5,
+      0.5
+    ],
+    "absent": -1.0,
+    "decisive_credit": 0.8,
+    "failure": {
+      "offline": "멈춤 · 횟수 0",
+      "auth_hold": "401 · 403: 멈춤 · 횟수 0 · 재로그인까지",
+      "rate_limited": "429: 멈춤 · 횟수 0 · Retry-After",
+      "transient": "408 · 5xx · 밝혀지지 않은 404: 횟수 +1, 5번이면 실패",
+      "permanent": "400 · 409 · 422 · \"evaluation not found\": 바로 거부"
+    }
+  },
+  "cases": [
+    {
+      "id": "FC-01",
+      "part": 1,
+      "title": "요청문 배제 & 장형 이중 부정",
+      "given": "\"다른 공략 추천해 줘\" vs \"우회하긴 했는데 나쁘지 않았어\"",
+      "expect": [
+        "앞은 None (투표 0건)",
+        "뒤는 라우터가 부정을 버리지 않고 (\"feedback\", +1, 0.5)"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc01_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nms/src",
+          "test": "fc01_"
+        }
+      ]
+    },
+    {
+      "id": "FC-02",
+      "part": 1,
+      "title": "역접 복합문 주절 우선",
+      "given": "\"딜은 쎈데 스태미나가 너무 딸려서 비추\"",
+      "expect": [
+        "앞절 긍정 기각",
+        "주절 기준 (\"feedback\", -1, 1.0)"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc02_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nms/src",
+          "test": "fc02_"
+        }
+      ]
+    },
+    {
+      "id": "FC-03",
+      "part": 1,
+      "title": "자기 실수 귀인 면책 & 반어법 차단",
+      "given": "패배 직후 \"공략은 맞는데 내 손이 꼬였어\" / 고마찰 직후 \"참 좋~은 길이다 죽기 딱 좋네\"",
+      "expect": [
+        "앞은 shield_defeat_outcome == true (패배 -1 을 쌓지 않는다)",
+        "뒤는 sarcasm_blocked == true (긍정 오탐 0)"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc03_"
+        }
+      ]
+    },
+    {
+      "id": "FC-04",
+      "part": 1,
+      "title": "5분 안 기존 표 제자리 철회 (sign = 0)",
+      "given": "\"이거 추천!\"(+1) 60s 뒤 \"아까 말 취소, 2페 막혀서 별로야\"",
+      "expect": [
+        "앞 관측이 제자리에서 sign 0",
+        "-1 하나만 반영 (E == 1.0, v < 0)"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc04_"
+        }
+      ]
+    },
+    {
+      "id": "FC-05",
+      "part": 2,
+      "title": "순항 구간 연대 책임 보호 & N×4 이중 센터링",
+      "given": "체크포인트 A(무마찰 z=−0.8) → B(광클 z=+2.1) 직후 사망(outcome −1)",
+      "expect": [
+        "double_center 가 0.0 으로 퇴화하지 않는다",
+        "병목 B 에 −1.0",
+        "순항 A 는 credit 0.0"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc05_"
+        }
+      ]
+    },
+    {
+      "id": "FC-06",
+      "part": 2,
+      "title": "경고 슬롯(WarnedTrap) 부호 역전 차단",
+      "given": "Slot 1(추천 해법) + Slot 3(패치 전 경고) 브리핑 뒤 클리어(+1)",
+      "expect": [
+        "경고 Slot 3 은 행렬에 넣지 않는다 (+ 크레딧 0.0)",
+        "Slot 1 에만 +1.0"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc06_"
+        }
+      ]
+    },
+    {
+      "id": "FC-07",
+      "part": 2,
+      "title": "N=2 시너지 0.5/0.5 분할 & 교차 시도 outperforms",
+      "given": "보완 조합 2개를 함께 써서 클리어 / 배타 대안 A 3패 뒤 B 3승",
+      "expect": [
+        "앞은 0.5 / 0.5",
+        "뒤는 duel_for_item(B) == (3, 0), B --outperforms--> A"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc07_"
+        }
+      ]
+    },
+    {
+      "id": "FC-08",
+      "part": 3,
+      "title": "DifferKind 4분화 · 영속 FadedRecall & 레시피 비혼합",
+      "given": "(Local Premium, Global Discount) / 감쇠 E = 1.90 상태에서 두 번 조회",
+      "expect": [
+        "WorksForMeOnly",
+        "두 번째 조회에도 FadedRecall",
+        "v1 · v2 원시 수치를 섞지 않는다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc08_"
+        }
+      ]
+    },
+    {
+      "id": "FC-09",
+      "part": 3,
+      "title": "수동 ▼ 핀 즉시 오버라이드 · 되돌리기 & 무전송",
+      "given": "5연승 Premium 기록에 ▼ 를 눌렀다 다시 눌러 해제",
+      "expect": [
+        "첫 클릭에 Discount (PinnedByUser), 서버로 보낼 것 0건",
+        "다시 누르면 원래 Premium"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src",
+          "test": "fc09_"
+        }
+      ]
+    },
+    {
+      "id": "FC-10",
+      "part": 4,
+      "title": "5초 멱등 키 · 오프라인 표 합치기 (D-03, 409 0건)",
+      "given": "5초 안에 같은 문장을 다시 저장 vs 다른 답글(ref) · 다른 대상(to)에 같은 문장 / 오프라인에서 남의 글 +1 → −1",
+      "expect": [
+        "같은 저장은 같은 request_id (\"idemp-\" + 48 hex, 54자) 로 한 항목, 임베딩 전에 0ms 에 기존 결과",
+        "다른 부모 · 대상 · bcc 는 다른 키 (서버 409 없음)",
+        "표를 바꾸면 새 request_id 로 마지막 값 하나만 보낸다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "apps/core/src/queue.rs",
+          "test": "fc10_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "apps/core/src/pipeline.rs",
+          "test": "fc10_"
+        }
+      ],
+      "vector": {
+        "derive": "hex(SHA-256(cc \\0 to \\0 bcc \\0 parent \\0 text_hash \\0 floor(now_ms / 5000)))[0..48]",
+        "prefix": "idemp-",
+        "len": 54,
+        "window_ms": 5000
+      }
+    },
+    {
+      "id": "FC-11",
+      "part": 4,
+      "title": "3단 욕설 차단 · 부모 거부 자식 연쇄 & 거부 알림 보존 (E-16)",
+      "given": "\"이 시1발\" 드롭 / 오프라인 부모+자식 등록 뒤 서버 cron 이 부모를 rejected(profanity) 로, 그 뒤 10s 주기 두 번",
+      "expect": [
+        "\"이 시1발\" 은 앱을 띄우지 않고 0ms 에 차단 (사전 필터)",
+        "자식 답글은 reply_cascade 로 함께 거부",
+        "두 주기 뒤에도 unacked_rejections 에 거부 알림이 남는다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-mcp/src/client.rs",
+          "test": "fc11_"
+        }
+      ]
+    },
+    {
+      "id": "FC-12",
+      "part": 4,
+      "title": "401/429 50초 유실 차단 (E-11) · 투표 단독 SyncLoop & 큐 상한 (E-17)",
+      "given": "401 · 429 상태로 10s 주기 6번(60s) 뒤 재로그인 / 평가 큐 0 + 오프라인 투표 1건",
+      "expect": [
+        "60s 뒤에도 attempts == 0, 유실 0건, 재로그인하면 바로 보낸다",
+        "투표만 있어도 SyncLoop 가 돌고 votes_remaining == 0 에서 멈춘다",
+        "상한: 대기 1,000 · 결과 대기 2,000 (7일) · 못 보낸 표 2,000 (결과 표부터 정리)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "apps/core/src/queue.rs",
+          "test": "fc12_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "apps/core/src/votes.rs",
+          "test": "fc12_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-mcp/src/client.rs",
+          "test": "fc12_"
+        }
+      ]
+    }
+  ]
+}

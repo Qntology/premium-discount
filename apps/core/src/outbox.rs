@@ -40,7 +40,12 @@ pub struct Outbox {
     queue: OfflineQueue,
     /// 추천/비추천 투표와 판정 캐시 (같은 폴더의 다른 표, votes.rs)
     votes: VoteStore,
+    /// 마지막으로 작은 파일을 합친 시각 (밀리초). [`Outbox::maintain_if_due`] 가 본다
+    last_maintained_ms: i64,
 }
+
+/// 보낼 것이 없을 때 작은 파일을 합치는 최소 간격 (30분). LanceDB 는 쓰기마다 작은 파일을 남긴다
+pub const MAINTAIN_EVERY_MS: i64 = 30 * 60 * 1000;
 
 impl Outbox {
     /// 폴더를 열고, `queued`와 `pending` 행에서 큐를 되살린다.
@@ -51,7 +56,7 @@ impl Outbox {
         let _ = db.optimize().await;
         let queue = Self::rebuild(&db).await?;
         let votes = VoteStore::open(dir).await?;
-        Ok(Self { db, queue, votes })
+        Ok(Self { db, queue, votes, last_maintained_ms: now_ms() })
     }
 
     /// 투표 보관함과 판정 캐시
@@ -62,6 +67,15 @@ impl Outbox {
     /// 작은 파일을 합치고 오래된 버전을 정리한다. 앱을 오래 켜 두는 경우 가끔 불러 준다.
     pub async fn maintain(&self) -> Result<(), AppError> {
         self.db.optimize().await
+    }
+
+    /// 마지막 정리에서 `every_ms` 가 지났으면 정리한다 (보낼 것이 없을 때 부른다: cmd_flush_outbox). 정리했으면 Some
+    pub async fn maintain_if_due(&mut self, now: i64, every_ms: i64) -> Option<Result<(), AppError>> {
+        if now - self.last_maintained_ms < every_ms {
+            return None;
+        }
+        self.last_maintained_ms = now;
+        Some(self.maintain().await)
     }
 
     pub fn db(&self) -> &LocalDb {
@@ -98,7 +112,8 @@ impl Outbox {
                 )));
             };
             resolved.push((r.local_id.clone(), Resolution::Sent { id: id.clone() }));
-            tracking.push((r.request_id.clone(), Tracked { local_id: r.local_id.clone(), id }));
+            // 접수 시각은 행이 pending 이 된 시각(updated_at)으로 본다 (7일 기한은 queue::RETAIN_MS)
+            tracking.push((r.request_id.clone(), Tracked { local_id: r.local_id.clone(), id, since_ms: r.updated_at }));
         }
 
         // 3. 못 보낸 항목이 가리키는 로컬 부모 중, 큐 밖에서 이미 처리된 것의 결과
@@ -125,6 +140,10 @@ impl Outbox {
     /// 저장 요청을 로컬 저장소에 먼저 쓰고 큐에 넣는다. 로컬 id를 돌려준다.
     /// 로컬 저장소에 쓰지 못하면 큐에도 넣지 않고 오류를 돌려준다.
     pub async fn enqueue(&mut self, req: SaveRequest, parent: Option<ParentRef>) -> Result<String, AppError> {
+        // 같은 request_id 의 행이 이미 있으면 같은 저장이다 (5초 멱등 키): 행을 덮어쓰지 않고 그 로컬 id 를 돌려준다
+        if let Some(row) = self.db.get(&req.request_id, false).await? {
+            return Ok(row.local_id);
+        }
         // 부모가 큐 메모리에 없는 로컬 id면(앱을 다시 켠 뒤 이미 처리된 항목에 답글을 다는 경우) 저장소에서 결과를 찾아 알려 준다
         if let Some(ParentRef::Local(local)) = &parent {
             if self.queue.pending_item(local).is_none() {

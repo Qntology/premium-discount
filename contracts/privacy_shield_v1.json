@@ -1,0 +1,238 @@
+{
+  "contract": "privacy_shield_v1",
+  "scenario": 6,
+  "title": "민감 화면 다중 감지 · 5초 소급 제로화 & 복귀 브리지",
+  "roadmap": "M0",
+  "source": "최종개선안: raon-zena 와 premium-discount 시나리오별 개선 개발 기획안 (24개 Part, 72개 검증 벡터)",
+  "params": {
+    "grace_probe_ms": 3000,
+    "grace_probe_ticks": 3,
+    "retro_purge_ms": 5000,
+    "locked_alpha": 76,
+    "locked_frame_us": 66666,
+    "keypad": [
+      3,
+      4
+    ],
+    "otp_cells": 6,
+    "seed_words": [
+      12,
+      24
+    ]
+  },
+  "cases": [
+    {
+      "id": "PS-01",
+      "part": 1,
+      "title": "비밀번호 칸 차단 하위 호환",
+      "given": "Region { sensitive: true } 가 있는 화면 (nav_screen(true))",
+      "expect": [
+        "sensitive == true, record == false",
+        "비전 · 이벤트 후보 0건 (접근성 트리만)"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src",
+          "test": "ps01_"
+        }
+      ]
+    },
+    {
+      "id": "PS-02",
+      "part": 1,
+      "title": "무속성 가상 키패드 · OTP 포착 & 오탐 차단",
+      "given": "3×4 숫자 보안 키패드 · 6칸 OTP vs 3×4 게임 인벤토리 · 일반 영문 문장",
+      "expect": [
+        "키패드 · OTP 는 FullLockdown",
+        "인벤토리 · 영문은 Clear"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src",
+          "test": "ps02_"
+        }
+      ]
+    },
+    {
+      "id": "PS-03",
+      "part": 1,
+      "title": "게임 결제 오버레이 · 옆 창 WDA 감지",
+      "given": "게임 위 결제 오버레이 프로세스 / 옆 창이 WDA_EXCLUDEFROMCAPTURE",
+      "expect": [
+        "게임 UIA 와 상관없이 바로 FullLockdown"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src",
+          "test": "ps03_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-window/src",
+          "test": "ps03_"
+        }
+      ]
+    },
+    {
+      "id": "PS-04",
+      "part": 1,
+      "title": "천공 패스 소형 모달 Privacy 시드 보존",
+      "given": "체커보드 PerforatedCfg + 구석 4% 소형 로그인 모달",
+      "expect": [
+        "국소 휘도 깨움 + VisionKind::Privacy 시드로 구멍을 넓혀 잡는다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-vision/src",
+          "test": "ps04_"
+        }
+      ]
+    },
+    {
+      "id": "PS-05",
+      "part": 1,
+      "title": "알림 토스트 패치 정렬 국소 마스킹",
+      "given": "보스전 오른쪽 아래 알림 토스트(PartialRedaction) 를 패치로 나눔",
+      "expect": [
+        "옆 패치로 번지지 않는다",
+        "토스트에 겹친 후보만 버리고 본 화면 코칭은 그대로"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-vision/src",
+          "test": "ps05_"
+        }
+      ]
+    },
+    {
+      "id": "PS-06",
+      "part": 2,
+      "title": "prev_log 소거 & 무역상 복귀",
+      "given": "민감 화면 1프레임 뒤 purge_privacy_residue() → 일반 화면",
+      "expect": [
+        "prev_log · ROI 트랙 0",
+        "복귀 첫 프레임 타일 차분 이벤트 0건"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-sensor/src",
+          "test": "ps06_"
+        }
+      ]
+    },
+    {
+      "id": "PS-07",
+      "part": 2,
+      "title": "진행 중 비전 블록 조기 중단",
+      "given": "인코딩 도중 privacy_epoch 증가",
+      "expect": [
+        "다음 블록 경계에서 멈춘다",
+        "PatchGrid · 32×18 썸네일을 지우고 넘기지 않는다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-vision/src",
+          "test": "ps07_"
+        }
+      ]
+    },
+    {
+      "id": "PS-08",
+      "part": 2,
+      "title": "미완결 에피소드 5초 소급 절단 & record false",
+      "given": "키패드 감지 직전 3초 동안의 클릭 · 수정 사건이 LiveEpisodeWindow 에 있다",
+      "expect": [
+        "최근 5초 사건 폐기",
+        "FrictionBaselines · Outbox · 장부 기록 0건"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src",
+          "test": "ps08_"
+        }
+      ]
+    },
+    {
+      "id": "PS-09",
+      "part": 3,
+      "title": "은행 창 장기 유지 vs 3초 로그인 고속 복귀",
+      "given": "은행 창(비전 단독 포함) 120s / 3s 로그인 뒤 게임 창",
+      "expect": [
+        "은행 창은 120s 뒤에도 Locked (캡처 0)",
+        "로그인은 GraceProbe(3s) 뒤 ~6s 안에 복귀"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src",
+          "test": "ps09_"
+        }
+      ]
+    },
+    {
+      "id": "PS-10",
+      "part": 3,
+      "title": "주문 완료 영수증 ReceiptGuard 무제한 보호",
+      "given": "결제 해제 직후 /order/complete 에서 30초",
+      "expect": [
+        "정제한 page_hash 결승 체크포인트 1건만",
+        "페이지를 떠나기 전까지 픽셀 · 라벨 수집 차단"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src",
+          "test": "ps10_"
+        }
+      ]
+    },
+    {
+      "id": "PS-11",
+      "part": 3,
+      "title": "다중 인증 시간 차감 course_chain 브리징",
+      "given": "S1 → S2 → [본인 인증 45s 잠금] → S3 완주 (자정을 넘김)",
+      "expect": [
+        "구간 시간 · 간격에서 45s 를 뺀 하나의 완주 런",
+        "Run.day 는 실제 결승 날짜"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "ps11_"
+        }
+      ]
+    },
+    {
+      "id": "PS-12",
+      "part": 4,
+      "title": "최전선 차단 · 강제 클릭 투과 & 종료 0ms 캡처 절단",
+      "given": "InteractivePet 잠금 + 채팅에 Luhn 카드 번호 / BIP-39 12단어 / 0x+40자 공개 주소 + ExitApp",
+      "expect": [
+        "잠금 즉시 WS_EX_TRANSPARENT, alpha 76, 15 FPS (66,666µs)",
+        "카드 · 시드는 지우고 LLM · 대화 · 보관함 · 사전으로 0건 (공개 주소는 통과)",
+        "Farewell 0ms 에 allows_capture() == false"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src",
+          "test": "ps12_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-identity/src",
+          "test": "ps12_"
+        }
+      ]
+    }
+  ]
+}

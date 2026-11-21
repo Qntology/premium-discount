@@ -47,15 +47,16 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 | 도구 | premium-discount-app 명령 | 이 층이 더하는 것 |
 |---|---|---|
 | `pd_enqueue_node` | `cmd_submit_evaluation` | `cc` 변환, `to_key` → `to`, `bcc_key`(기본: `text`) → `bcc`(정규화 후 hashId), `parent_local` → `local_parent` |
-| `pd_flush_and_sync` | `cmd_flush_outbox`(평가와 투표) + `cmd_sync_cache` | `next_since_ms`, 상태별 개수, `has_work`(못 보낸 투표 포함) |
-| `pd_search_merged` | `cmd_search_merged` | `cc` 변환, `to_key`, `tier` 필터 검사. 결과마다 서버 판정(`verdict`)과 내 표(`my_vote`) |
+| `pd_flush_and_sync` | `cmd_flush_outbox`(평가와 투표) + `cmd_sync_cache` (+ 보내기 없이는 `cmd_queue_counts`) | `next_since_ms`, 상태별 개수, `has_work`(못 보낸 투표 포함, 401 · 403 이면 false), `queued_votes`(보내기 없는 동기화에서도) |
+| `pd_search_merged` | `cmd_search_merged` | `cc` 변환, `to_key`, `tier` 필터 검사. 결과마다 서버 판정(`verdict`)과 내 표(`my_vote`). 스코프 부스트 `l1_checkpoint_to`(+0.12) · `l2_entity_tos`(+0.06): 거르지 않고 순위만 올린다 |
 | `pd_vote` | `cmd_vote` | 값(1 · −1 · 0)과 종류(`vote` · `vote_outcome`) 검사 |
 | `pd_supersede` | `cmd_supersede` | `old` · `new` 가 있고 다른지 검사. 신구 대체 보고(premium-discount-relay 의 판정): 서버가 받으면 옛 평가의 판정 캐시가 곧바로 discount(−2, `superseded`) |
 | `pd_verdicts` | `cmd_verdicts` | `ids` 검사 (캐시 10분, 오프라인이면 `stale`) |
-| `pd_graph_inspect` | (없음) 서버 `GET /graph?cc=`, `/graph/local?id=`, `/graph/similar?id=&topK=` | 노드 · 간선 종류별 개수, 작성자 수, 스레드(root) 크기, 서버 등급 분포 |
+| `pd_graph_inspect` | (없음) 서버 `GET /graph?cc=`, `/graph/local?id=`, `/graph/similar?id=&topK=` | 노드 · 간선 종류별 개수, 작성자 수, 스레드(root) 크기, 서버 등급 분포. `timeout_ms`(예: 200)로 짧은 기한 |
 | `pd_auth_session` | `cmd_session` · `cmd_login_start` · `cmd_login_status` · `cmd_logout` | — |
-| `pd_model_manage` | `cmd_model_status` · `cmd_model_download` · `cmd_model_download_cancel` | 자식 프로세스 상태(`running`, `starts`, `idle_ms`) |
-| `pd_nav_number` | (없음) 프로세스 안에서 premium-discount `premium-discount-nav` | 후보 합치기 · 1 ~ 9 번호 · 개인정보 화면 판정(아래) |
+| `pd_model_manage` | `cmd_model_status` · `cmd_model_download` · `cmd_model_download_cancel` | 자식 프로세스 상태(`running`, `starts`, `idle_ms`, `lease`). `prewarm`: 기다리지 않고 앱을 미리 띄움(예열만 한 프로세스는 45초, 실제로 쓰면 `--idle-secs`; 모델 · 실행 파일이 없으면 서킷 브레이커; `avail_ram_mb` < 650 이면 미룸). `evict`: 한가하면 지금 내림(`cmd_shutdown` 으로 코어 · GPU 풀을 먼저 놓게 하고, 2초 안에 안 끝나면 강제 종료) |
+| `pd_nav_number` | (없음) 프로세스 안에서 premium-discount `premium-discount-nav` | 후보 합치기 · 1 ~ 9 번호 · 개인정보 화면 판정(아래). 화면 문맥(`screen_key` · `now_ms` · `scrolled` · `locked_numbers` · `priority_anchor`)을 주면 세션(`session`)마다 번호를 붙잡아 둔다 |
+| `pd_analytic` | `cmd_analytic_site` · `cmd_analytic_sync` · `cmd_analytic_report` · `cmd_analytic_forget` | 사이트 운영자의 웹 분석. `report` 는 마지막 받기가 5분 넘었으면 짧게(2쪽) 먼저 받고, 받기에 실패해도 기기의 사건으로 리포트(`sync_error`). `forget` 은 사건 id 와 `before_ms` 컷오프를 함께 받는다 |
 
 도구 오류는 `<kind>: <message>` 형식입니다. `kind` 는 premium-discount-app 의 `CommandError.kind`(`offline`, `not_ready`, `invalid_input`, `rejected`, `queue_full` …)를 그대로 씁니다. 앱을 띄우거나 닿을 수 없으면 `unavailable` 입니다.
 
@@ -65,6 +66,8 @@ premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스�
 - 입력: 후보 영역(`anchor` · `role` · `name` · `rect`(창 기준 0 ~ 1) · `source`(tree · vision · event) · `score` · `changed` · `sensitive`), 선택으로 `tiers`(anchor → premium · neutral · discount · unrated)와 `iou`(기본 0.4).
 - 처리: 사각형은 `Rect::new` 로 창 안으로 자르고 넓이가 없으면 버립니다(`dropped`). `merge`(트리 > 비전 > 이벤트, 이벤트가 겹친 영역은 `changed`) → `number`(premium 앞 · discount 뒤, 종류, 읽는 순서, 앞의 9개가 1 ~ 9).
 - 개인정보 화면: 후보 하나라도 `sensitive` 면 트리 후보만 남기고 `record: false` 를 돌려줍니다. 호출하는 쪽은 그 화면을 기록하지 않습니다.
+- 개인정보 판정(`shield`, premium-discount-nav 의 `evaluate_privacy`): 속성 없는 보안 키패드 · OTP 칸, 또는 호스트가 잰 창 · 비전 신호(`os_capture_protected`, `os_overlay_payment_detected`, `vision_privacy_hit`, `seed_phrase_detected`, `auth_or_payment_context`)도 같은 잠금(`full_lockdown`)입니다. `os_notification_zones`(알림 토스트)는 그 아래 후보만 뺍니다(`partial_redaction`, 기록은 함).
+- 번호 붙잡기: 화면 문맥을 주면 등급이 바뀌거나 상자가 흔들려도 번호가 그대로이고, 말하고 있는 번호(`locked_numbers` 비트 n)는 다른 영역에 주지 않으며, 잠깐 가려진 상자는 600 ms 동안 번호를 지킵니다(`scrolled` 면 바로 거둠). 결과의 번호마다 `origin`(fresh · retained · promoted).
 
 ### `cc` · `to` · `bcc`
 

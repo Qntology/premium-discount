@@ -2,6 +2,7 @@
 //! expressed as a normalised distance `r` and an azimuth `θ` around it.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Axis-aligned box in screen pixels (`x0,y0` inclusive top-left, `x1,y1` exclusive bottom-right).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -47,6 +48,16 @@ impl BBox {
     }
 }
 
+/// 개인 화면 잔상 지우기 (ROI 추적기가 트랙을 버릴 때)
+impl Zeroize for BBox {
+    fn zeroize(&mut self) {
+        self.x0.zeroize();
+        self.y0.zeroize();
+        self.x1.zeroize();
+        self.y1.zeroize();
+    }
+}
+
 /// Polar coordinate around the screen centre.
 ///
 /// * `r` is normalised by the half-diagonal, so `0` is the player and `1` a screen corner.
@@ -55,6 +66,13 @@ impl BBox {
 pub struct Polar {
     pub r: f32,
     pub theta_deg: f32,
+}
+
+impl Zeroize for Polar {
+    fn zeroize(&mut self) {
+        self.r.zeroize();
+        self.theta_deg.zeroize();
+    }
 }
 
 /// Size of the captured desktop / game surface.

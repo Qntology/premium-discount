@@ -23,6 +23,11 @@ pub struct GraphClient {
     agent: ureq::Agent,
 }
 
+/// The shortest deadline [`GraphClient::get_within`] accepts.
+pub const QUICK_TIMEOUT_MIN: Duration = Duration::from_millis(50);
+/// The deadline the LabelHydrator uses for its single `/graph/local` read (Scenario 3 Part 4, step 2-B).
+pub const QUICK_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// Which graph to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphQuery {
@@ -60,8 +65,21 @@ impl GraphClient {
     }
 
     pub fn get(&self, q: &GraphQuery) -> Result<Value, CallError> {
+        self.fetch(&self.agent, q)
+    }
+
+    /// One read with its own short deadline (Scenario 3 Part 4: the LabelHydrator may ask `/graph/local` once for its
+    /// top candidate inside a 600 ms answer budget — the 15 s agent would stall the whole MCP pipe). `timeout` is
+    /// clamped to [`QUICK_TIMEOUT_MIN`, 15 s]; a timeout reads as `offline`, like any unreachable server.
+    pub fn get_within(&self, q: &GraphQuery, timeout: Duration) -> Result<Value, CallError> {
+        let timeout = timeout.clamp(QUICK_TIMEOUT_MIN, Duration::from_secs(15));
+        let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+        self.fetch(&agent, q)
+    }
+
+    fn fetch(&self, agent: &ureq::Agent, q: &GraphQuery) -> Result<Value, CallError> {
         let url = format!("{}{}", self.base, q.path());
-        match self.agent.get(&url).call() {
+        match agent.get(&url).call() {
             Ok(resp) => {
                 let body = resp
                     .into_string()
@@ -259,5 +277,24 @@ mod tests {
             .get(&GraphQuery::Local { id: A.into() })
             .unwrap_err();
         assert_eq!(e.kind(), "offline");
+    }
+
+    // Scenario 3 Part 4 (CR-10): the hydrator's single /graph/local read gives up inside its budget instead of
+    // waiting the agent's 15 s.
+    #[test]
+    fn cr10_a_quick_read_gives_up_inside_its_budget() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let slow = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            // Accept and never answer for longer than the budget.
+            std::thread::sleep(Duration::from_millis(1_500));
+        });
+        let started = std::time::Instant::now();
+        let e = GraphClient::new(&base).get_within(&GraphQuery::Local { id: A.into() }, QUICK_TIMEOUT).unwrap_err();
+        let waited = started.elapsed();
+        assert_eq!(e.kind(), "offline");
+        assert!(waited < Duration::from_millis(900), "gave up after {waited:?}");
+        slow.join().unwrap();
     }
 }

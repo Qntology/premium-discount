@@ -6838,6 +6838,7 @@ dependencies = [
  "premium-discount-verdict",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -7020,6 +7021,7 @@ version = "0.1.0"
 dependencies = [
  "naga 30.0.2",
  "serde",
+ "zeroize",
 ]
 
 [[package]]

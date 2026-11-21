@@ -7,6 +7,11 @@
 //! (the same search) and cut 16×16 patches. Patches are flattened here as `[C, ph, pw]` (channel-major) for both;
 //! a Hugging Face checkpoint's patch projection is reordered to match when it is loaded (`raon_vision::layout`).
 //! [`Preprocess`] holds what differs.
+//!
+//! 개인 화면: [`PatchGrid`] · [`NaFlexInput`] 은 버릴 때 패치 값을 0 으로 덮는다. 알림 토스트처럼 화면 일부만 가릴 때는
+//! [`redact_rgb_for_naflex`] 가 그 자리를 리샘플 커널이 닿는 거리보다 넓게, 패치 경계에 맞춰 0 으로 칠한다.
+
+use zeroize::Zeroize;
 
 pub const PATCH: usize = 16;
 pub const DEFAULT_MAX_PATCHES: usize = 256;
@@ -76,6 +81,16 @@ pub fn image_size_for_max_patches(h: usize, w: usize, patch: usize, max_patches:
     size(lo)
 }
 
+impl Resample {
+    /// 커널의 기본 지지 폭 (입력 픽셀). 줄일 때는 축소 배율만큼 늘어난다 (PIL `precompute_coeffs`)
+    pub fn base_support(self) -> f64 {
+        match self {
+            Resample::Bicubic => 2.0,
+            Resample::Bilinear => 1.0,
+        }
+    }
+}
+
 /// PIL's bicubic kernel (`a = -0.5`), support 2.
 fn bicubic(x: f64) -> f64 {
     let a = -0.5;
@@ -97,10 +112,11 @@ fn triangle(x: f64) -> f64 {
 /// Per output pixel: the first input index and the normalised weights (PIL `precompute_coeffs`: the kernel is
 /// stretched by the scale when shrinking, which is what makes PIL's resize antialiased).
 fn coeffs(in_size: usize, out_size: usize, resample: Resample) -> Vec<(usize, Vec<f64>)> {
-    let (kernel, base_support): (fn(f64) -> f64, f64) = match resample {
-        Resample::Bicubic => (bicubic, 2.0),
-        Resample::Bilinear => (triangle, 1.0),
+    let kernel: fn(f64) -> f64 = match resample {
+        Resample::Bicubic => bicubic,
+        Resample::Bilinear => triangle,
     };
+    let base_support = resample.base_support();
     let scale = in_size as f64 / out_size as f64;
     let filterscale = scale.max(1.0);
     let support = base_support * filterscale;
@@ -150,6 +166,7 @@ pub fn resize(src: &[u8], w: usize, h: usize, ch: usize, tw: usize, th: usize, r
     if th == h {
         return horizontal;
     }
+    let mut horizontal = horizontal;
     let cy = coeffs(h, th, resample);
     let mut out = vec![0u8; tw * th * ch];
     for (oy, (y0, ws)) in cy.iter().enumerate() {
@@ -164,6 +181,8 @@ pub fn resize(src: &[u8], w: usize, h: usize, ch: usize, tw: usize, th: usize, r
             }
         }
     }
+    // 가운데 그림(화면을 가로로만 줄인 것)도 화면이다: 버리기 전에 0 으로 덮는다
+    horizontal.zeroize();
     out
 }
 
@@ -183,6 +202,20 @@ impl PatchGrid {
     }
     pub fn patch(&self, cell: usize) -> &[f32] {
         &self.patches[cell * Self::DIM..(cell + 1) * Self::DIM]
+    }
+
+    /// 패치 값을 0 으로 덮고 비운다 (칸도 0 × 0 이 된다). 판독 중에 개인 화면으로 바뀌어 그만둘 때 부른다.
+    /// 버릴 때(Drop)도 패치 값을 0 으로 덮는다
+    pub fn wipe(&mut self) {
+        self.patches.zeroize();
+        self.grid_h = 0;
+        self.grid_w = 0;
+    }
+}
+
+impl Drop for PatchGrid {
+    fn drop(&mut self) {
+        self.patches.zeroize();
     }
 }
 
@@ -211,6 +244,8 @@ pub fn patchify_frame_with(rgb: &[u8], w: usize, h: usize, max_patches: usize, p
             }
         }
     }
+    let mut img = img;
+    img.zeroize();
     PatchGrid {
         grid_h: gh,
         grid_w: gw,
@@ -230,6 +265,75 @@ pub struct NaFlexInput {
     pub valid: Vec<bool>,
     /// `(grid_h, grid_w)`.
     pub spatial_shape: (usize, usize),
+}
+
+impl Drop for NaFlexInput {
+    fn drop(&mut self) {
+        self.patches.zeroize();
+    }
+}
+
+/// 알림 토스트처럼 화면 일부만 가린다 (개인 화면 판정의 `PartialRedaction` 자리들). `zones` 는 0..1 정규화 `(x, y, w, h)`.
+///
+/// 각 자리를 화면의 2 % 와 "리샘플 커널 지지 폭 × 축소 배율 + 4픽셀" 가운데 큰 만큼 넓힌 뒤, 출력 16 × 16 패치 경계에
+/// 맞춰 바깥으로 넓혀 RGB 를 0 으로 칠한다. 돌려주는 것은 그렇게 칠한 자리에 통째로 든 패치 칸(행 우선
+/// `row * grid_w + col`, 오름차순)이다. 인코더에서 빼도 된다.
+///
+/// 나머지 칸에는 가린 자리의 원래 픽셀이 하나도 닿지 않는다: 칠하기 전 그림으로 패치를 만들어도 그 칸들의 값은 토스트가
+/// 있든 없든 같다 (넓힌 거리가 bicubic(2) · bilinear(1) 커널이 닿는 거리보다 4픽셀 이상 길다). 2 % 여유는 창 사각형
+/// 밖으로 번지는 그림자 몫이다. `max_patches` · `pre` 는 이 그림을 패치로 만들 때([`patchify_frame_with`])와 같은 값을 넣는다.
+pub fn redact_rgb_for_naflex(
+    rgb: &mut [u8],
+    w: usize,
+    h: usize,
+    zones: &[(f32, f32, f32, f32)],
+    max_patches: usize,
+    pre: &Preprocess,
+) -> Vec<u32> {
+    let (th, tw) = image_size_for_max_patches(h, w, PATCH, max_patches);
+    let gw = tw / PATCH;
+    let mut masked = vec![false; (th / PATCH) * gw];
+    for &(zx, zy, zw, zh) in zones {
+        let (Some((c0, c1)), Some((r0, r1))) = (masked_cells(zx, zw, w, tw, pre.resample), masked_cells(zy, zh, h, th, pre.resample)) else {
+            continue;
+        };
+        let (x0, x1) = (cell_start(c0, w, tw), cell_end(c1, w, tw));
+        for y in cell_start(r0, h, th)..cell_end(r1, h, th) {
+            rgb[(y * w + x0) * 3..(y * w + x1) * 3].fill(0);
+        }
+        for r in r0..r1 {
+            masked[r * gw + c0..r * gw + c1].fill(true);
+        }
+    }
+    (0..masked.len() as u32).filter(|&i| masked[i as usize]).collect()
+}
+
+/// 한 축에서 정규화 시작 · 길이의 자리를 넓혀 덮는 패치 칸 범위 `[first, last)`. 빈 자리 · 화면 밖이면 `None`
+fn masked_cells(start: f32, len: f32, size: usize, out: usize, resample: Resample) -> Option<(usize, usize)> {
+    if !(start.is_finite() && len.is_finite() && len > 0.0) || size == 0 || out < PATCH {
+        return None;
+    }
+    let a = (start as f64 * size as f64).floor().max(0.0);
+    let b = ((start as f64 + len as f64) * size as f64).ceil().min(size as f64);
+    if b <= a {
+        return None;
+    }
+    let scale = size as f64 / out as f64;
+    let margin = (0.02 * size as f64).ceil().max((resample.base_support() * scale.max(1.0)).ceil() + 4.0);
+    let (lo, hi) = ((a - margin).max(0.0), (b + margin).min(size as f64));
+    let cell = PATCH as f64 * scale;
+    let first = (lo / cell).floor() as usize;
+    let last = ((hi / cell).ceil() as usize).min(out / PATCH);
+    (first < last).then_some((first, last))
+}
+
+/// 패치 칸 경계 `k` 의 입력 픽셀 위치. 칸을 통째로 덮도록 시작은 내리고 끝은 올린다
+fn cell_start(k: usize, size: usize, out: usize) -> usize {
+    ((k * PATCH) as f64 * size as f64 / out as f64).floor() as usize
+}
+
+fn cell_end(k: usize, size: usize, out: usize) -> usize {
+    (((k * PATCH) as f64 * size as f64 / out as f64).ceil() as usize).min(size)
 }
 
 /// Crop `(x0,y0,x1,y1)` out of an RGB8 image and patchify it (bilinear resize, half-pixel centres).
@@ -276,6 +380,7 @@ pub fn patchify_rgb(rgb: &[u8], img_w: usize, img_h: usize, crop: (usize, usize,
             }
         }
     }
+    resized.zeroize();
     let valid = (0..max_patches).map(|i| i < n).collect();
     NaFlexInput {
         patches,
@@ -343,5 +448,146 @@ mod tests {
         let blue_in_p1 = inp.patches[768 + 2 * 256];
         assert!((blue_in_p1 - (1.0 - MEAN[2]) / STD[2]).abs() < 1e-5);
         assert!(inp.patches[2 * 768..].iter().all(|&v| v == 0.0));
+    }
+
+    /// 결이 있는 게임 화면 (가운데에 보스)
+    fn boss_screen(w: usize, h: usize) -> Vec<u8> {
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                rgb[i] = ((x * 7 + y * 13) % 251) as u8;
+                rgb[i + 1] = ((x * 3 + y * 5 + 40) % 241) as u8;
+                rgb[i + 2] = ((x ^ y) % 199) as u8;
+            }
+        }
+        for y in h * 7 / 20..h * 13 / 20 {
+            for x in w * 2 / 5..w * 3 / 5 {
+                rgb[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&[200, 30, 40]);
+            }
+        }
+        rgb
+    }
+
+    /// `a` 위에 알림 토스트(밝은 바탕 · 글줄)와 창 밖으로 6픽셀 번진 그림자를 그린다
+    fn with_toast(a: &[u8], w: usize, h: usize, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> Vec<u8> {
+        let mut b = a.to_vec();
+        for y in y0.saturating_sub(6)..(y1 + 6).min(h) {
+            for x in x0.saturating_sub(6)..(x1 + 6).min(w) {
+                let i = (y * w + x) * 3;
+                let inside = (x0..x1).contains(&x) && (y0..y1).contains(&y);
+                let v = if !inside {
+                    b[i] / 2
+                } else if (y - y0) % 8 < 2 {
+                    20
+                } else {
+                    245
+                };
+                b[i..i + 3].fill(v);
+            }
+        }
+        b
+    }
+
+    /// 토스트를 가린 결과: (가린 칸, 칠하기 전 · 뒤 패치 넷: 토스트 없음 · 있음 · 없음 칠함 · 있음 칠함)
+    fn redact_case(
+        w: usize,
+        h: usize,
+        toast: (usize, usize, usize, usize),
+        budget: usize,
+        pre: &Preprocess,
+    ) -> (Vec<u32>, [PatchGrid; 4], Vec<u8>) {
+        let a = boss_screen(w, h);
+        let b = with_toast(&a, w, h, toast);
+        let (x0, y0, x1, y1) = toast;
+        let zone = (x0 as f32 / w as f32, y0 as f32 / h as f32, (x1 - x0) as f32 / w as f32, (y1 - y0) as f32 / h as f32);
+        let (mut a2, mut b2) = (a.clone(), b.clone());
+        let masked = redact_rgb_for_naflex(&mut a2, w, h, &[zone], budget, pre);
+        assert_eq!(redact_rgb_for_naflex(&mut b2, w, h, &[zone], budget, pre), masked, "같은 자리면 같은 칸");
+        let grids = [
+            patchify_frame_with(&a, w, h, budget, pre),
+            patchify_frame_with(&b, w, h, budget, pre),
+            patchify_frame_with(&a2, w, h, budget, pre),
+            patchify_frame_with(&b2, w, h, budget, pre),
+        ];
+        (masked, grids, a2)
+    }
+
+    /// 가린 칸 밖으로 토스트가 한 픽셀도 번지지 않는다: 칠하기 전에도 가리지 않은 칸은 같고, 칠한 뒤에는 모든 칸이 같다
+    fn assert_no_bleed(masked: &[u32], [a, b, a2, b2]: &[PatchGrid; 4]) {
+        let is_masked = |c: usize| masked.binary_search(&(c as u32)).is_ok();
+        assert!((0..a.cells()).any(|c| a.patch(c) != b.patch(c)), "토스트가 무언가는 바꾼다");
+        for c in (0..a.cells()).filter(|&c| !is_masked(c)) {
+            assert_eq!(a.patch(c), b.patch(c), "칠하기 전, 가리지 않은 칸 {c}");
+        }
+        assert_eq!(a2.patches, b2.patches, "칠한 뒤에는 토스트의 흔적이 없다 (번짐 0.0)");
+    }
+
+    #[test]
+    fn ps05_toast_redaction_is_patch_aligned_and_never_bleeds() {
+        // 1920 × 1080 보스전 화면, 오른쪽 아래 알림 토스트 400 × 160, Raon-VE(bicubic) 256패치
+        let (w, h, budget, pre) = (1920, 1080, 256, Preprocess::RAON_VE);
+        let toast = (1500, 900, 1900, 1060);
+        let (masked, grids, a2) = redact_case(w, h, toast, budget, &pre);
+        assert_no_bleed(&masked, &grids);
+        let [a, _, a_redacted, _] = &grids;
+        let (gw, cells) = (a.grid_w, a.cells());
+        // 토스트 밑 칸은 가렸고, 가린 칸은 오른쪽 아래 일부뿐이다
+        let center = ((toast.1 + toast.3) / 2 * a.grid_h / h) * gw + (toast.0 + toast.2) / 2 * gw / w;
+        assert!(masked.binary_search(&(center as u32)).is_ok());
+        assert!(masked.len() * 5 < cells, "{} of {cells}", masked.len());
+        // 가린 칸의 입력 자리는 통째로 0 이다 (패치 경계에 맞춰 칠했다)
+        let (th, tw) = (a.grid_h * PATCH, gw * PATCH);
+        for &c in &masked {
+            let (r, col) = (c as usize / gw, c as usize % gw);
+            for y in cell_start(r, h, th)..cell_end(r + 1, h, th) {
+                let row = &a2[(y * w + cell_start(col, w, tw)) * 3..(y * w + cell_end(col + 1, w, tw)) * 3];
+                assert!(row.iter().all(|&v| v == 0), "cell {c} row {y}");
+            }
+        }
+        // 가린 칸의 이웃도 아닌 칸은 칠하기 전과 비트까지 같다: 본 화면(보스) 코칭은 그대로
+        let near = |c: usize| {
+            masked.iter().any(|&m| (m as usize / gw).abs_diff(c / gw) <= 1 && (m as usize % gw).abs_diff(c % gw) <= 1)
+        };
+        let far: Vec<usize> = (0..cells).filter(|&c| !near(c)).collect();
+        assert!(far.len() * 10 >= cells * 7, "{} of {cells}", far.len());
+        for c in far {
+            assert_eq!(a_redacted.patch(c), a.patch(c), "cell {c}");
+        }
+    }
+
+    #[test]
+    fn bilinear_redaction_keeps_the_same_guarantee() {
+        // google SigLIP2 (bilinear, 커널 지지 1) · 작은 화면 · 왼쪽 위 토스트
+        let (masked, grids, _) = redact_case(640, 360, (20, 16, 200, 80), 144, &Preprocess::SIGLIP2);
+        assert!(!masked.is_empty());
+        assert_no_bleed(&masked, &grids);
+    }
+
+    #[test]
+    fn empty_or_offscreen_zones_change_nothing() {
+        let (w, h) = (160, 90);
+        let a = boss_screen(w, h);
+        let mut b = a.clone();
+        let none = [(0.5, 0.5, 0.0, 0.1), (f32::NAN, 0.1, 0.2, 0.2), (1.2, 0.1, 0.2, 0.2), (0.1, -0.5, 0.2, 0.3), (0.2, 0.2, -0.1, 0.1)];
+        assert!(redact_rgb_for_naflex(&mut b, w, h, &none, 64, &Preprocess::RAON_VE).is_empty());
+        assert_eq!(a, b);
+        // 화면 밖으로 걸친 자리는 화면 안쪽만 칠한다
+        let cells = redact_rgb_for_naflex(&mut b, w, h, &[(0.9, 0.9, 0.5, 0.5)], 64, &Preprocess::RAON_VE);
+        assert!(!cells.is_empty());
+        assert_eq!(b[(h * w - 1) * 3..], [0, 0, 0]);
+        assert_eq!(b[..3], a[..3]);
+    }
+
+    #[test]
+    fn grids_wipe_their_patches() {
+        let mut g = patchify_frame(&boss_screen(64, 32), 64, 32, 8);
+        assert!(g.patches.iter().any(|&v| v != 0.0));
+        let (ptr, cap) = (g.patches.as_ptr(), g.patches.capacity());
+        g.wipe();
+        assert_eq!((g.cells(), g.patches.len()), (0, 0));
+        // SAFETY: 할당은 아직 g.patches 가 갖고 있고(zeroize 는 용량을 줄이지 않는다), cap 개를 모두 0 으로 썼다
+        let all = unsafe { std::slice::from_raw_parts(ptr, cap) };
+        assert!(all.iter().all(|&v| v == 0.0));
     }
 }

@@ -9,6 +9,8 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 재전송에도 같은 사건 id (`event::deterministic_event_id`) · 선택 대조 키 (`pug::canonical_choice_of`). Worker 와 같은 SHA-256
+sha2.workspace = true
 premium-discount-nav.workspace = true
 premium-discount-nms.workspace = true
 premium-discount-sds.workspace = true

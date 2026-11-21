@@ -1,18 +1,20 @@
 [package]
 name = "premium-discount-window"
-description = "오버레이 창 계산: 3단계 크기 · 옮기기, 누르기와 끌기, 창 자리, 확장 스타일 · 알파 · 프레임 간격, 제자리로 돌아가기. 점 아래 창 · 앞 창 찾기(Win32). premium-discount 앱과 raon-zena 가 함께 쓴다"
+description = "오버레이 창 계산: 3단계 크기 · 옮기기, 누르기와 끌기, 창 자리, 확장 스타일 · 알파 · 프레임 간격, 제자리로 돌아가기. 점 아래 창 · 앞 창 · 캡처 모니터 위 보이는 창 찾기(Win32)와 그 창들의 개인 화면 신호. premium-discount 앱과 raon-zena 가 함께 쓴다"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [features]
 default = ["win32"]
-# Windows 에서 점 아래 창 · 앞 창을 실제로 찾는다. 끄면(또는 Windows 가 아니면) 찾는 함수가 늘 None 을 준다.
+# Windows 에서 점 아래 창 · 앞 창 · 캡처 모니터 위 보이는 창을 실제로 찾는다. 끄면(또는 Windows 가 아니면) 찾는 함수가
+# 늘 None(목록은 빈 목록)을 준다. 개인 화면 신호 계산(surface)은 기능과 상관없이 돈다.
 win32 = ["dep:windows-sys"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

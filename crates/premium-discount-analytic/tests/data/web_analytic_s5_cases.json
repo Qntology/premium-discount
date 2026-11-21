@@ -1,0 +1,90 @@
+{
+ "schema": "analytic-s5-cases/1",
+ "note": "시나리오 5 에서 더한 수집 규칙의 사례. 수집 스크립트(web/www/static/js/tracker.js, workers/www/tests/tracker.test.ts)와 crates/premium-discount-analytic(tests/web_analytic.rs)이 같은 결과를 내야 한다. contracts/analytic_pug_v1.json 13 사례는 그대로 두고 새 규칙만 여기 둔다.",
+ "pug": [
+  {
+   "name": "icon button keeps its aria-label",
+   "html": "<button aria-label=\"장바구니\"><svg><path d=\"M0\"/></svg></button>",
+   "pug": "button | [장바구니]\n"
+  },
+  {
+   "name": "icon link label is scrubbed (4+ digits)",
+   "html": "<a href=\"/orders\" aria-label=\"주문 20261121 조회\"><svg/></a>",
+   "pug": "a | [주문 # 조회]\n"
+  },
+  {
+   "name": "input value and label are never sent",
+   "html": "<input value=\"홍길동\" aria-label=\"이름\">",
+   "pug": "input\n"
+  },
+  {
+   "name": "role=button wrapper falls back to its label",
+   "html": "<div role=\"button\" aria-label=\"닫기\"><span><svg/></span></div>",
+   "pug": "div | [닫기]\n"
+  },
+  {
+   "name": "role=tab falls back to title",
+   "html": "<span role=\"tab\" title=\"리뷰\"></span>",
+   "pug": "span | [리뷰]\n"
+  },
+  {
+   "name": "base64 icon image alt",
+   "html": "<button><img src=\"data:image/png;base64,AAAA\" alt=\"찜하기\"></button>",
+   "pug": "button | [찜하기]\n"
+  },
+  {
+   "name": "text wins over the label",
+   "html": "<button aria-label=\"무시\">담기</button>",
+   "pug": "button | 담기\n"
+  },
+  {
+   "name": "no label, no text",
+   "html": "<button><svg/></button>",
+   "pug": "button\n"
+  },
+  {
+   "name": "a visible image keeps the structure",
+   "html": "<button aria-label=\"장바구니\"><img src=\"cart.png\" alt=\"장바구니\"></button>",
+   "pug": "button\n    img\n"
+  },
+  {
+   "name": "select is not a labelled control",
+   "html": "<select aria-label=\"수량\"><option>1</option></select>",
+   "pug": "select\n"
+  },
+  {
+   "name": "an open modal drawer root is kept although fixed",
+   "html": "<div role=\"dialog\" aria-modal=\"true\" style=\"position: fixed; inset: 0\"><h2>장바구니</h2><button>주문하기</button></div>",
+   "pug": "div\n    h2 | 장바구니\n    button | 주문하기\n"
+  },
+  {
+   "name": "an open dialog is kept",
+   "html": "<dialog open style=\"position:fixed\"><button>결제하기</button></dialog>",
+   "pug": "dialog\n    button | 결제하기\n"
+  },
+  {
+   "name": "a fixed banner is still dropped",
+   "html": "<div><button>담기</button><div style=\"position:fixed\">광고</div></div>",
+   "pug": "div\n    button | 담기\n"
+  },
+  {
+   "name": "a closed fixed dialog is still dropped",
+   "html": "<dialog style=\"position:fixed\"><button>결제하기</button></dialog>",
+   "pug": ""
+  }
+ ],
+ "modal_href": [
+  { "href": "https://shop.example.com/product/1", "slug": "cart", "expect": "https://shop.example.com/product/1#/__modal/cart" },
+  { "href": "https://shop.example.com/#/product/1", "slug": "checkout", "expect": "https://shop.example.com/#/product/1/__modal/checkout" },
+  { "href": "https://app.example.com/#!/cart/", "slug": "Cart Drawer", "expect": "https://app.example.com/#!/cart/__modal/cart-drawer" },
+  { "href": "https://shop.example.com/product/1#/__modal/cart", "slug": "checkout", "expect": "https://shop.example.com/product/1#/__modal/checkout" },
+  { "href": "https://shop.example.com/", "slug": "장바구니", "expect": "https://shop.example.com/#/__modal/dialog" }
+ ],
+ "slug": [
+  { "raw": "  Cart__Drawer!! ", "expect": "cart-drawer" },
+  { "raw": "장바구니", "expect": "dialog" },
+  { "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expect": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  { "raw": "checkout-", "expect": "checkout" },
+  { "raw": "size-guide", "expect": "size-guide" }
+ ]
+}
