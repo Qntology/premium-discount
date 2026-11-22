@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn cn267_and_cn277_wallet_claim_preseeds_session_registrations_preventing_run_inflation() {
+    fn cn267_wallet_claim_preseeds_session_registrations_preventing_run_inflation() {
         let session_k = account_key(&V::from("secret"), "session", &fill('a')).unwrap();
         let wallet_k = account_key(&V::from("secret"), "wallet", &fill('b')).unwrap();
         let courses = vec![fill('1'), fill('2')];
@@ -950,6 +950,23 @@ mod tests {
         // Session re-submission produces the exact same registration key -> ON CONFLICT DO NOTHING -> duplicate: true (+0 runs)!
         assert_eq!(preseeded[0], hash_str(&format!("{session_k}{}", courses[0])));
         assert_ne!(preseeded[0], hash_str(&format!("{wallet_k}{}", courses[0])));
+    }
+
+    #[test]
+    fn cn277_multi_layer_abuse_defense_blocks_detour_ballots_wallet_inflation_and_batch_replays() {
+        let session_k = account_key(&V::from("secret"), "session", &fill('a')).unwrap();
+        let wallet_k = account_key(&V::from("secret"), "wallet", &fill('b')).unwrap();
+        let app = fill('9');
+        let goal = fill('8');
+        let target = fill('7');
+        // 1) 5 detour variants from one wallet collapse to 1 ballot_id
+        let ballots: HashSet<String> = (0..5).map(|_| ballot_id(&wallet_k, &app, &goal, &target)).collect();
+        assert_eq!(ballots.len(), 1);
+        // 2) Wallet->session claim pre-seeds session registration so run inflation is 0
+        let course = fill('3');
+        let preseeded = plan_wallet_claim_registrations(&session_k, std::slice::from_ref(&course));
+        assert_eq!(preseeded, vec![hash_str(&format!("{session_k}{course}"))]);
+        // 3) batch_id validation enforces safe idempotent receipt keys
         assert!(valid_batch_id("batch_1234567890abcdef"));
         assert!(!valid_batch_id("short"));
     }

@@ -1,0 +1,119 @@
+{
+  "contract": "accessible_nav_v1",
+  "scenario": "phase_7_accessibility",
+  "title": "포용적 접근성 내비게이션 계약 (Phase 7)",
+  "source": "최종_코스와 체크포인트 N_N 시나리오 목차.docx (AC-01 ~ AC-06)",
+  "params": {
+    "spastic_bounce_ms": 80,
+    "hold_shift_margin_ms": 450,
+    "spoken_lock_hold_sr_ms": 20000,
+    "screen_reader_accept_window_ms": 35000,
+    "speech_coalesce_window_ms": 2500,
+    "reading_ms_per_char": 120,
+    "quota_accessible": 4
+  },
+  "cases": [
+    {
+      "id": "AC-01",
+      "part": "P7.1",
+      "title": "진전·지연 릴리스 탄성 획 Press 수렴 및 80ms 경직 바운스 광클 면책",
+      "given": "KinematicProfile(tremor_px=30, release_ms=900) 하에서 wander=28px, dur=820ms 입력 및 60ms 바운스 3회",
+      "expect": [
+        "@hold 분열 없이 표준 Gesture::Press로 수렴한다",
+        "80ms 미만 경직 바운스는 RageClick에서 면책된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/gesture.rs",
+          "test": "ac01_"
+        }
+      ]
+    },
+    {
+      "id": "AC-02",
+      "part": "P7.1",
+      "title": "#0 배지 뱅크 페이징 발화 잠금 보존 및 10~15번 요소 도달 + 3x3 재귀 GridInvoke",
+      "given": "15개 요소 화면에서 발화 잠금(#2) 유지 중 뱅크 1 전환 및 3x3 격자 분할",
+      "expect": [
+        "잠긴 #2 번호가 뱅크 전환 시 보존된다",
+        "10~15번 초과 요소에 도달 가능하며 3x3 grid_subrect가 정확히 분할된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/order.rs",
+          "test": "ac02_"
+        }
+      ]
+    },
+    {
+      "id": "AC-03",
+      "part": "P7.4",
+      "title": "개인 속도비(ρ_u) 정규화 shortcut_wins_v2 및 Zero-Health-Telemetry 물리 특성 비트",
+      "given": "개인 기저 속도비 ρ_u=3.0 사용자의 무마찰 33s 우회 완주(고스트 15s) 및 코스 TRAIT 비트 산출",
+      "expect": [
+        "정규화 시간 11s < 15s로 지름길 승리가 인정된다",
+        "장애 정보 전송 0건으로 물리 특성 비트 기반 접근성 라우팅이 동작한다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "ac03_"
+        }
+      ]
+    },
+    {
+      "id": "AC-04",
+      "part": "P7.2",
+      "title": "스크린리더 20s 잠금 연장 · 3D 공간 오디오 비콘 · 확대경 뷰포트 추종 도킹",
+      "given": "스크린리더 활성 시 SpokenSlotLock(20s), 우상단 극좌표 음향화, 3배 확대경 내 비가림 도킹",
+      "expect": [
+        "발화 잠금이 20초간 유지된다",
+        "우상단 극좌표가 우측 패닝·고피치로 변환되고 확대경 내 대상을 가리지 않는 모서리에 도킹된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src/nav_target.rs",
+          "test": "ac04_"
+        }
+      ]
+    },
+    {
+      "id": "AC-05",
+      "part": "P7.3",
+      "title": "구음장애·말더듬 분할 발화 병합기(CR-06 명시 취소 보존)",
+      "given": "900ms 간격으로 끊긴 '그...' → '어... 2번' → '눌러줘' 및 '아니 취소 1번으로'",
+      "expect": [
+        "미완결 조각이 단일 질의 '그 2번 눌러줘'로 병합된다",
+        "CR-06 명시적 취소/정정 시 기존 버퍼가 즉시 폐기·교체된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src/reference.rs",
+          "test": "ac05_"
+        }
+      ]
+    },
+    {
+      "id": "AC-06",
+      "part": "P7.3",
+      "title": "차분한 나침반(Calm Compass) 스톱워치 문구 제거 및 프리픽스 캐시 불변",
+      "given": "calm_compass=true 상태에서 vs_best=+4.5s, vs_public=+8.2s CourseBrief 렌더링",
+      "expect": [
+        "초·느림·빠름 등 스톱워치 압박 문구 0건",
+        "시스템+도구 프리픽스 캐시가 바이트 단위로 100% 동일하다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src/brief.rs",
+          "test": "ac06_"
+        }
+      ]
+    }
+  ]
+}
