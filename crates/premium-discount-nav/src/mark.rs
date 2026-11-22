@@ -20,6 +20,72 @@ pub const MARK_SCHEMA: &str = "navmark/1";
 /// 라벨 글 벡터의 공간: granite-embedding-97m-multilingual-r2 의 CLS (raon-zena `zena-nlp` 의 SPACE_TAG 와 같다).
 /// 두 앱이 같은 모델이라 서버가 한 색인으로 함께 찾는다
 pub const LABEL_SPACE: &str = "granite-97m-r2-cls-v1";
+/// Raon-VisionEncoder (Layout::RaonVe) 정규 비전 공간. 파일 크기·콜론을 떼어 F32/F16/피라미드 GGUF 를 하나로 수렴한다.
+pub const VISION_SPACE_RAON_VE: &str = "raon-ve-so400m-v1";
+/// google/siglip2-so400m-patch16-naflex (Layout::Siglip2Hf) 정규 비전 공간. Raon-VE 와 1152차원이 같으나 분포가 달라 분리한다.
+pub const VISION_SPACE_SIGLIP2_HF: &str = "siglip2-so400m-hf-v1";
+/// 비신경망 해시 폴백 공간 — 서버 `nav_vectors` 업로드를 금지한다.
+pub const HASH_NGRAM_SPACE: &str = "hash-ngram-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalSpace {
+    pub name: &'static str,
+    pub dims: usize,
+}
+
+/// Phase 5 Part 3 표준 임베딩 공간 레지스트리 (`SPACE_RE` 호환, 콜론 없음).
+pub const CANONICAL_SPACES: [CanonicalSpace; 3] = [
+    CanonicalSpace { name: LABEL_SPACE, dims: 384 },
+    CanonicalSpace { name: VISION_SPACE_RAON_VE, dims: 1152 },
+    CanonicalSpace { name: VISION_SPACE_SIGLIP2_HF, dims: 1152 },
+];
+
+/// 비전 모델 지문(`"raon-ve:335544320"`, `"siglip2-hf:4540000000"`)이나 레이아웃 태그를 서버 업로드용 정규 공간 키로 바꾼다.
+pub fn canonical_vision_space(fingerprint_or_layout: &str) -> Option<&'static str> {
+    let head = fingerprint_or_layout
+        .trim()
+        .to_ascii_lowercase();
+    let head = head.split(':').next().unwrap_or("");
+    if head.starts_with("raon-ve") || head.starts_with("raon_ve") {
+        Some(VISION_SPACE_RAON_VE)
+    } else if head.starts_with("siglip2-hf") || head.starts_with("siglip2_hf") || head.starts_with("siglip2-so400m") {
+        Some(VISION_SPACE_SIGLIP2_HF)
+    } else {
+        None
+    }
+}
+
+/// 표준 공간의 기대 차원 (레지스트리에 없는 사용자 정의 공간이면 `None`).
+pub fn canonical_space_dims(space: &str) -> Option<usize> {
+    CANONICAL_SPACES.iter().find(|s| s.name == space).map(|s| s.dims)
+}
+
+/// 서버 `SPACE_RE`(`/^[a-z0-9][a-z0-9._-]{0,63}$/`)와 폴백 차단(`hash-ngram-v1`)을 함께 확인한다.
+pub fn is_uploadable_space(space: &str) -> bool {
+    let s = space.trim();
+    if s.is_empty() || s.len() > 64 || s == HASH_NGRAM_SPACE || s.contains(':') {
+        return false;
+    }
+    let b = s.as_bytes();
+    let head = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    head(b[0]) && b[1..].iter().all(|&c| head(c) || matches!(c, b'.' | b'_' | b'-'))
+}
+
+/// L2 정규화 단위 벡터를 대칭 스칼라 Int8 (`[-127, 127]`)로 압축한다 (코사인 오차 < 0.001).
+pub fn quantize_unit_i8(unit: &[f32]) -> Vec<i8> {
+    unit.iter()
+        .map(|&v| {
+            let clamped = if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
+            (clamped * 127.0).round().clamp(-127.0, 127.0) as i8
+        })
+        .collect()
+}
+
+/// [`quantize_unit_i8`] 로 압축된 벡터를 L2 정규화 f32 단위 벡터로 복원한다.
+pub fn dequantize_unit_i8(q: &[i8]) -> Option<Vec<f32>> {
+    let raw: Vec<f32> = q.iter().map(|&b| b as f32 / 127.0).collect();
+    normalized(&raw)
+}
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -266,5 +332,27 @@ mod tests {
         // 하루치(1개)만으로는 근거가 모자라 판정하지 않는다
         let one = Case { obs: case.obs[..1].to_vec(), ..case.clone() };
         assert_eq!(verdict(&one, &params).unwrap().tier, Tier::Unrated);
+    }
+
+    #[test]
+    fn cn265_canonical_spaces_unify_quant_formats_and_block_hash_fallback() {
+        assert_eq!(canonical_vision_space("raon-ve:4540000000"), Some(VISION_SPACE_RAON_VE));
+        assert_eq!(canonical_vision_space("raon-ve:335544320"), Some(VISION_SPACE_RAON_VE));
+        assert_eq!(canonical_vision_space("siglip2-hf:4540000000"), Some(VISION_SPACE_SIGLIP2_HF));
+        assert_ne!(VISION_SPACE_RAON_VE, VISION_SPACE_SIGLIP2_HF);
+        assert!(is_uploadable_space(LABEL_SPACE));
+        assert!(is_uploadable_space(VISION_SPACE_RAON_VE));
+        assert!(is_uploadable_space(VISION_SPACE_SIGLIP2_HF));
+        assert!(!is_uploadable_space("raon-ve:335544320"), "colon must be rejected");
+        assert!(!is_uploadable_space(HASH_NGRAM_SPACE), "hash fallback must not upload");
+        assert_eq!(canonical_space_dims(LABEL_SPACE), Some(384));
+        assert_eq!(canonical_space_dims(VISION_SPACE_RAON_VE), Some(1152));
+        // Int8 round-trip preserves cosine similarity within < 0.001.
+        let v: Vec<f32> = (0..384).map(|i| (i as f32 * 0.13).sin()).collect();
+        let u = normalized(&v).unwrap();
+        let q = quantize_unit_i8(&u);
+        let restored = dequantize_unit_i8(&q).unwrap();
+        let cos: f32 = u.iter().zip(&restored).map(|(a, b)| a * b).sum();
+        assert!(cos > 0.999, "int8 cosine {cos}");
     }
 }

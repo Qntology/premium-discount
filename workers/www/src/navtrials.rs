@@ -296,6 +296,8 @@ pub struct ParsedRun {
     pub vectors: Vec<Vector>,
     /// 따라간 다른 사용자의 코스 (없으면 None)
     pub ghost: Option<String>,
+    /// Phase 4 Part 1 (FC-05/FC-06): 스텝별 사용자·환경 귀책 비트마스크 (생략 시 0)
+    pub fault_mask: u16,
 }
 
 impl ParsedRun {
@@ -345,7 +347,10 @@ fn parse_vectors(value: &V, hash: &str) -> Result<Vec<Vector>, String> {
             V::Str(s) => s,
             _ => String::new(),
         };
-        if !is_space(&space) || out.iter().any(|x| x.space == space) {
+        if !is_space(&space)
+            || !crate::navtrials_v2::is_allowed_upload_space(&space)
+            || out.iter().any(|x| x.space == space)
+        {
             return Err("spaces must be named and distinct".to_string());
         }
         let raw = v.get("vector");
@@ -461,7 +466,12 @@ pub fn parse_run(value: &V, today: f64) -> Result<ParsedRun, String> {
     }
     let raw_ghost = r.get("ghost");
     let ghost = if raw_ghost.is_nullish() { None } else { Some(parse_hash(&raw_ghost, "ghost")?) };
-    Ok(ParsedRun { app, course, steps, splits, total, kind, day, vectors, ghost })
+    let fault_mask = match r.get("fault_mask") {
+        V::Undef | V::Null => 0u16,
+        V::Num(n) if n.is_finite() && n.trunc() == n && (0.0..=65535.0).contains(&n) => n as u16,
+        _ => return Err("fault_mask must be an integer between 0 and 65535".to_string()),
+    };
+    Ok(ParsedRun { app, course, steps, splits, total, kind, day, vectors, ghost, fault_mask })
 }
 
 /// `accountKey(secret, kind, address)` = HMAC-SHA256(AUTHOR_KEY_SECRET, "nav-account|<종류>|<주소>") hex.
@@ -505,6 +515,14 @@ mod wasm {
 
     use super::*;
     use crate::auth::{read_session_credentials, verified_address, verify_wallet_request_once};
+    use crate::navtrials_v2::{
+        apply_ballot_delta, ballot_id, compute_course_traits, dead_end_ballot_id, duel_reg_id,
+        encode_unit_i8_b64, epoch_pulse_id, evaluate_vector_consensus, extract_server_shortcut_duels,
+        half_life_epoch, parse_dead_end_marks, plan_wallet_claim_registrations,
+        representative_best_swap, route_marks_v2, select_stratified_portfolio,
+        should_pioneer_promote, update_ema_splits, valid_batch_id, BallotDelta, ParsedDeadEnd,
+        PortfolioCourse, VectorConsensusAction, CLAIM_WALLET_PATH,
+    };
     use crate::ratelimit::{is_rate_limited, RETRY_AFTER_SECONDS};
     use crate::util::{changes_of, empty_response, header_or_empty, hv, json_response, pathname};
 
@@ -514,8 +532,6 @@ mod wasm {
 
     /// IN 바인딩 한 번의 수 (D1 문장당 바인딩 100 이하)
     const IN_CHUNK: usize = 90;
-    /// 다른 사용자의 공개 코스를 앱마다 몇 개까지 보여 주는가 (많이 달린 순)
-    const OTHERS_LIMIT: f64 = 10.0;
 
     /// `Math.max(a, b)` — b 는 늘 수 (날짜)
     fn js_max(a: &V, b: f64) -> V {
@@ -542,25 +558,50 @@ mod wasm {
         stringify(v).map(V::Str).unwrap_or(V::Undef)
     }
 
-    // ───────────── SQL (원본 글 그대로) ─────────────
+    // ───────────── SQL (0007 + 0011..0015 Phase 4/5/7 확장) ─────────────
 
     const SQL_EXPIRE_MINE: &str = "DELETE FROM nav_trials WHERE \"account\" = ?1 AND \"last_day\" < ?2";
     const SQL_COLLECTION: &str = "SELECT * FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2";
+    const SQL_ALL_MINE: &str = "SELECT * FROM nav_trials WHERE \"account\" = ?1";
     const SQL_EVICT: &str = "DELETE FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3";
-    // 고침(fix-nav-lost-update): 원본의 두 upsert(excluded."runs" · "sums" … 로 읽은 값에서 계산한 절대값을 썼다) 대신.
-    // 수는 상대 갱신, 읽은 값에서 계산한 JSON(best · record · sums)은 읽은 글에 조건을 건다. 처음 넣는 행은 ON CONFLICT DO NOTHING
+    // 고침(fix-nav-lost-update) + Phase 5 Part 2/3 (best_total_ms 단조 병합 · pinned 보호)
     const SQL_EVICT_IF: &str = "DELETE FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3 AND \"touched\" = ?4";
     const SQL_TRIAL_ROW: &str = "SELECT * FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3";
-    const SQL_INSERT_TRIAL: &str = "INSERT INTO nav_trials (\"account\", \"kind\", \"app\", \"course\", \"steps\", \"runs\", \"premium\", \"discount\", \"best\", \"last\", \"last_day\", \"touched\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT (\"account\", \"app\", \"course\") DO NOTHING";
-    const SQL_UPDATE_TRIAL: &str = "UPDATE nav_trials SET \"runs\" = \"runs\" + ?5, \"premium\" = \"premium\" + ?6, \"discount\" = \"discount\" + ?7, \"best\" = ?8, \"last\" = ?9, \"last_day\" = MAX(\"last_day\", ?10), \"touched\" = ?11 WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3 AND \"best\" = ?4";
+    const SQL_INSERT_TRIAL: &str = "INSERT INTO nav_trials (\"account\", \"kind\", \"app\", \"course\", \"steps\", \"runs\", \"premium\", \"discount\", \"best\", \"last\", \"last_day\", \"touched\", \"best_total_ms\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT (\"account\", \"app\", \"course\") DO NOTHING";
+    const SQL_UPDATE_TRIAL: &str = "UPDATE nav_trials SET \"runs\" = \"runs\" + ?5, \"premium\" = \"premium\" + ?6, \"discount\" = \"discount\" + ?7, \"best\" = CASE WHEN ?12 > 0 AND (\"best_total_ms\" = 0 OR ?12 < \"best_total_ms\") THEN ?8 ELSE \"best\" END, \"best_total_ms\" = CASE WHEN ?12 > 0 AND (\"best_total_ms\" = 0 OR ?12 < \"best_total_ms\") THEN ?12 ELSE \"best_total_ms\" END, \"last\" = ?9, \"last_day\" = MAX(\"last_day\", ?10), \"touched\" = ?11 WHERE \"account\" = ?1 AND \"app\" = ?2 AND \"course\" = ?3 AND \"best\" = ?4";
+    const SQL_MERGE_CLAIM_TRIAL: &str = "INSERT INTO nav_trials (\"account\", \"kind\", \"app\", \"course\", \"steps\", \"runs\", \"premium\", \"discount\", \"best\", \"last\", \"last_day\", \"touched\", \"best_total_ms\", \"pinned\") VALUES (?1, 'session', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT (\"account\", \"app\", \"course\") DO UPDATE SET \"runs\" = \"runs\" + excluded.\"runs\", \"premium\" = \"premium\" + excluded.\"premium\", \"discount\" = \"discount\" + excluded.\"discount\", \"best\" = CASE WHEN excluded.\"best_total_ms\" > 0 AND (nav_trials.\"best_total_ms\" = 0 OR excluded.\"best_total_ms\" < nav_trials.\"best_total_ms\") THEN excluded.\"best\" ELSE nav_trials.\"best\" END, \"best_total_ms\" = CASE WHEN excluded.\"best_total_ms\" > 0 AND (nav_trials.\"best_total_ms\" = 0 OR excluded.\"best_total_ms\" < nav_trials.\"best_total_ms\") THEN excluded.\"best_total_ms\" ELSE nav_trials.\"best_total_ms\" END, \"last_day\" = MAX(nav_trials.\"last_day\", excluded.\"last_day\"), \"touched\" = MAX(nav_trials.\"touched\", excluded.\"touched\"), \"pinned\" = MAX(nav_trials.\"pinned\", excluded.\"pinned\")";
     const SQL_COURSE_ROW: &str = "SELECT * FROM nav_courses WHERE \"course\" = ?1";
-    const SQL_INSERT_COURSE: &str = "INSERT INTO nav_courses (\"course\", \"app\", \"steps\", \"runs\", \"premium\", \"discount\", \"record\", \"sums\", \"last_day\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (\"course\") DO NOTHING";
-    const SQL_UPDATE_COURSE: &str = "UPDATE nav_courses SET \"runs\" = \"runs\" + 1, \"premium\" = \"premium\" + ?4, \"discount\" = \"discount\" + ?5, \"record\" = ?6, \"sums\" = ?7, \"last_day\" = MAX(\"last_day\", ?8) WHERE \"course\" = ?1 AND \"record\" = ?2 AND \"sums\" = ?3";
+    const SQL_INSERT_COURSE: &str = "INSERT INTO nav_courses (\"course\", \"app\", \"steps\", \"runs\", \"premium\", \"discount\", \"record\", \"sums\", \"last_day\", \"start_cp\", \"goal_cp\", \"pace_ms\", \"interaction_traits\", \"ema_splits\", \"era_record\", \"era_record_day\") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) ON CONFLICT (\"course\") DO NOTHING";
+    const SQL_UPDATE_COURSE: &str = "UPDATE nav_courses SET \"runs\" = \"runs\" + 1, \"premium\" = \"premium\" + ?4, \"discount\" = \"discount\" + ?5, \"record\" = ?6, \"sums\" = ?7, \"last_day\" = MAX(\"last_day\", ?8), \"start_cp\" = CASE WHEN \"start_cp\" = '' THEN ?9 ELSE \"start_cp\" END, \"goal_cp\" = CASE WHEN \"goal_cp\" = '' THEN ?10 ELSE \"goal_cp\" END, \"pace_ms\" = ?11, \"interaction_traits\" = ?12, \"ema_splits\" = ?13, \"era_record\" = ?14, \"era_record_day\" = ?15 WHERE \"course\" = ?1 AND \"record\" = ?2 AND \"sums\" = ?3";
+    const SQL_SWAP_COURSE_REP: &str = "UPDATE nav_courses SET \"record\" = ?4, \"sums\" = ?5, \"pace_ms\" = ?6, \"ema_splits\" = ?7, \"last_day\" = MAX(\"last_day\", ?8) WHERE \"course\" = ?1 AND \"record\" = ?2 AND \"sums\" = ?3";
     const SQL_COUNT_UP: &str = "INSERT INTO nav_counts (\"hash\", \"day\", \"type\", \"recipe\", \"n\") VALUES (?1, ?2, ?3, ?4, 1)\n\t\t\t\t ON CONFLICT (\"hash\", \"day\", \"type\", \"recipe\") DO UPDATE SET \"n\" = \"n\" + 1";
-    const SQL_REGISTER: &str = "INSERT INTO nav_registrations (\"id\", \"day\") VALUES (?1, ?2) ON CONFLICT DO NOTHING";
-    const SQL_VECTOR: &str = "INSERT INTO nav_vectors (\"hash\", \"space\", \"dims\", \"vector\", \"day\") VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING";
+    const SQL_COUNT_DEC: &str = "UPDATE nav_counts SET \"n\" = MAX(0, \"n\" - 1) WHERE \"hash\" = ?1 AND \"type\" = ?2 AND \"recipe\" = ?3 AND \"n\" > 0 AND \"day\" = (SELECT MAX(\"day\") FROM nav_counts WHERE \"hash\" = ?1 AND \"type\" = ?2 AND \"recipe\" = ?3 AND \"n\" > 0)";
+    const SQL_ROUTE_FIT_UP: &str = "INSERT INTO nav_route_fit_counts (\"hash\", \"goal\", \"day\", \"type\", \"recipe\", \"n\") VALUES (?1, ?2, ?3, ?4, ?5, 1) ON CONFLICT (\"hash\", \"goal\", \"day\", \"type\", \"recipe\") DO UPDATE SET \"n\" = \"n\" + 1";
+    const SQL_ROUTE_FIT_DEC: &str = "UPDATE nav_route_fit_counts SET \"n\" = MAX(0, \"n\" - 1) WHERE \"hash\" = ?1 AND \"goal\" = ?2 AND \"type\" = ?3 AND \"recipe\" = ?4 AND \"n\" > 0 AND \"day\" = (SELECT MAX(\"day\") FROM nav_route_fit_counts WHERE \"hash\" = ?1 AND \"goal\" = ?2 AND \"type\" = ?3 AND \"recipe\" = ?4 AND \"n\" > 0)";
+    const SQL_BALLOT_GET: &str = "SELECT \"sign\" FROM nav_route_ballots WHERE \"id\" = ?1";
+    const SQL_BALLOT_UPSERT: &str = "INSERT INTO nav_route_ballots (\"id\", \"sign\", \"day\") VALUES (?1, ?2, ?3) ON CONFLICT (\"id\") DO UPDATE SET \"sign\" = excluded.\"sign\", \"day\" = excluded.\"day\"";
+    const SQL_DUEL_REG: &str = "INSERT INTO nav_shortcut_duel_regs (\"id\", \"day\") VALUES (?1, ?2) ON CONFLICT DO NOTHING";
+    const SQL_DUEL_UPSERT: &str = "INSERT INTO nav_shortcut_duels (\"fork_course\", \"skipped_cp\", \"taken_cp\", \"app\", \"wins\", \"saved_ms_sum\", \"margin_sum\", \"promoted\", \"last_day\") VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 0, ?7) ON CONFLICT (\"fork_course\", \"skipped_cp\", \"taken_cp\") DO UPDATE SET \"wins\" = \"wins\" + 1, \"saved_ms_sum\" = \"saved_ms_sum\" + excluded.\"saved_ms_sum\", \"margin_sum\" = \"margin_sum\" + excluded.\"margin_sum\", \"last_day\" = MAX(\"last_day\", excluded.\"last_day\")";
+    const SQL_DUEL_GET: &str = "SELECT \"wins\", \"saved_ms_sum\", \"margin_sum\", \"promoted\" FROM nav_shortcut_duels WHERE \"fork_course\" = ?1 AND \"skipped_cp\" = ?2 AND \"taken_cp\" = ?3";
+    const SQL_DUEL_PROMOTE: &str = "UPDATE nav_shortcut_duels SET \"promoted\" = 1 WHERE \"fork_course\" = ?1 AND \"skipped_cp\" = ?2 AND \"taken_cp\" = ?3";
+    const SQL_DUELS_PROMOTED: &str = "SELECT \"fork_course\", \"skipped_cp\", \"taken_cp\", \"wins\", \"saved_ms_sum\", \"margin_sum\" FROM nav_shortcut_duels WHERE \"app\" = ?1 AND \"promoted\" = 1 ORDER BY \"wins\" DESC LIMIT 32";
+    const SQL_REGISTER: &str = "INSERT INTO nav_registrations (\"id\", \"day\", \"rep_splits\", \"rep_type\") VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING";
+    const SQL_REGISTER_PRESEED: &str = "INSERT INTO nav_registrations (\"id\", \"day\") VALUES (?1, ?2) ON CONFLICT DO NOTHING";
+    const SQL_REGISTER_GET: &str = "SELECT \"rep_splits\", \"rep_type\" FROM nav_registrations WHERE \"id\" = ?1";
+    const SQL_REGISTER_UPDATE_REP: &str = "UPDATE nav_registrations SET \"rep_splits\" = ?2, \"rep_type\" = ?3, \"day\" = MAX(\"day\", ?4) WHERE \"id\" = ?1";
+    const SQL_EPOCH_PULSE: &str = "INSERT INTO nav_epoch_pulses (\"id\", \"epoch\", \"day\", \"sign\") VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING";
+    const SQL_DIRTY_MARK: &str = "INSERT INTO nav_verdict_dirty (\"hash\", \"kind\", \"app\", \"scope_to\", \"at\") VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (\"hash\") DO UPDATE SET \"at\" = excluded.\"at\"";
+    const SQL_BATCH_GET: &str = "SELECT \"response_json\" FROM nav_batch_receipts WHERE \"batch_id\" = ?1 AND \"account\" = ?2 AND \"created_ms\" >= ?3";
+    const SQL_BATCH_PUT: &str = "INSERT INTO nav_batch_receipts (\"batch_id\", \"account\", \"response_json\", \"created_ms\") VALUES (?1, ?2, ?3, ?4) ON CONFLICT (\"batch_id\") DO NOTHING";
+    const SQL_VECTOR_GET: &str = "SELECT \"dims\", \"vector\", \"confirmations\", \"locked\", \"candidate_vector\", \"candidate_hits\" FROM nav_vectors WHERE \"hash\" = ?1 AND \"space\" = ?2";
+    const SQL_VECTOR_INSERT: &str = "INSERT INTO nav_vectors (\"hash\", \"space\", \"dims\", \"vector\", \"day\", \"confirmations\", \"locked\") VALUES (?1, ?2, ?3, ?4, ?5, 1, 0) ON CONFLICT DO NOTHING";
+    const SQL_VECTOR_CONFIRM: &str = "UPDATE nav_vectors SET \"vector\" = ?3, \"confirmations\" = ?4, \"locked\" = ?5, \"day\" = MAX(\"day\", ?6) WHERE \"hash\" = ?1 AND \"space\" = ?2 AND \"locked\" = 0";
+    const SQL_VECTOR_CANDIDATE: &str = "UPDATE nav_vectors SET \"candidate_vector\" = ?3, \"candidate_hits\" = ?4 WHERE \"hash\" = ?1 AND \"space\" = ?2 AND \"locked\" = 0";
+    const SQL_VECTOR_REPLACE: &str = "UPDATE nav_vectors SET \"vector\" = ?3, \"confirmations\" = 2, \"locked\" = 0, \"candidate_vector\" = NULL, \"candidate_hits\" = 0, \"day\" = MAX(\"day\", ?4) WHERE \"hash\" = ?1 AND \"space\" = ?2 AND \"locked\" = 0";
     const SQL_MINE: &str = "SELECT * FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2 ORDER BY \"touched\" DESC";
     const SQL_TOP: &str = "SELECT * FROM nav_courses WHERE \"app\" = ?1 AND \"runs\" >= ?2 ORDER BY \"runs\" DESC, \"course\" LIMIT ?3";
+    const SQL_TOP_ENTRY: &str = "SELECT * FROM nav_courses WHERE \"app\" = ?1 AND \"runs\" >= ?2 AND \"start_cp\" = ?3 ORDER BY \"pace_ms\" ASC, \"runs\" DESC LIMIT 16";
+    const SQL_TOP_ACCESSIBLE: &str = "SELECT * FROM nav_courses WHERE \"app\" = ?1 AND \"runs\" >= ?2 AND (\"interaction_traits\" & 3) = 3 ORDER BY \"pace_ms\" ASC, \"runs\" DESC LIMIT 12";
     const SQL_DELETE_APP: &str = "DELETE FROM nav_trials WHERE \"account\" = ?1 AND \"app\" = ?2";
     const SQL_DELETE_ALL: &str = "DELETE FROM nav_trials WHERE \"account\" = ?1";
 
@@ -570,6 +611,64 @@ mod wasm {
     fn sql_counts(n: usize) -> String {
         let marks = (0..n).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(", ");
         format!("SELECT \"hash\", \"type\", SUM(\"n\") AS \"n\" FROM nav_counts WHERE \"recipe\" = ?1 AND \"hash\" IN ({marks}) GROUP BY \"hash\", \"type\"")
+    }
+    fn sql_route_fit_counts(n: usize) -> String {
+        let marks = (0..n).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(", ");
+        format!("SELECT \"hash\", \"goal\", \"type\", SUM(\"n\") AS \"n\" FROM nav_route_fit_counts WHERE \"recipe\" = ?1 AND \"hash\" IN ({marks}) GROUP BY \"hash\", \"goal\", \"type\"")
+    }
+    fn sql_verdicts(n: usize) -> String {
+        format!("SELECT * FROM nav_verdicts WHERE \"hash\" IN ({})", crate::util::binds(n))
+    }
+    fn sql_confirmed_vectors(n: usize) -> String {
+        format!("SELECT \"hash\", \"space\", \"dims\", \"vector\" FROM nav_vectors WHERE \"confirmations\" >= 2 AND \"hash\" IN ({})", crate::util::binds(n))
+    }
+
+    fn v_to_f32_vec(v: &V) -> Option<Vec<f32>> {
+        let bytes: Vec<u8> = match v {
+            V::Bytes(b) => b.borrow().clone(),
+            V::Arr(_) => v.items().into_iter().map(|x| x.to_num() as u8).collect(),
+            _ => return None,
+        };
+        if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+            return None;
+        }
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        )
+    }
+
+    fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn parse_f64_array(v: &V) -> Option<Vec<f64>> {
+        if !v.is_arr() {
+            return None;
+        }
+        let items = v.items();
+        if items.is_empty() {
+            return None;
+        }
+        Some(items.into_iter().map(|x| x.to_num()).collect())
+    }
+
+    fn splits_v_from_f64(xs: &[f64]) -> V {
+        V::from(xs.iter().map(|&x| V::Num(x)).collect::<Vec<_>>())
+    }
+
+    fn verdict_row_to_v(r: &V) -> V {
+        obj! {
+            "tier" => r.get("tier"),
+            "grade" => r.get("grade"),
+            "evidence" => r.get("evidence"),
+            "value" => r.get("value"),
+            "level" => r.get("level"),
+            "rank" => r.get("rank"),
+            "superseded" => r.get("superseded").to_num() != 0.0,
+        }
     }
 
     /// 계정 (`NavAccount`)
@@ -801,11 +900,13 @@ mod wasm {
                 let mut status = "stored";
                 let mut gone = V::Undef;
                 if collection.len() >= MAX_COURSES {
-                    // 가장 오래 달리지 않은 코스 자리를 덮어쓴다
-                    let mut oldest_row = collection.values().next().cloned().expect("10행 이상");
-                    for b in collection.values().skip(1) {
+                    // Phase 5 Part 2 (Pinned-SLRU): 수동 고정(pinned != 0) 코스를 우선 보호하고 비고정 중 가장 오래된 코스를 밀어낸다
+                    let unpinned: Vec<&V> = collection.values().filter(|r| r.get("pinned").to_num() == 0.0).collect();
+                    let pool: Vec<&V> = if unpinned.is_empty() { collection.values().collect() } else { unpinned };
+                    let mut oldest_row = pool[0].clone();
+                    for b in &pool[1..] {
                         if less_than(&b.get("touched"), &oldest_row.get("touched")) == Some(true) {
-                            oldest_row = b.clone();
+                            oldest_row = (*b).clone();
                         }
                     }
                     let oldest_course = oldest_row.get("course");
@@ -827,6 +928,7 @@ mod wasm {
                     "last" => run.splits_v(),
                     "last_day" => run.day,
                     "touched" => touched,
+                    "best_total_ms" => run.total,
                 };
                 collection.insert(mk(&course), fresh.clone());
                 dirty.insert(dirty_key.clone(), (run.app.clone(), fresh));
@@ -841,21 +943,25 @@ mod wasm {
         }
 
         // 사용자마다 코스 등록은 한 번: 사용자 코스 id = hashId(<계정 키> + <코스 id>).
-        // 고침(fix-nav-lost-update): 원본은 등록을 읽어(SELECT) 보고 batch 에서 넣어, 같은 사용자의 동시 요청 둘이 모두 처음 등록으로 세어
-        // 합계 · 판정 수에 두 번 들어갔다. 등록을 먼저 잡는다: INSERT … ON CONFLICT DO NOTHING 의 바뀐 행이 1 이면 이 요청이 처음이다
-        // (같은 요청에서 같은 코스를 두 번 보내면 앞의 것만). 등록이 합계 · 판정 수를 쓸지 정하므로 batch 밖 앞으로 옮겼고,
-        // 아래에서 쓰지 못하면(D1 오류 · 원본처럼 던지는 TypeError) 잡은 등록을 되돌린다
+        // Phase 5 Part 2: 대표 기록(rep_splits, rep_type)을 함께 저장해 duplicate 재주행 시 차분 치환을 지원한다.
         let registration_of = |run: &ParsedRun| hash_str(&format!("{}{}", account.key, run.course));
-        let mut first_day: IndexMap<String, f64> = IndexMap::new();
+        let mut first_reg: IndexMap<String, (f64, String, i32)> = IndexMap::new();
         for run in runs.iter().flatten() {
-            first_day.entry(registration_of(run)).or_insert(run.day);
+            first_reg.entry(registration_of(run)).or_insert_with(|| {
+                let splits_json = stringify(&run.splits_v()).unwrap_or_else(|| "[]".to_string());
+                (run.day, splits_json, run.kind)
+            });
         }
         let mut claims = Vec::new();
-        for (id, day) in &first_day {
-            claims.push(stmt(env, SQL_REGISTER, &[V::from(id.as_str()), V::Num(*day)])?);
+        for (id, (day, rep_splits, rep_type)) in &first_reg {
+            claims.push(stmt(
+                env,
+                SQL_REGISTER,
+                &[V::from(id.as_str()), V::Num(*day), V::from(rep_splits.as_str()), V::Num(*rep_type as f64)],
+            )?);
         }
         let claim_out = env.batch("DB", &V::from(claims)).await?;
-        let claimed: Vec<String> = first_day.keys().enumerate().filter(|(k, _)| changes_of(&claim_out.at(*k)) > 0.0).map(|(_, id)| id.clone()).collect();
+        let claimed: Vec<String> = first_reg.keys().enumerate().filter(|(k, _)| changes_of(&claim_out.at(*k)) > 0.0).map(|(_, id)| id.clone()).collect();
         let mut fresh = vec![false; runs.len()];
         let mut seen: IndexSet<String> = IndexSet::new();
         for (i, run) in runs.iter().enumerate() {
@@ -884,7 +990,10 @@ mod wasm {
                 }
                 let premium = if run.kind == 1 { 1.0 } else { 0.0 };
                 let discount = if run.kind == -1 { 1.0 } else { 0.0 };
+                let start_cp = run.steps.first().map(|s| s.id.as_str()).unwrap_or("");
+                let goal_cp = run.steps.last().map(|s| s.id.as_str()).unwrap_or("");
                 let Some(prev) = prev else {
+                    let traits = compute_course_traits(&run.steps, &run.splits, discount, 1.0);
                     totals.insert(
                         ck.clone(),
                         obj! {
@@ -897,6 +1006,13 @@ mod wasm {
                             "record" => run.splits_v(),
                             "sums" => run.splits_v(),
                             "last_day" => run.day,
+                            "start_cp" => start_cp,
+                            "goal_cp" => goal_cp,
+                            "pace_ms" => run.total,
+                            "interaction_traits" => traits as f64,
+                            "ema_splits" => run.splits_v(),
+                            "era_record" => run.splits_v(),
+                            "era_record_day" => run.day,
                         },
                     );
                     changed.insert(ck, i);
@@ -905,18 +1021,47 @@ mod wasm {
                 if less_than(&V::Num(run.total), &last_of(&prev.g("record")?)?) == Some(true) {
                     prev.put("record", run.splits_v());
                 }
+                let next_runs = prev.get("runs").to_num() + 1.0;
+                let next_discount = prev.get("discount").to_num() + discount;
                 prev.put("runs", add(&prev.get("runs"), &V::Num(1.0)));
                 prev.put("premium", add(&prev.get("premium"), &V::Num(premium)));
                 prev.put("discount", add(&prev.get("discount"), &V::Num(discount)));
-                // prev.sums = prev.sums.map((s, k) => s + (run.splits[k] ?? 0))
-                prev.put("sums", V::from(sums_plus(&prev.g("sums")?, run, "prev.sums")?));
+                let next_sums = sums_plus(&prev.g("sums")?, run, "prev.sums")?;
+                let next_total_sum = next_sums.last().map(V::to_num).unwrap_or(run.total);
+                let next_pace = if next_runs > 0.0 { js_round(next_total_sum / next_runs) } else { run.total };
+                let prev_ema_vec = prev
+                    .get("ema_splits")
+                    .as_str()
+                    .and_then(|s| js_parse(&V::from(s)).ok())
+                    .and_then(|v| parse_f64_array(&v));
+                let next_ema = update_ema_splits(prev_ema_vec.as_deref(), &run.splits, 0.15);
+                let traits = compute_course_traits(&run.steps, &next_ema, next_discount, next_runs);
+                // 30일 에라 최고기록 회전
+                let prev_era_day = prev.get("era_record_day").to_num();
+                let mut era_rec = prev
+                    .get("era_record")
+                    .as_str()
+                    .and_then(|s| js_parse(&V::from(s)).ok())
+                    .unwrap_or_else(|| prev.get("record"));
+                let mut era_day = prev_era_day;
+                if prev_era_day <= 0.0 || run.day - prev_era_day >= 30.0 || less_than(&V::Num(run.total), &last_of(&era_rec).unwrap_or(V::Num(f64::INFINITY))) == Some(true) {
+                    era_rec = run.splits_v();
+                    era_day = run.day;
+                }
+                prev.put("sums", V::from(next_sums));
                 prev.put("last_day", js_max(&prev.get("last_day"), run.day));
+                prev.put("start_cp", V::from(start_cp));
+                prev.put("goal_cp", V::from(goal_cp));
+                prev.put("pace_ms", V::Num(next_pace));
+                prev.put("interaction_traits", V::Num(traits as f64));
+                prev.put("ema_splits", splits_v_from_f64(&next_ema));
+                prev.put("era_record", era_rec);
+                prev.put("era_record_day", V::Num(era_day));
                 changed.insert(ck, i);
             }
 
             let mut statements: Vec<V> = Vec::new();
             for (app, course, base, index) in &evicted {
-                // 읽은 행은 그때의 touched 일 때만 지운다 (그 사이 다른 요청이 다시 달린 코스를 지우지 않게). 이 요청에서 넣었다가 밀려난 행은 D1 에 없다
                 if base.is_undef() {
                     statements.push(stmt(env, SQL_EVICT, &[key.clone(), V::from(app.as_str()), course.clone()])?);
                     checks.push(None);
@@ -945,10 +1090,10 @@ mod wasm {
                             json(&row.get("last")),
                             row.get("last_day"),
                             row.get("touched"),
+                            V::Num(a.best_total),
                         ],
                     )?);
                 } else {
-                    // 읽은 행: 수는 더하고, best 는 읽은 글일 때만 바꾼다
                     statements.push(stmt(
                         env,
                         SQL_UPDATE_TRIAL,
@@ -964,6 +1109,7 @@ mod wasm {
                             json(&row.get("last")),
                             V::Num(a.last_day),
                             row.get("touched"),
+                            V::Num(a.best_total),
                         ],
                     )?);
                 }
@@ -974,6 +1120,8 @@ mod wasm {
                 let run = runs[ri].as_ref().expect("처음 등록하는 런");
                 let stored = t.get("stored");
                 let course = t.get("course");
+                let start_cp = run.steps.first().map(|s| s.id.as_str()).unwrap_or("");
+                let goal_cp = run.steps.last().map(|s| s.id.as_str()).unwrap_or("");
                 if stored.is_undef() {
                     statements.push(stmt(
                         env,
@@ -988,6 +1136,13 @@ mod wasm {
                             json(&t.get("record")),
                             json(&t.get("sums")),
                             t.get("last_day"),
+                            V::from(start_cp),
+                            V::from(goal_cp),
+                            t.get("pace_ms"),
+                            t.get("interaction_traits"),
+                            json(&t.get("ema_splits")),
+                            json(&t.get("era_record")),
+                            t.get("era_record_day"),
                         ],
                     )?);
                     checks.push(Some(Check::Course { course: course.to_str(), insert: true }));
@@ -1004,6 +1159,13 @@ mod wasm {
                             json(&t.get("record")),
                             json(&t.get("sums")),
                             V::Num(run.day),
+                            V::from(start_cp),
+                            V::from(goal_cp),
+                            t.get("pace_ms"),
+                            t.get("interaction_traits"),
+                            json(&t.get("ema_splits")),
+                            json(&t.get("era_record")),
+                            t.get("era_record_day"),
                         ],
                     )?);
                     checks.push(Some(Check::Course { course: course.to_str(), insert: false }));
@@ -1012,47 +1174,235 @@ mod wasm {
             let count_up = |hash: V, day: f64, kind: i32| stmt(env, SQL_COUNT_UP, &[hash, V::Num(day), V::Num(kind as f64), V::from(NAV_RECIPE)]);
             for (i, run) in runs.iter().enumerate() {
                 let Some(run) = run else { continue };
+                let goal_cp = run.steps.last().map(|s| s.id.as_str()).unwrap_or("");
                 if fresh[i] && run.kind != 0 {
                     statements.push(count_up(V::from(run.course.as_str()), run.day, run.kind)?);
+                    checks.push(None);
+                    statements.push(stmt(
+                        env,
+                        SQL_DIRTY_MARK,
+                        &[V::from(run.course.as_str()), V::from("course"), V::from(run.app.as_str()), V::from(goal_cp), V::Num(now_ms)],
+                    )?);
                     checks.push(None);
                 }
             }
 
-            // 고스트 따라가기 판정. 고스트가 공개됐는지는 이 요청을 쓰기 전의 합계로 본다
+            // Phase 4 Part 1 & 2: 고스트 따라가기 판정(route_marks_v2 + 1인1표 ballot + 목적지별 route_fit + 갈림길 대결 선행 승격)
             let ghost_ids = unique(runs.iter().flatten().filter_map(|r| r.ghost.as_deref().map(V::from)));
             let ghosts = read_courses(env, &ghost_ids).await?;
             for (i, run) in runs.iter().enumerate() {
                 let Some(run) = run else { continue };
                 let Some(ghost_id) = &run.ghost else { continue };
                 let ghost = ghosts.get(&mk(&V::from(ghost_id.as_str())));
-                let marks = match ghost {
+                let (marks, ghost_steps_vec, ghost_avg_splits) = match ghost {
                     Some(g) if fresh[i] && strict_eq(&g.get("app"), &V::from(run.app.as_str())) && js_ge(&g.get("runs"), PUBLISH_MIN_RUNS) => {
                         let steps = run.steps_v();
                         let ghost_steps = js_parse(&g.get("steps"))?;
-                        route_marks(&steps, &ghost_steps)?
+                        let g_runs = g.get("runs").to_num().max(1.0);
+                        let g_sums = parse_f64_array(&g.get("sums")).unwrap_or_default();
+                        let g_avg: Vec<f64> = g_sums.iter().map(|s| s / g_runs).collect();
+                        let g_avg_total = g_avg.last().copied().unwrap_or(0.0);
+                        let m = route_marks_v2(&steps, &ghost_steps, run.total, run.kind, g_avg_total, run.fault_mask)?;
+                        (m, ghost_steps.items(), g_avg)
                     }
-                    _ => None,
+                    _ => (None, Vec::new(), Vec::new()),
                 };
                 let Some(marks) = marks else {
                     results[i].put("route", V::Null);
                     continue;
                 };
-                for (step, kind) in &marks {
-                    statements.push(count_up(V::from(checkpoint_id_v(step)?), run.day, *kind)?);
-                    checks.push(None);
+                let goal_cp = run.steps.last().map(|s| s.id.as_str()).unwrap_or("");
+                let mut prem_cnt = 0usize;
+                let mut disc_cnt = 0usize;
+                for (step, outcome) in &marks {
+                    let Some(sign) = outcome.sign() else { continue };
+                    let cp_id = checkpoint_id_v(step)?;
+                    let bid = ballot_id(&account.key, &run.app, goal_cp, &cp_id);
+                    let prev_row = js::first(&stmt(env, SQL_BALLOT_GET, &[V::from(bid.as_str())])?).await?;
+                    let prev_sign = if prev_row.is_nullish() { None } else { Some(prev_row.get("sign").to_num() as i32) };
+                    match apply_ballot_delta(prev_sign, sign) {
+                        BallotDelta::Duplicate => continue,
+                        BallotDelta::First(new_sign) => {
+                            statements.push(stmt(env, SQL_BALLOT_UPSERT, &[V::from(bid.as_str()), V::Num(new_sign as f64), V::Num(run.day)])?);
+                            checks.push(None);
+                            statements.push(count_up(V::from(cp_id.as_str()), run.day, new_sign)?);
+                            checks.push(None);
+                            statements.push(stmt(
+                                env,
+                                SQL_ROUTE_FIT_UP,
+                                &[V::from(cp_id.as_str()), V::from(goal_cp), V::Num(run.day), V::Num(new_sign as f64), V::from(NAV_RECIPE)],
+                            )?);
+                            checks.push(None);
+                            statements.push(stmt(
+                                env,
+                                SQL_DIRTY_MARK,
+                                &[V::from(cp_id.as_str()), V::from("checkpoint"), V::from(run.app.as_str()), V::from(goal_cp), V::Num(now_ms)],
+                            )?);
+                            checks.push(None);
+                        }
+                        BallotDelta::Flipped { old, new } => {
+                            statements.push(stmt(env, SQL_BALLOT_UPSERT, &[V::from(bid.as_str()), V::Num(new as f64), V::Num(run.day)])?);
+                            checks.push(None);
+                            statements.push(stmt(env, SQL_COUNT_DEC, &[V::from(cp_id.as_str()), V::Num(old as f64), V::from(NAV_RECIPE)])?);
+                            checks.push(None);
+                            statements.push(stmt(
+                                env,
+                                SQL_ROUTE_FIT_DEC,
+                                &[V::from(cp_id.as_str()), V::from(goal_cp), V::Num(old as f64), V::from(NAV_RECIPE)],
+                            )?);
+                            checks.push(None);
+                            statements.push(count_up(V::from(cp_id.as_str()), run.day, new)?);
+                            checks.push(None);
+                            statements.push(stmt(
+                                env,
+                                SQL_ROUTE_FIT_UP,
+                                &[V::from(cp_id.as_str()), V::from(goal_cp), V::Num(run.day), V::Num(new as f64), V::from(NAV_RECIPE)],
+                            )?);
+                            checks.push(None);
+                            statements.push(stmt(
+                                env,
+                                SQL_DIRTY_MARK,
+                                &[V::from(cp_id.as_str()), V::from("checkpoint"), V::from(run.app.as_str()), V::from(goal_cp), V::Num(now_ms)],
+                            )?);
+                            checks.push(None);
+                        }
+                    }
+                    if sign == 1 {
+                        prem_cnt += 1;
+                    } else {
+                        disc_cnt += 1;
+                    }
                 }
-                let premium = marks.iter().filter(|(_, k)| *k == 1).count();
-                let discount = marks.iter().filter(|(_, k)| *k == -1).count();
-                results[i].put("route", obj! { "ghost" => ghost_id.as_str(), "premium" => premium, "discount" => discount });
+                results[i].put("route", obj! { "ghost" => ghost_id.as_str(), "premium" => prem_cnt, "discount" => disc_cnt });
+
+                // Phase 4 Part 2: 서버 갈림길 대결 추출 및 3인 합의 선행 승격
+                if let Ok(duels) = extract_server_shortcut_duels(run, &ghost_steps_vec, &ghost_avg_splits) {
+                    for duel in duels {
+                        let drid = duel_reg_id(&account.key, &duel.fork_course, &duel.taken_cp, &duel.skipped_cp);
+                        let reg_res = js::run(&stmt(env, SQL_DUEL_REG, &[V::from(drid.as_str()), V::Num(run.day)])?).await?;
+                        if changes_of(&reg_res) <= 0.0 {
+                            continue;
+                        }
+                        js::run(&stmt(
+                            env,
+                            SQL_DUEL_UPSERT,
+                            &[
+                                V::from(duel.fork_course.as_str()),
+                                V::from(duel.skipped_cp.as_str()),
+                                V::from(duel.taken_cp.as_str()),
+                                V::from(run.app.as_str()),
+                                V::Num(duel.saved_ms.round()),
+                                V::Num(duel.margin),
+                                V::Num(run.day),
+                            ],
+                        )?)
+                        .await?;
+                        let drow = js::first(&stmt(
+                            env,
+                            SQL_DUEL_GET,
+                            &[V::from(duel.fork_course.as_str()), V::from(duel.skipped_cp.as_str()), V::from(duel.taken_cp.as_str())],
+                        )?)
+                        .await?;
+                        if !drow.is_nullish() && drow.get("promoted").to_num() == 0.0 {
+                            let wins = drow.get("wins").to_num() as u32;
+                            let saved_sum = drow.get("saved_ms_sum").to_num();
+                            let margin_sum = drow.get("margin_sum").to_num();
+                            let mut taken_p = 0u32;
+                            let mut taken_d = 0u32;
+                            for c in rows(env, &sql_counts(1), &[V::from(NAV_RECIPE), V::from(duel.taken_cp.as_str())]).await? {
+                                if strict_eq(&c.get("type"), &V::Num(1.0)) {
+                                    taken_p += c.get("n").to_num() as u32;
+                                } else {
+                                    taken_d += c.get("n").to_num() as u32;
+                                }
+                            }
+                            if should_pioneer_promote(wins, saved_sum, margin_sum, taken_p, taken_d) {
+                                statements.push(stmt(
+                                    env,
+                                    SQL_DUEL_PROMOTE,
+                                    &[V::from(duel.fork_course.as_str()), V::from(duel.skipped_cp.as_str()), V::from(duel.taken_cp.as_str())],
+                                )?);
+                                checks.push(None);
+                                statements.push(count_up(V::from(duel.taken_cp.as_str()), run.day, 1)?);
+                                checks.push(None);
+                                statements.push(stmt(
+                                    env,
+                                    SQL_DIRTY_MARK,
+                                    &[V::from(duel.taken_cp.as_str()), V::from("checkpoint"), V::from(run.app.as_str()), V::from(goal_cp), V::Num(now_ms)],
+                                )?);
+                                checks.push(None);
+                            }
+                        }
+                    }
+                }
             }
-            for run in runs.iter().flatten() {
+
+            // Phase 5 Part 3: 2-단계 신뢰 합의 대표 벡터(Consensus EMA Medoid)
+            for (i, run) in runs.iter().enumerate() {
+                let Some(run) = run else { continue };
+                if !fresh[i] {
+                    continue;
+                }
                 for v in &run.vectors {
-                    statements.push(stmt(
-                        env,
-                        SQL_VECTOR,
-                        &[V::from(v.hash.as_str()), V::from(v.space.as_str()), V::from(v.vector.len()), V::bytes(v.bytes()), V::Num(run.day)],
-                    )?);
-                    checks.push(None);
+                    let existing = js::first(&stmt(env, SQL_VECTOR_GET, &[V::from(v.hash.as_str()), V::from(v.space.as_str())])?).await?;
+                    if existing.is_nullish() {
+                        statements.push(stmt(
+                            env,
+                            SQL_VECTOR_INSERT,
+                            &[V::from(v.hash.as_str()), V::from(v.space.as_str()), V::from(v.vector.len()), V::bytes(v.bytes()), V::Num(run.day)],
+                        )?);
+                        checks.push(None);
+                    } else if existing.get("locked").to_num() == 0.0 {
+                        if let Some(cur) = v_to_f32_vec(&existing.get("vector")) {
+                            let conf = existing.get("confirmations").to_num().max(1.0) as u32;
+                            let cand = v_to_f32_vec(&existing.get("candidate_vector"));
+                            let cand_hits = existing.get("candidate_hits").to_num().max(0.0) as u32;
+                            match evaluate_vector_consensus(&cur, conf, false, cand.as_deref(), cand_hits, &v.vector) {
+                                VectorConsensusAction::ConfirmMerge { merged, confirmations, lock } => {
+                                    statements.push(stmt(
+                                        env,
+                                        SQL_VECTOR_CONFIRM,
+                                        &[
+                                            V::from(v.hash.as_str()),
+                                            V::from(v.space.as_str()),
+                                            V::bytes(f32_vec_to_bytes(&merged)),
+                                            V::Num(confirmations as f64),
+                                            V::Num(if lock { 1.0 } else { 0.0 }),
+                                            V::Num(run.day),
+                                        ],
+                                    )?);
+                                    checks.push(None);
+                                }
+                                VectorConsensusAction::TrackCandidate { candidate, hits } => {
+                                    statements.push(stmt(
+                                        env,
+                                        SQL_VECTOR_CANDIDATE,
+                                        &[
+                                            V::from(v.hash.as_str()),
+                                            V::from(v.space.as_str()),
+                                            V::bytes(f32_vec_to_bytes(&candidate)),
+                                            V::Num(hits as f64),
+                                        ],
+                                    )?);
+                                    checks.push(None);
+                                }
+                                VectorConsensusAction::ReplaceWithCandidate { replacement } => {
+                                    statements.push(stmt(
+                                        env,
+                                        SQL_VECTOR_REPLACE,
+                                        &[
+                                            V::from(v.hash.as_str()),
+                                            V::from(v.space.as_str()),
+                                            V::bytes(f32_vec_to_bytes(&replacement)),
+                                            V::Num(run.day),
+                                        ],
+                                    )?);
+                                    checks.push(None);
+                                }
+                                VectorConsensusAction::KeepExisting => {}
+                            }
+                        }
+                    }
                 }
             }
             if statements.is_empty() {
@@ -1064,7 +1414,6 @@ mod wasm {
         let out = match written {
             Ok(out) => out,
             Err(err) => {
-                // 쓰지 못했다: 이번에 잡은 등록을 되돌린다 (원본은 등록도 같은 batch 라 실패하면 남지 않았다). 되돌리기의 실패는 삼킨다
                 if !claimed.is_empty() {
                     let ids: Vec<V> = claimed.iter().map(|id| V::from(id.as_str())).collect();
                     let undo: R<()> = async {
@@ -1093,7 +1442,6 @@ mod wasm {
             match check {
                 Check::Trial { key } => retry_trials.push(key.clone()),
                 Check::Course { course, insert } => {
-                    // 새 코스를 넣으려 했는데 다른 요청이 먼저 만들었다
                     if *insert {
                         for (i, run) in runs.iter().enumerate() {
                             if run.as_ref().is_some_and(|r| &r.course == course) {
@@ -1131,6 +1479,7 @@ mod wasm {
                             json(&row.get("last")),
                             V::Num(a.last_day),
                             row.get("touched"),
+                            V::Num(a.best_total),
                         ],
                     )?)
                     .await?;
@@ -1154,6 +1503,7 @@ mod wasm {
                         json(&row.get("last")),
                         V::Num(a.last_day),
                         row.get("touched"),
+                        V::Num(a.best_total),
                     ],
                 )?)
                 .await?;
@@ -1168,12 +1518,15 @@ mod wasm {
             let run = runs[ri].as_ref().expect("처음 등록하는 런");
             let premium = V::Num(if run.kind == 1 { 1.0 } else { 0.0 });
             let discount = V::Num(if run.kind == -1 { 1.0 } else { 0.0 });
+            let start_cp = run.steps.first().map(|s| s.id.as_str()).unwrap_or("");
+            let goal_cp = run.steps.last().map(|s| s.id.as_str()).unwrap_or("");
             let mut done = false;
             let mut attempt = 0;
             while attempt < NAV_RETRIES && !done {
                 attempt += 1;
                 let cur = js::first(&stmt(env, SQL_COURSE_ROW, &[V::from(course.as_str())])?).await?;
                 if cur.is_nullish() {
+                    let traits = compute_course_traits(&run.steps, &run.splits, discount.to_num(), 1.0);
                     let res = js::run(&stmt(
                         env,
                         SQL_INSERT_COURSE,
@@ -1187,6 +1540,13 @@ mod wasm {
                             json(&run.splits_v()),
                             json(&run.splits_v()),
                             V::Num(run.day),
+                            V::from(start_cp),
+                            V::from(goal_cp),
+                            V::Num(run.total),
+                            V::Num(traits as f64),
+                            json(&run.splits_v()),
+                            json(&run.splits_v()),
+                            V::Num(run.day),
                         ],
                     )?)
                     .await?;
@@ -1196,7 +1556,13 @@ mod wasm {
                 let record = js_parse(&cur.g("record")?)?;
                 let sums = js_parse(&cur.g("sums")?)?;
                 let next_record = if less_than(&V::Num(run.total), &last_of(&record)?) == Some(true) { run.splits_v() } else { record };
-                let next_sums = V::from(sums_plus(&sums, run, "sums")?);
+                let next_sums_vec = sums_plus(&sums, run, "sums")?;
+                let next_runs = cur.get("runs").to_num() + 1.0;
+                let next_discount = cur.get("discount").to_num() + discount.to_num();
+                let next_pace = js_round(next_sums_vec.last().map(V::to_num).unwrap_or(run.total) / next_runs.max(1.0));
+                let next_ema = update_ema_splits(None, &run.splits, 0.15);
+                let traits = compute_course_traits(&run.steps, &next_ema, next_discount, next_runs);
+                let next_sums = V::from(next_sums_vec);
                 let res = js::run(&stmt(
                     env,
                     SQL_UPDATE_COURSE,
@@ -1209,6 +1575,13 @@ mod wasm {
                         json(&next_record),
                         json(&next_sums),
                         V::Num(run.day),
+                        V::from(start_cp),
+                        V::from(goal_cp),
+                        V::Num(next_pace),
+                        V::Num(traits as f64),
+                        json(&splits_v_from_f64(&next_ema)),
+                        json(&next_record),
+                        V::Num(run.day),
                     ],
                 )?)
                 .await?;
@@ -1219,14 +1592,16 @@ mod wasm {
             }
         }
         for (app, index) in &retry_evictions {
-            // 밀어내려던 코스를 그 사이 다른 요청이 다시 달렸다: 콜렉션을 다시 읽어 넘치면 이 요청이 쓰지 않은 것 중 가장 오래된 것을 밀어낸다
             let mine: IndexSet<String> = dirty.values().filter(|(a, _)| a == app).map(|(_, row)| mk(&row.get("course"))).collect();
             let mut done = false;
             let mut attempt = 0;
             while attempt < NAV_RETRIES && !done {
                 attempt += 1;
                 let all = rows(env, SQL_COLLECTION, &[key.clone(), V::from(app.as_str())]).await?;
-                let candidates: Vec<&V> = all.iter().filter(|r| !mine.contains(&mk(&r.get("course")))).collect();
+                let candidates: Vec<&V> = all
+                    .iter()
+                    .filter(|r| !mine.contains(&mk(&r.get("course"))) && r.get("pinned").to_num() == 0.0)
+                    .collect();
                 if all.len() <= MAX_COURSES || candidates.is_empty() {
                     done = true;
                     break;
@@ -1247,7 +1622,106 @@ mod wasm {
                 return Err(Throw::error(NAV_CONFLICT));
             }
         }
+
+        // Phase 5 Part 1 & 2: duplicate 재주행자 대표 기록 차분 치환(runs 불변) + 14일 에폭 하트비트 갱신
+        for (i, run) in runs.iter().enumerate() {
+            let Some(run) = run else { continue };
+            if fresh[i] {
+                continue;
+            }
+            let reg_id = registration_of(run);
+            if run.kind != -1 {
+                let reg_row = js::first(&stmt(env, SQL_REGISTER_GET, &[V::from(reg_id.as_str())])?).await?;
+                let cur_course = js::first(&stmt(env, SQL_COURSE_ROW, &[V::from(run.course.as_str())])?).await?;
+                if !reg_row.is_nullish() && !cur_course.is_nullish() {
+                    let old_rep = reg_row
+                        .get("rep_splits")
+                        .as_str()
+                        .and_then(|s| js_parse(&V::from(s)).ok())
+                        .and_then(|v| parse_f64_array(&v));
+                    let old_sums = js_parse(&cur_course.get("sums")).ok().and_then(|v| parse_f64_array(&v));
+                    let old_rec = js_parse(&cur_course.get("record")).ok().and_then(|v| parse_f64_array(&v));
+                    if let (Some(rep), Some(sums), Some(rec)) = (old_rep, old_sums, old_rec) {
+                        if let Some((next_sums, next_rec)) = representative_best_swap(&sums, &rep, &run.splits, &rec, run.kind) {
+                            let c_runs = cur_course.get("runs").to_num().max(1.0);
+                            let next_pace = js_round(next_sums.last().copied().unwrap_or(run.total) / c_runs);
+                            let prev_ema = cur_course
+                                .get("ema_splits")
+                                .as_str()
+                                .and_then(|s| js_parse(&V::from(s)).ok())
+                                .and_then(|v| parse_f64_array(&v));
+                            let next_ema = update_ema_splits(prev_ema.as_deref(), &run.splits, 0.15);
+                            let swap_res = js::run(&stmt(
+                                env,
+                                SQL_SWAP_COURSE_REP,
+                                &[
+                                    V::from(run.course.as_str()),
+                                    cur_course.get("record"),
+                                    cur_course.get("sums"),
+                                    json(&splits_v_from_f64(&next_rec)),
+                                    json(&splits_v_from_f64(&next_sums)),
+                                    V::Num(next_pace),
+                                    json(&splits_v_from_f64(&next_ema)),
+                                    V::Num(run.day),
+                                ],
+                            )?)
+                            .await?;
+                            if changes_of(&swap_res) > 0.0 {
+                                let _ = js::run(&stmt(
+                                    env,
+                                    SQL_REGISTER_UPDATE_REP,
+                                    &[V::from(reg_id.as_str()), json(&run.splits_v()), V::Num(run.kind as f64), V::Num(run.day)],
+                                )?)
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+            if run.kind != 0 {
+                let pid = epoch_pulse_id(&account.key, &run.course, run.day);
+                let ep = half_life_epoch(run.day);
+                let pulse_res = js::run(&stmt(
+                    env,
+                    SQL_EPOCH_PULSE,
+                    &[V::from(pid.as_str()), V::Num(ep as f64), V::Num(run.day), V::Num(run.kind as f64)],
+                )?)
+                .await?;
+                if changes_of(&pulse_res) > 0.0 {
+                    let goal_cp = run.steps.last().map(|s| s.id.as_str()).unwrap_or("");
+                    let _ = js::run(&stmt(env, SQL_COUNT_UP, &[V::from(run.course.as_str()), V::Num(run.day), V::Num(run.kind as f64), V::from(NAV_RECIPE)])?).await;
+                    let _ = js::run(&stmt(
+                        env,
+                        SQL_DIRTY_MARK,
+                        &[V::from(run.course.as_str()), V::from("course"), V::from(run.app.as_str()), V::from(goal_cp), V::Num(now_ms)],
+                    )?)
+                    .await;
+                }
+            }
+        }
         Ok(results)
+    }
+
+    /// Phase 4 Part 3: 생존자 편향 해소용 단일 체크포인트 이탈(`dead_end_marks`) 기록.
+    async fn store_dead_end_marks(env: &Env, account: &Account, marks: &[ParsedDeadEnd], now_ms: f64) -> R<usize> {
+        let mut recorded = 0usize;
+        for m in marks {
+            let bid = dead_end_ballot_id(&account.key, &m.app, &m.checkpoint_id);
+            let prev = js::first(&stmt(env, SQL_BALLOT_GET, &[V::from(bid.as_str())])?).await?;
+            if !prev.is_nullish() {
+                continue;
+            }
+            js::run(&stmt(env, SQL_BALLOT_UPSERT, &[V::from(bid.as_str()), V::Num(-1.0), V::Num(m.day)])?).await?;
+            js::run(&stmt(env, SQL_COUNT_UP, &[V::from(m.checkpoint_id.as_str()), V::Num(m.day), V::Num(-1.0), V::from(NAV_RECIPE)])?).await?;
+            js::run(&stmt(
+                env,
+                SQL_DIRTY_MARK,
+                &[V::from(m.checkpoint_id.as_str()), V::from("checkpoint"), V::from(m.app.as_str()), V::Null, V::Num(now_ms)],
+            )?)
+            .await?;
+            recorded += 1;
+        }
+        Ok(recorded)
     }
 
     /// `readMine(db, account, app)` — 앱의 내 콜렉션 (최근에 달린 순)
@@ -1279,33 +1753,99 @@ mod wasm {
         Ok(if id.is_nullish() { V::from(checkpoint_id_v(s)?) } else { id })
     }
 
-    /// `readOthers(db, app, mine)` — 다른 사용자의 공개 코스: 많이 달린 순으로 앞의 10개와, 내 콜렉션에 있는 코스 중 공개된 것
-    async fn read_others(env: &Env, app: &str, mine: &[V]) -> R<Vec<V>> {
-        let top = rows(env, SQL_TOP, &[V::from(app), V::Num(PUBLISH_MIN_RUNS), V::Num(OTHERS_LIMIT)]).await?;
+    /// `readOthers(db, app, mine, entry_cp)` — Phase 5 Part 2 + Phase 7 Part 4 4-쿼터 다양성 포트폴리오 공개 조회.
+    async fn read_others(env: &Env, app: &str, mine: &[V], entry_cp: Option<&str>) -> R<Vec<V>> {
+        // 후보 풀 수집: 상위 인기 코스(최대 40) + ?entry= 진입 일치(최대 16) + 접근성 코스(최대 12) + 내 콜렉션 공개 코스
+        let top = rows(env, SQL_TOP, &[V::from(app), V::Num(PUBLISH_MIN_RUNS), V::Num(40.0)]).await?;
         let mut table: IndexMap<String, V> = top.into_iter().map(|r| (mk(&r.get("course")), r)).collect();
+        if let Some(entry) = entry_cp {
+            for r in rows(env, SQL_TOP_ENTRY, &[V::from(app), V::Num(PUBLISH_MIN_RUNS), V::from(entry)]).await? {
+                table.entry(mk(&r.get("course"))).or_insert(r);
+            }
+        }
+        for r in rows(env, SQL_TOP_ACCESSIBLE, &[V::from(app), V::Num(PUBLISH_MIN_RUNS)]).await? {
+            table.entry(mk(&r.get("course"))).or_insert(r);
+        }
         let missing: Vec<V> = mine.iter().filter(|c| !table.contains_key(&mk(c))).cloned().collect();
         for (course, row) in read_courses(env, &missing).await? {
             if strict_eq(&row.get("app"), &V::from(app)) && js_ge(&row.get("runs"), PUBLISH_MIN_RUNS) {
-                // { ...row, record: JSON.stringify(row.record), sums: JSON.stringify(row.sums) }
                 row.put("record", json(&row.get("record")));
                 row.put("sums", json(&row.get("sums")));
                 table.insert(course, row);
             }
         }
-        // 체크포인트마다의 따라가기 판정 수 (nav_counts, 모든 날짜)
-        let mut hashes: Vec<V> = Vec::new();
+
+        // 코스 판정(nav_verdicts)을 조회해 4-쿼터 포트폴리오 선발에 반영한다.
+        let course_hashes: Vec<V> = table.values().map(|r| r.get("course")).collect();
+        let mut verdicts: IndexMap<String, V> = IndexMap::new();
+        for part in course_hashes.chunks(IN_CHUNK) {
+            if part.is_empty() {
+                continue;
+            }
+            for vr in rows(env, &sql_verdicts(part.len()), part).await? {
+                verdicts.insert(mk(&vr.get("hash")), vr);
+            }
+        }
+        let mut portfolio_cands = Vec::with_capacity(table.len());
         for r in table.values() {
+            let c_id = r.get("course").to_str();
+            let v_row = verdicts.get(&mk(&r.get("course")));
+            let c_tier = v_row
+                .map(|vr| vr.get("tier").to_str())
+                .unwrap_or_else(|| tier(&r.get("premium"), &r.get("discount")).to_string());
+            let grade = v_row.map(|vr| vr.get("grade").to_num() as i32).unwrap_or(0);
+            let superseded = v_row.is_some_and(|vr| vr.get("superseded").to_num() != 0.0);
+            let pace_ms = {
+                let p = r.get("pace_ms").to_num();
+                if p > 0.0 {
+                    p
+                } else {
+                    let sums_last = js_parse(&r.get("sums")).ok().and_then(|v| parse_f64_array(&v)).and_then(|a| a.last().copied()).unwrap_or(0.0);
+                    let runs_n = r.get("runs").to_num().max(1.0);
+                    sums_last / runs_n
+                }
+            };
+            portfolio_cands.push(PortfolioCourse {
+                course: c_id,
+                start_cp: r.get("start_cp").to_str(),
+                goal_cp: r.get("goal_cp").to_str(),
+                runs: r.get("runs").to_num(),
+                tier: c_tier,
+                grade,
+                pace_ms,
+                interaction_traits: r.get("interaction_traits").to_num().max(0.0) as u32,
+                superseded,
+            });
+        }
+        let mine_ids: Vec<String> = mine.iter().map(V::to_str).collect();
+        let selected_ids = select_stratified_portfolio(&portfolio_cands, entry_cp, &mine_ids);
+        let selected_rows: Vec<V> = selected_ids
+            .iter()
+            .filter_map(|cid| table.get(&mk(&V::from(cid.as_str()))).cloned())
+            .collect();
+
+        // 체크포인트 판정 수(nav_counts + 목적지별 nav_route_fit_counts) · 판정(nav_verdicts) · 합의 벡터(nav_vectors) · 선행 승격 갈림길(nav_shortcut_duels)
+        let mut hashes: Vec<V> = Vec::new();
+        let mut raw_step_hashes: Vec<V> = Vec::new();
+        for r in &selected_rows {
             let steps = js_parse(&r.get("steps"))?;
             if !steps.is_arr() {
                 return Err(Throw::type_error("JSON.parse(...).map is not a function"));
             }
             for s in steps.items() {
                 hashes.push(step_hash(&s)?);
+                raw_step_hashes.push(s.get("hash"));
             }
         }
         let hashes = unique(hashes);
+        let raw_step_hashes = unique(raw_step_hashes);
+
         let mut tallies: IndexMap<String, (f64, f64)> = IndexMap::new();
+        let mut route_fit: IndexMap<(String, String), (f64, f64)> = IndexMap::new();
         for part in hashes.chunks(IN_CHUNK) {
+            if part.is_empty() {
+                continue;
+            }
             let mut args = vec![V::from(NAV_RECIPE)];
             args.extend(part.iter().cloned());
             for c in rows(env, &sql_counts(part.len()), &args).await? {
@@ -1316,9 +1856,54 @@ mod wasm {
                     t.1 += c.get("n").to_num();
                 }
             }
+            for c in rows(env, &sql_route_fit_counts(part.len()), &args).await? {
+                let key = (c.get("hash").to_str(), c.get("goal").to_str());
+                let t = route_fit.entry(key).or_insert((0.0, 0.0));
+                if strict_eq(&c.get("type"), &V::Num(1.0)) {
+                    t.0 += c.get("n").to_num();
+                } else {
+                    t.1 += c.get("n").to_num();
+                }
+            }
+            for vr in rows(env, &sql_verdicts(part.len()), part).await? {
+                verdicts.insert(mk(&vr.get("hash")), vr);
+            }
         }
+
+        // 합의 2회 이상 확인된 대표 벡터(Int8 Base64 압축)
+        let mut confirmed_vecs: IndexMap<String, Vec<V>> = IndexMap::new();
+        for part in raw_step_hashes.chunks(IN_CHUNK) {
+            if part.is_empty() {
+                continue;
+            }
+            for vr in rows(env, &sql_confirmed_vectors(part.len()), part).await? {
+                if let Some(f32s) = v_to_f32_vec(&vr.get("vector")) {
+                    let h = vr.get("hash").to_str();
+                    confirmed_vecs.entry(h).or_default().push(obj! {
+                        "space" => vr.get("space"),
+                        "dims" => vr.get("dims"),
+                        "q8_b64" => encode_unit_i8_b64(&f32s),
+                    });
+                }
+            }
+        }
+
+        // 앱의 선행 승격 갈림길 목록
+        let mut forks_by_course: IndexMap<String, Vec<V>> = IndexMap::new();
+        for fr in rows(env, SQL_DUELS_PROMOTED, &[V::from(app)]).await? {
+            let fc = fr.get("fork_course").to_str();
+            let wins = fr.get("wins").to_num().max(1.0);
+            forks_by_course.entry(fc).or_default().push(obj! {
+                "fork_course" => fr.get("fork_course"),
+                "skipped_cp" => fr.get("skipped_cp"),
+                "taken_cp" => fr.get("taken_cp"),
+                "wins" => fr.get("wins"),
+                "mean_saved_ms" => js_round(fr.get("saved_ms_sum").to_num() / wins),
+            });
+        }
+
         let mut out = Vec::new();
-        for r in table.values() {
+        for r in &selected_rows {
             let sums = js_parse(&r.get("sums"))?;
             let steps = js_parse(&r.get("steps"))?;
             let shown_steps = js_parse(&r.get("steps"))?;
@@ -1329,12 +1914,37 @@ mod wasm {
             }
             let runs = r.get("runs").to_num();
             let average: Vec<V> = sums.items().iter().map(|s| V::Num(js_round(s.to_num() / runs / SPLIT_UNIT_MS) * SPLIT_UNIT_MS)).collect();
+            let step_items = steps.items();
+            let goal_cp = step_items
+                .last()
+                .and_then(|s| step_hash(s).ok())
+                .map(|v| v.to_str())
+                .unwrap_or_default();
             let mut checkpoints = Vec::new();
-            for s in steps.items() {
-                let (p, d) = tallies.get(&mk(&step_hash(&s)?)).copied().unwrap_or((0.0, 0.0));
-                checkpoints.push(obj! { "premium" => p, "discount" => d, "tier" => tier(&V::Num(p), &V::Num(d)) });
+            let mut course_forks = Vec::new();
+            let course_vecs = V::new_obj();
+            for s in &step_items {
+                let sh = step_hash(s)?;
+                let sh_str = sh.to_str();
+                // 목적지별 적합도 집계(nav_route_fit_counts)가 3표 이상이면 우선 사용, 부족 시 전역 nav_counts 폴백
+                let (p, d) = match route_fit.get(&(sh_str.clone(), goal_cp.clone())).copied() {
+                    Some((rp, rd)) if rp + rd >= TIER_MIN_DECIDED => (rp, rd),
+                    _ => tallies.get(&mk(&sh)).copied().unwrap_or((0.0, 0.0)),
+                };
+                let cp_obj = obj! { "premium" => p, "discount" => d, "tier" => tier(&V::Num(p), &V::Num(d)) };
+                if let Some(vr) = verdicts.get(&mk(&sh)) {
+                    cp_obj.put("verdict", verdict_row_to_v(vr));
+                }
+                checkpoints.push(cp_obj);
+                if let Some(fk_list) = forks_by_course.get(&s.get("course").to_str()) {
+                    course_forks.extend(fk_list.iter().cloned());
+                }
+                let raw_h = s.get("hash").to_str();
+                if let Some(vs) = confirmed_vecs.get(&raw_h) {
+                    course_vecs.put(&raw_h, V::from(vs.clone()));
+                }
             }
-            out.push(obj! {
+            let item = obj! {
                 "course" => r.get("course"),
                 "steps" => shown_steps,
                 "runs" => r.get("runs"),
@@ -1344,9 +1954,77 @@ mod wasm {
                 "record" => record,
                 "average" => V::from(average),
                 "checkpoints" => V::from(checkpoints),
-            });
+                "interaction_traits" => r.get("interaction_traits").to_num().max(0.0),
+            };
+            if let Some(vr) = verdicts.get(&mk(&r.get("course"))) {
+                item.put("verdict", verdict_row_to_v(vr));
+            }
+            if !course_forks.is_empty() {
+                item.put("verified_forks", V::from(course_forks));
+            }
+            if !course_vecs.keys().is_empty() {
+                item.put("vectors", course_vecs);
+            }
+            out.push(item);
         }
         Ok(out)
+    }
+
+    /// Phase 5 Part 3: `POST /nav/trials/claim-wallet` — 세션 + 지갑 일회성 서명 이중 검증 후 무중복 승격.
+    async fn handle_claim_wallet(req: &Req, env: &Env, origin: &str, now_ms: f64) -> R<Resp> {
+        if req.method != "POST" {
+            return Ok(error("method not allowed", 405, origin));
+        }
+        let Some(session_addr) = verified_address(req, env).await else {
+            return Ok(error("valid session required", 401, origin));
+        };
+        let Some(wallet_addr) = verify_wallet_request_once(req, env, &req.body, now_ms).await? else {
+            return Ok(error("valid wallet signature required", 401, origin));
+        };
+        let secret = env.get("AUTHOR_KEY_SECRET");
+        let session_key = account_key(&secret, "session", &session_addr)?;
+        let wallet_key = account_key(&secret, "wallet", &wallet_addr)?;
+        let wallet_rows = rows(env, SQL_ALL_MINE, &[V::from(wallet_key.as_str())]).await?;
+        let mut course_ids = Vec::with_capacity(wallet_rows.len());
+        let mut stmts = Vec::new();
+        let today = day_of(now_ms);
+        for wr in &wallet_rows {
+            let cid = wr.get("course").to_str();
+            course_ids.push(cid);
+            stmts.push(stmt(
+                env,
+                SQL_MERGE_CLAIM_TRIAL,
+                &[
+                    V::from(session_key.as_str()),
+                    wr.get("app"),
+                    wr.get("course"),
+                    wr.get("steps"),
+                    wr.get("runs"),
+                    wr.get("premium"),
+                    wr.get("discount"),
+                    wr.get("best"),
+                    wr.get("last"),
+                    wr.get("last_day"),
+                    wr.get("touched"),
+                    wr.get("best_total_ms"),
+                    wr.get("pinned"),
+                ],
+            )?);
+        }
+        let preseeded = plan_wallet_claim_registrations(&session_key, &course_ids);
+        for reg_id in &preseeded {
+            stmts.push(stmt(env, SQL_REGISTER_PRESEED, &[V::from(reg_id.as_str()), V::Num(today)])?);
+        }
+        stmts.push(stmt(env, SQL_DELETE_ALL, &[V::from(wallet_key.as_str())])?);
+        if !stmts.is_empty() {
+            env.batch("DB", &V::from(stmts)).await?;
+        }
+        Ok(reply(
+            obj! { "account" => "session", "claimed" => wallet_rows.len(), "preseeded" => preseeded.len() },
+            200,
+            origin,
+            &[],
+        ))
     }
 
     fn has_wallet_headers(req: &Req) -> bool {
@@ -1356,7 +2034,6 @@ mod wasm {
     /// `authenticate(request, body, env, nowMs)` — 지갑 헤더가 있으면 지갑으로만, 없으면 세션으로 확인한다. 어느 쪽도 아니면 None
     async fn authenticate(req: &Req, env: &Env, now_ms: f64) -> R<Option<Account>> {
         if has_wallet_headers(req) {
-            // 고침(fix-wallet-replay): 서명 확인 + 한 번만 쓰기 (auth.rs). 이미 쓴 서명은 틀린 서명과 같이 None → 401
             return Ok(match verify_wallet_request_once(req, env, &req.body, now_ms).await? {
                 Some(address) => Some(Account { kind: "wallet", key: account_key(&env.get("AUTHOR_KEY_SECRET"), "wallet", &address)? }),
                 None => None,
@@ -1374,11 +2051,13 @@ mod wasm {
         u.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned())
     }
 
-    /// try 안 (`handleNavTrials` 643~693)
+    /// try 안 (`handleNavTrials` 643~693 + Phase 4/5/7 확장)
     async fn handle_inner(req: &Req, env: &Env, origin: &str, now_ms: f64) -> R<Resp> {
-        // 지갑 서명은 본문 바이트 그대로에 대한 것이라 바이트로 읽는다
         if req.body.len() as f64 > MAX_BODY_BYTES {
             return Ok(error("body too large", 413, origin));
+        }
+        if pathname(req) == CLAIM_WALLET_PATH {
+            return handle_claim_wallet(req, env, origin, now_ms).await;
         }
         let app = search_param(&req.url, "app").map(|a| to_lower(js_trim(&a)));
         if let Some(a) = &app {
@@ -1386,11 +2065,16 @@ mod wasm {
                 return Ok(error("app must be 0x + 40 hex", 400, origin));
             }
         }
+        let entry = search_param(&req.url, "entry").map(|e| to_lower(js_trim(&e)));
+        if let Some(e) = &entry {
+            if !is_hash(e) {
+                return Ok(error("entry must be 0x + 40 hex", 400, origin));
+            }
+        }
         let method = req.method.as_str();
 
         if method == "GET" {
             let Some(app) = app else { return Ok(error("app is required", 400, origin)) };
-            // 인증이 없으면 게스트: 다른 사용자의 공개 코스만. 인증을 보냈는데 틀리면 401
             let signed_in = has_wallet_headers(req) || read_session_credentials(req).is_some();
             let account = if signed_in { authenticate(req, env, now_ms).await? } else { None };
             if signed_in && account.is_none() {
@@ -1401,7 +2085,7 @@ mod wasm {
                 None => None,
             };
             let mine_courses: Vec<V> = mine.iter().flatten().map(|m| m.get("course")).collect();
-            let others = read_others(env, &app, &mine_courses).await?;
+            let others = read_others(env, &app, &mine_courses, entry.as_deref()).await?;
             let body = obj! {
                 "app" => app.as_str(),
                 "account" => account.as_ref().map_or(V::Null, |a| V::from(a.kind)),
@@ -1425,25 +2109,79 @@ mod wasm {
             return Ok(reply(obj! { "account" => account.kind, "deleted" => changes(&res)? }, 200, origin, &[]));
         }
 
-        // JSON.parse(new TextDecoder().decode(body))
         let Ok(parsed) = js_sys::JSON::parse(&gzip::decode_utf8(&req.body)) else {
             return Ok(error("invalid JSON body", 400, origin));
         };
-        // parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed.runs : undefined
-        let runs = if parsed.is_object() && !Array::is_array(&parsed) { Reflect::get(&parsed, &JsValue::from_str("runs")).unwrap_or(JsValue::UNDEFINED) } else { JsValue::UNDEFINED };
+        let is_obj = parsed.is_object() && !Array::is_array(&parsed);
+
+        // Phase 5 Part 2: 선택적 batch_id 멱등 재전송 보호(24시간 TTL)
+        let batch_id = if is_obj {
+            Reflect::get(&parsed, &JsValue::from_str("batch_id"))
+                .ok()
+                .and_then(|v| v.as_string())
+        } else {
+            None
+        };
+        if let Some(bid) = &batch_id {
+            if !valid_batch_id(bid) {
+                return Ok(error("batch_id must be 16 to 64 alphanumeric/-/_ chars", 400, origin));
+            }
+            let cutoff = now_ms - DAY_MS;
+            let cached = js::first(&stmt(env, SQL_BATCH_GET, &[V::from(bid.as_str()), V::from(account.key.as_str()), V::Num(cutoff)])?).await?;
+            if !cached.is_nullish() {
+                if let Ok(resp_v) = js_parse(&cached.get("response_json")) {
+                    return Ok(reply(resp_v, 200, origin, &[]));
+                }
+            }
+        }
+
+        let runs = if is_obj { Reflect::get(&parsed, &JsValue::from_str("runs")).unwrap_or(JsValue::UNDEFINED) } else { JsValue::UNDEFINED };
         let count = if Array::is_array(&runs) { runs.unchecked_ref::<Array>().length() as usize } else { 0 };
-        if !Array::is_array(&runs) || count == 0 || count > MAX_RUNS {
+
+        let raw_dead_ends = if is_obj {
+            Reflect::get(&parsed, &JsValue::from_str("dead_end_marks")).unwrap_or(JsValue::UNDEFINED)
+        } else {
+            JsValue::UNDEFINED
+        };
+        let dead_ends = match parse_dead_end_marks(&body_v(&raw_dead_ends, 2), day_of(now_ms)) {
+            Ok(d) => d,
+            Err(msg) => return Ok(error(&msg, 400, origin)),
+        };
+
+        if (!Array::is_array(&runs) || count == 0 || count > MAX_RUNS) && dead_ends.is_empty() {
             return Ok(error(&format!("runs must hold 1 to {MAX_RUNS} records"), 400, origin));
         }
-        let items: Vec<V> = runs.unchecked_ref::<Array>().iter().map(|x| body_v(&x, 2)).collect();
-        let results = store_runs(env, &account, &items, now_ms).await?;
-        Ok(reply(obj! { "account" => account.kind, "results" => V::from(results) }, 200, origin, &[]))
+        let results = if Array::is_array(&runs) && count > 0 {
+            if count > MAX_RUNS {
+                return Ok(error(&format!("runs must hold 1 to {MAX_RUNS} records"), 400, origin));
+            }
+            let items: Vec<V> = runs.unchecked_ref::<Array>().iter().map(|x| body_v(&x, 2)).collect();
+            store_runs(env, &account, &items, now_ms).await?
+        } else {
+            Vec::new()
+        };
+        let dead_end_recorded = if !dead_ends.is_empty() {
+            store_dead_end_marks(env, &account, &dead_ends, now_ms).await?
+        } else {
+            0
+        };
+        let resp_body = obj! { "account" => account.kind, "results" => V::from(results) };
+        if dead_end_recorded > 0 {
+            resp_body.put("dead_end_recorded", V::from(dead_end_recorded));
+        }
+        if let Some(bid) = &batch_id {
+            if let Some(resp_json) = stringify(&resp_body) {
+                let _ = js::run(&stmt(env, SQL_BATCH_PUT, &[V::from(bid.as_str()), V::from(account.key.as_str()), V::from(resp_json), V::Num(now_ms)])?).await;
+            }
+        }
+        Ok(reply(resp_body, 200, origin, &[]))
     }
 
-    /// 원본 `handleNavTrials(request, env, nowMs = Date.now())`
+    /// 원본 `handleNavTrials(request, env, nowMs = Date.now())` + `/nav/trials/claim-wallet`
     pub async fn handle(req: &Req, env: &Env) -> R<Option<Resp>> {
         let now_ms = platform::now();
-        if pathname(req) != NAV_TRIALS_PATH {
+        let path = pathname(req);
+        if path != NAV_TRIALS_PATH && path != CLAIM_WALLET_PATH {
             return Ok(None);
         }
         let origin = header_or_empty(req, "Origin");
@@ -1454,7 +2192,6 @@ mod wasm {
         if method != "GET" && method != "POST" && method != "DELETE" {
             return Ok(Some(error("method not allowed", 405, &origin)));
         }
-        // IP 마다의 요청 제한 (평가 API 와 함께 센다). 계정마다의 저장 수 제한은 없고, 콜렉션 크기(앱마다 코스 10개)로만 묶는다
         let limiter = env.get(if method == "GET" { "EVAL_READ_LIMITER" } else { "EVAL_WRITE_LIMITER" });
         if is_rate_limited(req, &limiter).await {
             let retry = RETRY_AFTER_SECONDS.to_string();

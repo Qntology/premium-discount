@@ -339,6 +339,8 @@ fn sessions_become_nav_checkpoints_a_bottleneck_and_a_premium_next_step() {
         record: ghost_runs[0].splits(),
         average: ghost_runs[0].splits(),
         checkpoints: tallies,
+        verdict: None,
+        interaction_traits: 0,
     };
 
     // 결제 페이지에 막 들어온 새 방문자: 다음 단계는 간편결제, premium
@@ -348,4 +350,66 @@ fn sessions_become_nav_checkpoints_a_bottleneck_and_a_premium_next_step() {
     let next = guide.next.expect("not at the finish yet");
     assert_eq!(next.hash, easy_hash);
     assert_eq!(guide.next_tier, Tier::Premium);
+}
+
+#[test]
+fn cn253_cross_boundary_1hop_post_pick_classifies_dark_pattern_button_as_friction_trap() {
+    use premium_discount_analytic::funnel::{canonical_of, post_pick_windows_v2, AbandonPolicy, DebiasedChoiceBook, WebElementKind};
+    use premium_discount_nav::BehaviorParams;
+    let params = BehaviorParams::default();
+    let mut book = DebiasedChoiceBook::default();
+    let p1 = "https://shop.example/product/100";
+    let p2_bad = "https://shop.example/dead-promo";
+    let p2_ok = "https://shop.example/checkout";
+    let trap_btn = button("promo-trap", "특가 쿠폰 받기");
+    let safe_btn = button("buy-now", "바로 구매");
+    let peer_btn = button("wish", "찜하기");
+    let dead_box = button("retry", "재시도");
+
+    // 6 clean baseline sessions pick safe_btn and submit on checkout.
+    for s in 0..6 {
+        let sid = format!("ok-{s}");
+        let mut click = ev(EventKind::Click, p1, &sid, 1, 1_000);
+        click.target = Some(safe_btn.clone());
+        click.related = vec![trap_btn.clone(), peer_btn.clone()];
+        let events = vec![
+            ev(EventKind::Enter, p1, &sid, 0, 0),
+            click.clone(),
+            ev(EventKind::Enter, p2_ok, &sid, 2, 1_400),
+            ev(EventKind::Submit, p2_ok, &sid, 3, 4_000),
+        ];
+        book.observe_event(&click);
+        for pp in post_pick_windows_v2(&events, &params, AbandonPolicy::Always) {
+            book.observe_post_pick(&pp.choice.stable_key, &pp.page, pp.friction, pp.completed, pp.abandoned, params.eps);
+        }
+    }
+    // 12 sessions click attractive trap_btn on P1 (z_choice > +2.0!), navigate to P2 in 400ms, then immediately rage-click & backtrack/leave within 3s.
+    for s in 0..12 {
+        let sid = format!("trap-{s}");
+        let mut click = ev(EventKind::Click, p1, &sid, 1, 1_000);
+        click.target = Some(trap_btn.clone());
+        click.related = vec![safe_btn.clone(), peer_btn.clone()];
+        let mut rage_ev = ev(EventKind::Click, p2_bad, &sid, 3, 2_500);
+        rage_ev.target = Some(dead_box.clone());
+        rage_ev.rage = true;
+        let events = vec![
+            ev(EventKind::Enter, p1, &sid, 0, 0),
+            click.clone(),
+            ev(EventKind::Enter, p2_bad, &sid, 2, 1_400),
+            rage_ev,
+            ev(EventKind::Enter, p1, &sid, 4, 4_000),
+            ev(EventKind::Leave, p1, &sid, 5, 4_200),
+        ];
+        book.observe_event(&click);
+        for pp in post_pick_windows_v2(&events, &params, AbandonPolicy::Always) {
+            book.observe_post_pick(&pp.choice.stable_key, &pp.page, pp.friction, pp.completed, pp.abandoned, params.eps);
+        }
+    }
+
+    let page_h = page_hash(p1).unwrap();
+    let trap_choice = canonical_of(&page_h, &trap_btn);
+    let diag = book.diagnose(&trap_choice.stable_key).expect("trap diagnosed");
+    assert_eq!(diag.kind, WebElementKind::FrictionTrap, "1-Hop bounce/rage must veto GoldenPath into FrictionTrap: {diag:?}");
+    assert!(diag.abandon_rate.unwrap_or(0.0) >= 0.5);
+    assert!(diag.post_friction_z.unwrap_or(0.0) >= 1.0);
 }

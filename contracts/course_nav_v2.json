@@ -1,0 +1,617 @@
+{
+  "contract": "course_nav_v2",
+  "scenario": "phases_4_to_6",
+  "title": "코스·체크포인트 N:N 심층 고도화 (Phase 4 ~ Phase 6)",
+  "source": "최종_코스와 체크포인트 N_N 시나리오 목차.docx (CN2-45 ~ CN2-80)",
+  "params": {
+    "pace_eps": 0.05,
+    "pace_deadband_ms": 500,
+    "pioneer_min_wins": 3,
+    "pioneer_min_saved_ms": 1500,
+    "pioneer_min_margin": 0.15,
+    "nav_half_life_days": 14,
+    "drift_half_life_trigger_z": 1.5,
+    "zone_vault_max_slots": 64,
+    "consensus_lock_confirmations": 3,
+    "safe_learn_promote_sessions": 3,
+    "safe_learn_revoke_rejects": 2,
+    "reflex_distill_min_accepts": 2
+  },
+  "cases": [
+    {
+      "id": "CN2-45",
+      "part": "P4.1",
+      "title": "품질·속도 인지형 route_marks_v2 오염 차단",
+      "given": "고스트(15s) 대비 둔속 고마찰 우회 런(45s, discount) 및 고속 무마찰 우회 런(11s, premium)",
+      "expect": [
+        "둔속·마찰 우회 런에서 미방문 스텝이 Abstain(0)으로 보호된다",
+        "고속 무마찰 우회 런에서만 -1이 부과된다",
+        "결함 스텝은 +1 세탁이 차단된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn245_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-46",
+      "part": "P4.1",
+      "title": "1인 1목적지 투표권(nav_route_ballots) 다중 우회 증폭 차단 및 목적지별 적합도 분리",
+      "given": "단일 지갑이 서로 다른 우회 경유지 X1..X5로 같은 고스트의 CP_R2를 5회 우회 완주",
+      "expect": [
+        "nav_route_ballots 중복 차단으로 CP_R2 discount가 1을 넘지 않는다",
+        "의견 번복 시 이전 부호가 상쇄된다",
+        "route_fit_hash가 결승 목적지별로 분리된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn246_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-47",
+      "part": "P4.1",
+      "title": "크로스 모달리티(탭 vs 스와이프) EquivalentPass 보호",
+      "given": "WEB_COURSE의 elem:c@swipe-left를 탭(elem:c)으로 정속 완주",
+      "expect": [
+        "동일 (kind, hash) 상이 제스처 통과 시 Discount(-1) 대신 EquivalentPass(0)로 판정된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn247_"
+        },
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn247_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-48",
+      "part": "P4.1",
+      "title": "FC-05 fault_mask 병목 격리 · FC-06 WarnedTrap 보호 · 승리 직후 부정 발화 억제",
+      "given": "순항 A(z=-0.4) + WarnedTrap B + 병목 C(z=2.1) 및 자책 패배 / 승리 직후 '깨긴 했는데 비추' 발화",
+      "expect": [
+        "자책 방패는 fault_mask=u16::MAX, run_kind=0으로 오염을 차단한다",
+        "승리 후 부정 발화는 SuppressedByFeedback로 +1을 억제한다",
+        "순항 스텝 비트는 0으로 보호된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src/credit.rs",
+          "test": "cn248_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-49",
+      "part": "P4.2",
+      "title": "LCS 창 내부 구간 시간 대조 shortcut_wins_v2 무임승차 차단 및 후반 지름길 구제",
+      "given": "1차 분기 지연(+3s)+2차 분기 단축(-10s) 런 및 초반 지연(+8s)+후반 단축(-6s) 런",
+      "expect": [
+        "지연된 1차 우회는 무임승차 차단된다",
+        "창 내부 구간 단축을 입증한 후반 Alt_2만 승리로 추출된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn249_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-50",
+      "part": "P4.2",
+      "title": "서버 갈림길 대결(nav_shortcut_duels) 독립 3인 선행 승격(Pioneer Promotion)",
+      "given": "후반 경로가 서로 다른 3명의 독립 계정이 동일 갈림길에서 Alt로 6초 단축(각 코스 runs=1 < 11)",
+      "expect": [
+        "동일 계정 반복 전송은 duel_reg_id로 1회만 인정된다",
+        "독립 3인 합의(saved>=1.5s, margin>=15%) 시 Alt가 선행 승격된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn250_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-51",
+      "part": "P4.2",
+      "title": "로컬 지름길 3연승 즉시 승격 및 Stage 2 드로어 가역적 핀",
+      "given": "서버 미공개 개인 지름길 3연승 직후 LocalVerdictStore nav 트랙 및 Stage 2 드로어",
+      "expect": [
+        "3연승 시 outperforms 성립으로 로컬 Premium 승격",
+        "Stage 2 드로어 [▼] 핀 클릭 시 즉시 Discount로 전환, 재클릭 시 복원된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/pd_bridge.rs",
+          "test": "cn251_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-52",
+      "part": "P4.2",
+      "title": "WorksForMeOnly 개인 숙련 지름길 브리핑 분기 및 로컬 핀 격리",
+      "given": "서버 Discount · 로컬 3승 0패(Premium) 체크포인트",
+      "expect": [
+        "로컬/글로벌을 혼합하지 않고 WorksForMeOnly 나만의 비기 브리핑을 생성한다",
+        "수동 핀은 outbound_votes에 포함되지 않는다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src/speak.rs",
+          "test": "cn252_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-53",
+      "part": "P4.3",
+      "title": "1-Hop 경계 횡단 post_pick_windows_v2 다크패턴 함정 포착",
+      "given": "랜딩 버튼 클릭 직후 새 페이지 전환 후 8초 내 역류/이탈하는 다크패턴 세션",
+      "expect": [
+        "1-Hop 가중 감쇠(0.85) 귀속으로 랜딩 버튼이 FrictionTrap으로 분류된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-analytic/tests/funnel.rs",
+          "test": "cn253_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-54",
+      "part": "P4.3",
+      "title": "생존자 편향 해소용 단일 체크포인트 dead_end_marks 3인 함정 격리",
+      "given": "완주율 0% 막다른 길에서 독립 3계정이 dead_end_marks 보고",
+      "expect": [
+        "경로 노출 없이 단일 체크포인트만 계정당 1회 중복 차단되어 3계정 합산 시 함정으로 격리된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn254_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-55",
+      "part": "P4.3",
+      "title": "3-소스 라이브 web_rows 병합 및 진전 안전 2-단계 CommitGuard",
+      "given": "로컬/공개/오너 3-소스 병합 및 300ms 내 #3 더블탭 vs '결제 진행' 명시 발화",
+      "expect": [
+        "LABEL_SPACE_ID가 premium_discount_nav::LABEL_SPACE와 일치한다",
+        "로컬 우선 병합과 2-단계 CommitGuard 더블탭 차단이 동작한다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/browser_uia.rs",
+          "test": "cn255_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-56",
+      "part": "P4.3",
+      "title": "인게임 DefeatTrap 전투 침묵 → 패배 1.5s 뒤 PostDefeatComfort 함정 경고",
+      "given": "고긴장 전투 중 DefeatTrap 포착 후 패배 이벤트 발생",
+      "expect": [
+        "전투 중 무발화 유지",
+        "패배 1500ms 후 위로+함정 경고 Lv3 PostDefeatComfort로 전달된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src/coach.rs",
+          "test": "cn256_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-57",
+      "part": "P5.1",
+      "title": "PD-Verdict v2 nav 트랙 14일 반감기 감쇠 및 drift_z 적응 반감기 급전환",
+      "given": "과거 Premium 코스에 최근 패치 마찰(discount) 급증 및 drift_z >= 1.5 발생",
+      "expect": [
+        "적응형 반감기 단축으로 낡은 Premium이 신속히 Discount로 전환된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/cron/src/nav_verdicts.rs",
+          "test": "cn257_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-58",
+      "part": "P5.1",
+      "title": "14일 에폭 하트비트(nav_epoch_pulses) 동일 에폭 폭주 차단 및 다음 에폭 갱신",
+      "given": "동일 계정의 5일차 재주행 vs 15일차(다음 14일 에폭) 재주행",
+      "expect": [
+        "같은 14일 에폭 내 반복은 동일 키로 충돌 차단되고, 다음 에폭 재주행은 생존 증거를 갱신한다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn258_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-59",
+      "part": "P5.1",
+      "title": "ghost_utility_v3 등급·순위 가중치 및 superseded 구코스 강등",
+      "given": "grade/rank가 다른 두 공개 코스 및 신규 코스에 패배해 superseded된 구코스",
+      "expect": [
+        "grade+rank가 반영된 ghost_utility_v3가 순위를 결정하고 superseded 코스는 명확히 강등된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn259_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-60",
+      "part": "P5.1",
+      "title": "FadedRecall 과거 경로 회상 및 신코스 붕괴 시 구코스 자가 복권",
+      "given": "14일 nav 트랙 18일 경과(1.0<=E<2.0) 및 신코스 Discount(grade<=-1, E>=3.0)",
+      "expect": [
+        "FadedRecall이 과거 Premium 경로를 회상한다",
+        "신코스 붕괴 시 should_reinstate_standard_course가 true를 반환한다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-verdict/src/speak.rs",
+          "test": "cn260_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-61",
+      "part": "P5.2",
+      "title": "4-쿼터 다양성 포트폴리오(Quota A/B/C/D) 고속 지름길·진입점·접근성 코스 구출",
+      "given": "인기 1~12위가 느린 함정 코스일 때 13위 정예 지름길 + ?entry= 일치 + 접근성 코스",
+      "expect": [
+        "Quota A(?entry=), Quota B(Elite), Quota D(Accessible)가 모두 탈락 없이 반환된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn261_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-62",
+      "part": "P5.2",
+      "title": "대표 기록 차분 치환(representative_best_swap) runs 불변 보장",
+      "given": "duplicate:true 재주행자가 무마찰로 종전 대표 기록보다 1500ms 단축",
+      "expect": [
+        "nav_courses.runs 증가 없이 sums 차분 치환 및 record 갱신이 정확히 이뤄진다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn262_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-63",
+      "part": "P5.2",
+      "title": "3-계층 Pinned-SLRU 숙련·고정 코스 보호",
+      "given": "고정 코스 및 다회 숙련 코스 존재 상태에서 일회성 탐색 코스 대량 유입",
+      "expect": [
+        "고정 코스와 보호 계층 숙련 코스는 일회성 탐색 코스에 의해 축출되지 않는다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/trial.rs",
+          "test": "cn263_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-64",
+      "part": "P5.2",
+      "title": "온디바이스 64-슬롯 ZoneVault 및 batch_id 멱등 재전송 보호",
+      "given": "70개 코스 적재(고정 코스 포함) 및 미응답 배치 재전송",
+      "expect": [
+        "64슬롯 상한 내 고정 코스가 보존되고 ack 전까지 동일 batch_id가 유지된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/pd_bridge.rs",
+          "test": "cn264_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-65",
+      "part": "P5.3",
+      "title": "캐노니컬 공간 레지스트리 양자화 통합 및 hash-ngram-v1 업로드 차단",
+      "given": "raon-ve-so400m-v1 / siglip2-so400m-hf-v1 정규화 및 hash-ngram-v1 / 콜론(:) 입력",
+      "expect": [
+        "동일 아키텍처 양자화 변형이 단일 공간 ID로 통일되고 hash-ngram-v1은 업로드 차단된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nav/src/mark.rs",
+          "test": "cn265_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-66",
+      "part": "P5.3",
+      "title": "2-단계 합의 대표 벡터(Consensus Medoid) 초기 오염 축출 및 3인 잠금 + Int8 Base64",
+      "given": "최초 1인 오염 벡터 등록 후 정상 독립 주행자 3인의 벡터 도착",
+      "expect": [
+        "충돌 후보 2인 합의로 오염 초기 벡터가 자동 교체되고 3인 합의 시 잠금 및 Int8 Base64 왕복 cos>0.999 유지"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn266_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-67",
+      "part": "P5.3",
+      "title": "지갑→세션 무중복 승격(claim-wallet) 세션 등록 선점",
+      "given": "지갑 계정 2개 코스를 세션 계정으로 claim-wallet 이관",
+      "expect": [
+        "plan_wallet_claim_registrations가 세션 등록 키를 사전 생성해 재주행 시 공용 runs 부풀림 0건 보장"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn267_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-68",
+      "part": "P5.3",
+      "title": "이중 중심화 soft_checkpoint_bridge DOM 리팩터링·인게임 ROI 복구",
+      "given": "해시가 바뀐 DOM/ROI 벡터 쌍에 대한 1:1 소프트 매칭",
+      "expect": [
+        "이중 중심화 + 배타 1:1 할당으로 변경된 체크포인트가 오매칭 없이 복구된다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-nms/src/spatial.rs",
+          "test": "cn268_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-69",
+      "part": "P6.1",
+      "title": "크로스-앱 릴레이 연합(curate_relay_federation) 다국어 명칭 연결 및 서버 supersede 0건",
+      "given": "영문 위키 노트(Malenia)와 한글 인게임 노트(말레니아) 간 공유 RelayKey 연합",
+      "expect": [
+        "서로 다른 cc 간 연합 링크가 생성되되 서버 supersede 패킷은 0건을 유지한다"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "crates/premium-discount-relay/src/lib.rs",
+          "test": "cn269_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-70",
+      "part": "P6.1",
+      "title": "TopicTracker 선택적 크로스-앱 브리지 및 CR-02 PLINKO 단절 보존",
+      "given": "공통 RelayKey 없는 메모장 전환 vs 공통 RelayKey 있는 위키→게임 전환",
+      "expect": [
+        "무관한 앱 전환은 salience 0.0 단절을 유지하고, 공유 RelayKey 전환에서만 토픽이 복원된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src/reference.rs",
+          "test": "cn270_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-71",
+      "part": "P6.1",
+      "title": "LocalMirrorIndex 크로스-앱 브리지 노트 인게임 검색 및 타 앱 격리",
+      "given": "fextralife.com 노트를 eldenring.exe로만 브리지한 뒤 게임·메모장에서 각각 검색",
+      "expect": [
+        "게임에서는 브리지된 위키 노트가 검색되고 무관한 앱에서는 0건으로 격리된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/pd_bridge.rs",
+          "test": "cn271_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-72",
+      "part": "P6.1",
+      "title": "크로스-앱 메타 궤적 승리 크레딧 역전파(게임 승리 → 위키 노트 귀속)",
+      "given": "fextralife.com → eldenring.exe 궤적 간선 기록 후 인게임 승리 이벤트 발생",
+      "expect": [
+        "active_in_meta_trajectory가 위키 노트를 회수해 인게임 승리가 위키 노트 전적(wins+=1)에 귀속된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/pd_bridge.rs",
+          "test": "cn272_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-73",
+      "part": "P6.2",
+      "title": "닫힌 nav.* 아키타입 5종 및 Tier 2 scoped_bindings 재시딩 보존",
+      "given": "data/zena_lexicon.json nav.* 5종 로드 및 eldenring.exe 은어 3세션 승격 후 import 재실행",
+      "expect": [
+        "nav.* 5종은 text_nodes()에서 제외된다",
+        "앱 은어는 글로벌을 오염시키지 않고 재시딩 후에도 보존된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-lexicon/src/store.rs",
+          "test": "cn273_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-74",
+      "part": "P6.2",
+      "title": "Lv3 → 0ms Lv2 반사 신경 증류(ReflexCompiler)",
+      "given": "동일 (cc, screen, anchor) Lv3 코칭 2회 연속 검증 수락 후 재발생 및 철회",
+      "expect": [
+        "2회 수락 뒤 LLM을 깨우지 않고 0ms Lv2 캐시 응답으로 전환되며 revoke 시 Lv3로 복귀한다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src/coach.rs",
+          "test": "cn274_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-75",
+      "part": "P6.2",
+      "title": "TextTower 없는 시각 프로토타입 축적 및 전투/저RAM 재임베딩 지연 가드",
+      "given": "전투 중·저RAM(<650MiB) 가드 체크 및 3회 일관된 비프라이버시 이미지 벡터 축적",
+      "expect": [
+        "전투/주행/저RAM에서는 재임베딩이 지연되고, 프라이버시 버퍼(±10s) 밖 3회 일치 시 단위 프로토타입이 생성된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/lexicon.rs",
+          "test": "cn275_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-76",
+      "part": "P6.2",
+      "title": "4-게이트 안전 --learn(Command Air-Gap · PII 스크럽 · 2회 거부 자동 철회 · Privacy 불변)",
+      "given": "system.exit_app 자동학습 시도, 이메일/0x해시, 저마진, 3세션 승격 후 2회 거부, vision.private 덮어쓰기 시도",
+      "expect": [
+        "Command Air-Gap·PII·저마진은 모두 거부되고 2회 거부 시 자동 철회+감사 로그 기록, vision.private는 불변 유지"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-lexicon/src/store.rs",
+          "test": "cn276_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-77",
+      "part": "P6.3",
+      "title": "다계층 어뷰징 방어 통합(1인 5변종 우회 + 지갑→세션 승격 + batch_id 멱등성)",
+      "given": "단일 계정 5변종 우회, 지갑→세션 승격, 배치 재전송 검증",
+      "expect": [
+        "표 증폭 0건, 런 부풀림 0건, 배치 키 검증 통과"
+      ],
+      "owners": [
+        {
+          "repo": "premium-discount",
+          "path": "workers/www/src/navtrials_v2.rs",
+          "test": "cn277_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-78",
+      "part": "P6.3",
+      "title": "파이프라인 라이브 web_rows · checkpoint_to · focused · CourseBrief 종단 배선",
+      "given": "라이브 NavBadgeOverlay 활성 상태에서 ScreenAnchorSnapshot 및 CourseBrief 생성",
+      "expect": [
+        "checkpoint_to와 focused가 실제 활성 배지로 채워지고 CourseBrief가 프롬프트에 연결된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/pipeline.rs",
+          "test": "cn278_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-79",
+      "part": "P6.3",
+      "title": "하이브리드 RAG(90일) × 실측 텔레메트리(14일) 패치 모순 4사분면 중재기",
+      "given": "구버전 공략 Premium vs 최근 14일 실측 Discount 충돌 및 원본 해시 포함 라벨",
+      "expect": [
+        "RecentPatchCaution 경고로 자동 전환되고 원본 0x 해시는 완전히 제거된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "crates/zena-core/src/brief.rs",
+          "test": "cn279_"
+        }
+      ]
+    },
+    {
+      "id": "CN2-80",
+      "part": "P6.3",
+      "title": "종단 간 하이브리드 폐루프 0.5 / 0.5 시너지 크레딧 귀속",
+      "given": "동일 턴에서 RAG 공략('tactics')과 코스 체크포인트('route')를 동시 노출 후 승리",
+      "expect": [
+        "RagRecord와 CourseCheckpoint가 상호보완 0.5/0.5 크레딧으로 동시 승리 기록된다"
+      ],
+      "owners": [
+        {
+          "repo": "raon-zena",
+          "path": "apps/raon-zena/src/pipeline.rs",
+          "test": "cn280_"
+        }
+      ]
+    }
+  ]
+}

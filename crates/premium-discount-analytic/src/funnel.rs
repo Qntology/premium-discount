@@ -1037,6 +1037,110 @@ pub fn post_pick_windows(events: &[WebEvent], params: &BehaviorParams, policy: A
     out
 }
 
+/// Phase 4 Part 3: 선택 직후 페이지 전환으로 인정하는 최대 전이 지연(ms).
+pub const CROSS_BOUNDARY_TRANSITION_MS: i64 = 1_500;
+/// Phase 4 Part 3: 도착 페이지 초기 정착 관찰 창(8초) 및 1-Hop 감쇠 계수(0.85).
+pub const CROSS_BOUNDARY_BOUNCE_MS: i64 = 8_000;
+pub const CROSS_BOUNDARY_HOP_DECAY: f64 = 0.85;
+
+/// 화면·장면 경계를 넘는 1-Hop 역추적 창 (`post_pick_windows_v2`, Phase 4 Part 3).
+///
+/// 같은 페이지 내부 마찰에 더해, 선택 직후(`Δt <= 1,500ms`) 진입한 다음 페이지 `S_2` 에서
+/// 정상 전진 조작이 일어나기 전 8초(`CROSS_BOUNDARY_BOUNCE_MS`) 이내에 즉시 뒤로가기(`Backtracked`) ·
+/// 창 닫기 이탈(`Leave` / `Abandoned`) · 광클(`rage`)이 발생하면 `0.85 * F_arrival(S_2)` 를 출발지 선택지로 역귀속한다.
+pub fn post_pick_windows_v2(events: &[WebEvent], params: &BehaviorParams, policy: AbandonPolicy) -> Vec<PostPick> {
+    let mut sorted: Vec<&WebEvent> = events.iter().collect();
+    sorted.sort_by_key(|e| (e.seq, e.t_ms));
+    let mut out = Vec::new();
+    for (i, e) in sorted.iter().enumerate() {
+        if !choice_event(e) {
+            continue;
+        }
+        let (Some(page), Some(chosen)) = (nav::page_hash(&e.href), e.item.as_ref().or(e.target.as_ref())) else { continue };
+        if !identifiable(chosen) {
+            continue;
+        }
+        let end = sorted
+            .iter()
+            .enumerate()
+            .skip(i + 1)
+            .find(|(_, f)| nav::page_hash(&f.href).is_some_and(|p| p != page) || choice_event(f))
+            .map_or(sorted.len(), |(j, _)| j);
+        let window: Vec<WebEvent> = sorted[i + 1..end].iter().map(|f| (*f).clone()).collect();
+        let trace = trace_session_with(&window, policy);
+        let signals = Episode { events: trace.events.into_iter().filter(|s| !matches!(s.signal, Signal::Searched { .. })).collect() };
+        let submitted_here = window.iter().any(|f| f.kind == EventKind::Submit);
+        let exempt_page = policy != AbandonPolicy::Always && AnalyticDictionary::builtin().page_kind_of(&e.href).as_deref() == Some(GOODS_VIEW_KIND);
+        let left_for_good = end == sorted.len() && window.iter().any(|f| f.kind == EventKind::Leave) && !submitted_here && !exempt_page;
+        let mut friction = signals.friction(params);
+        let mut abandoned = left_for_good || signals.events.iter().any(|s| matches!(s.signal, Signal::Abandoned));
+
+        // 1-Hop 역추적: 직후 다른 페이지 S_2 로 전이된 경우 도착 초기 8초 이내의 즉발 역류·이탈·광클을 역귀속한다.
+        if let Some(first_next) = sorted.get(end) {
+            if let Some(next_page) = nav::page_hash(&first_next.href).filter(|p| p != &page) {
+                let transition_dt = first_next.t_ms - e.t_ms;
+                if (0..=CROSS_BOUNDARY_TRANSITION_MS).contains(&transition_dt) {
+                    let arrive_t = first_next.t_ms;
+                    let mut hop_events: Vec<WebEvent> = Vec::new();
+                    let mut immediate_backtrack = false;
+                    let mut immediate_leave = false;
+                    let mut forward_progress = false;
+                    for f in &sorted[end..] {
+                        let dwell = f.t_ms - arrive_t;
+                        if dwell > CROSS_BOUNDARY_BOUNCE_MS {
+                            break;
+                        }
+                        let f_page = nav::page_hash(&f.href);
+                        if f_page.as_deref() == Some(page.as_str()) {
+                            immediate_backtrack = true;
+                            break;
+                        }
+                        if f_page.as_deref() != Some(next_page.as_str()) {
+                            // 제3의 새 페이지로 정상 전진
+                            forward_progress = true;
+                            break;
+                        }
+                        if f.kind == EventKind::Submit {
+                            forward_progress = true;
+                            break;
+                        }
+                        if f.kind == EventKind::Leave {
+                            immediate_leave = true;
+                        }
+                        hop_events.push((*f).clone());
+                    }
+                    let hop_trace = trace_session_with(&hop_events, AbandonPolicy::Always);
+                    let hop_ep = Episode {
+                        events: hop_trace.events.into_iter().filter(|s| !matches!(s.signal, Signal::Searched { .. })).collect(),
+                    };
+                    let mut arrival_friction = hop_ep.friction(params);
+                    let has_hop_rage = hop_ep.events.iter().any(|s| matches!(s.signal, Signal::RageClick));
+                    if immediate_backtrack && !forward_progress {
+                        arrival_friction += params.backtracked;
+                    }
+                    if immediate_leave && !forward_progress && !exempt_page {
+                        arrival_friction += params.abandoned;
+                    }
+                    let bounced = !forward_progress && (immediate_backtrack || (immediate_leave && !exempt_page) || has_hop_rage);
+                    if bounced {
+                        friction += CROSS_BOUNDARY_HOP_DECAY * arrival_friction;
+                        abandoned = true;
+                    }
+                }
+            }
+        }
+
+        out.push(PostPick {
+            choice: canonical_of(&page, chosen),
+            page,
+            friction,
+            completed: sorted[i + 1..].iter().any(|f| f.kind == EventKind::Submit),
+            abandoned,
+        });
+    }
+    out
+}
+
 /// 세션 하나의 갈래 기록 ([`FunnelDag`])
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DagSession {
@@ -1123,6 +1227,21 @@ pub struct FastTrackElement {
     pub mean_ms: f64,
     /// 선택 대조 교차 판정이 추천 경로(GoldenPath)인가
     pub golden: bool,
+}
+
+impl FastTrackElement {
+    /// Phase 4 Part 3: 확정된 `FastTrackElement(golden == true)` 를 로컬 단축 고스트 스텝 열
+    /// `[entry_page, fast_track_element, goal_page]` 로 합성한다.
+    pub fn synthetic_ghost_steps(&self, entry_page_hash: &str, element_hash: &str, goal_page_hash: &str) -> Option<Vec<nav::StepRef>> {
+        if !self.golden || self.sessions == 0 {
+            return None;
+        }
+        Some(vec![
+            nav::StepRef { kind: StepKind::Page, hash: entry_page_hash.to_string(), gesture: None },
+            nav::StepRef { kind: StepKind::Element, hash: element_hash.to_string(), gesture: None },
+            nav::StepRef { kind: StepKind::Page, hash: goal_page_hash.to_string(), gesture: None },
+        ])
+    }
 }
 
 /// 정석 경로 · 단축 경로 · 1순위 병목 요약 ([`SiteAnalysis::branch_summary`])
