@@ -212,13 +212,19 @@ impl Qwen35 {
     }
 
     pub fn new_state(&self) -> State {
+        self.new_state_with_capacity(0)
+    }
+
+    /// `planned_tokens` 분량의 전역 어텐션 KV 용량을 미리 확보한 상태를 만든다 (생성 중 재할당 제거).
+    pub fn new_state_with_capacity(&self, planned_tokens: usize) -> State {
         let gdn = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Linear(_))).count();
         let full = LAYERS - gdn;
+        let cap = planned_tokens.saturating_mul(KV_HEADS * HEAD_DIM);
         State {
             conv: vec![None; gdn],
             ssm: vec![None; gdn],
-            keys: vec![Vec::new(); full],
-            values: vec![Vec::new(); full],
+            keys: (0..full).map(|_| Vec::with_capacity(cap)).collect(),
+            values: (0..full).map(|_| Vec::with_capacity(cap)).collect(),
             pos: 0,
         }
     }
@@ -375,6 +381,19 @@ impl Qwen35 {
         *ssm = Some(gdn_out.recurrent_state);
         let core_2d = gdn_out.out.reshape((t * LIN_HEADS, LIN_DIM))?;
         let gated = if !core_2d.device().is_cpu()
+            && crate::utils::accel_op_ok(core_2d.device(), crate::utils::AccelOp::GatedDeltaRule)
+        {
+            candle_core::delta_rule::fused_gated_rms_norm(&core_2d, &z, &g.norm_w, EPS)
+                .or_else(|_| {
+                    candle_core::decoder_ops::rmsnorm_fused(&core_2d, &g.norm_w, EPS as f32, false)
+                        .and_then(|normed| candle_core::decoder_ops::silu_mul(&z, &normed))
+                })
+                .or_else(|_| {
+                    let ms = core_2d.sqr()?.mean_keepdim(D::Minus1)?;
+                    let normed = core_2d.broadcast_div(&(ms + EPS)?.sqrt()?)?.broadcast_mul(&g.norm_w)?;
+                    &normed * &z.silu()?
+                })?
+        } else if !core_2d.device().is_cpu()
             && crate::utils::accel_op_ok(core_2d.device(), crate::utils::AccelOp::DecoderOps)
         {
             candle_core::decoder_ops::rmsnorm_fused(&core_2d, &g.norm_w, EPS as f32, false)
@@ -456,6 +475,10 @@ impl Qwen35 {
     /// - `allow = Some(ids)` with a small whitelist scores ONLY the allowed rows (avoiding full-vocab GEMV).
     /// - `allow = None` on GPU uses Pack A/C fused tile argmax (`fused_linear_argmax_cs`) with 0-byte logits materialization.
     pub fn next_token(&self, h: &Tensor, head: &Head, allow: Option<&[u32]>) -> Result<(u32, f32)> {
+        self.next_token_inner(h, head, allow, true)
+    }
+
+    fn next_token_inner(&self, h: &Tensor, head: &Head, allow: Option<&[u32]>, need_val: bool) -> Result<(u32, f32)> {
         if let Some(allowed) = allow {
             if !allowed.is_empty() && allowed.len() <= 64 {
                 let h_row = h.unsqueeze(0)?;
@@ -509,11 +532,14 @@ impl Qwen35 {
             if let Ok(out) = candle_core::lm_head::fused_linear_argmax_cs(&h_row, weight, None, None, None) {
                 let (ids_vec, _) = out.download_ids_and_mask()?;
                 let local_id = ids_vec[0];
-                let val = out
-                    .max_vals
-                    .and_then(|t| t.to_vec1::<f32>().ok())
-                    .and_then(|v| v.first().copied())
-                    .unwrap_or(0.0);
+                let val = if need_val {
+                    out.max_vals
+                        .and_then(|t| t.to_vec1::<f32>().ok())
+                        .and_then(|v| v.first().copied())
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
                 let token_id = ids_opt.map_or(local_id, |v| v[local_id as usize]);
                 return Ok((token_id, val));
             }
@@ -544,17 +570,18 @@ impl Qwen35 {
 
     /// 프롬프트 뒤로 그리디 생성 (`stop`이 참이면 멈춘다)
     pub fn generate(&self, prompt: &[u32], max_new: usize, head: &Head, stop: &dyn Fn(&[u32]) -> bool) -> Result<Vec<u32>> {
-        let mut st = self.new_state();
+        let mut st = self.new_state_with_capacity(prompt.len().saturating_add(max_new));
         let mut h = self.forward(prompt, &mut st)?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(max_new);
         for _ in 0..max_new {
-            let (id, _) = self.next_token(&h, head, None)?;
+            let (id, _) = self.next_token_inner(&h, head, None, false)?;
             out.push(id);
             if stop(&out) {
                 break;
             }
             h = self.forward(&[id], &mut st)?;
         }
+        crate::utils::trim_idle_gpu_pool(&self.device);
         Ok(out)
     }
 

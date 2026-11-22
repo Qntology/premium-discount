@@ -144,19 +144,25 @@ fn open_best_vulkan(ordinal: usize) -> Result<Device> {
     if count <= 1 {
         return Ok(Device::new_vulkan(0)?);
     }
-    let mut best_hw: Option<(u64, Device)> = None;
-    let mut best_cpu: Option<(u64, Device)> = None;
+    // 외장 GPU > 내장 GPU > 가상 > 기타 > 소프트웨어(CPU) 순으로 우선하고, 같은 계층 안에서 여유 VRAM 이 큰 장치를 고른다.
+    let mut best: Option<((u8, u64), Device)> = None;
     for id in 0..count {
         if let Ok(d) = Device::new_vulkan(id) {
+            let tier: u8 = match d.as_vulkan_device().map(|v| v.device_type()) {
+                Ok("discrete") => 4,
+                Ok("integrated") => 3,
+                Ok("virtual") => 2,
+                Ok("other") => 1,
+                _ => 0,
+            };
             let free = d.mem_info().ok().flatten().map_or(0, |(f, _)| f as u64);
-            let is_cpu = d.as_vulkan_device().is_ok_and(|v| v.is_cpu_device());
-            let slot = if is_cpu { &mut best_cpu } else { &mut best_hw };
-            if slot.as_ref().is_none_or(|(b, _)| free > *b) {
-                *slot = Some((free, d));
+            let rank = (tier, free);
+            if best.as_ref().is_none_or(|(b, _)| rank > *b) {
+                best = Some((rank, d));
             }
         }
     }
-    match best_hw.or(best_cpu) {
+    match best {
         Some((_, d)) => Ok(d),
         None => Ok(Device::new_vulkan(0)?),
     }
@@ -242,19 +248,29 @@ pub fn describe(d: &Device) -> String {
 }
 
 /// 추론 구간 사이 유휴 GPU 메모리 풀을 보수적으로 정리한다.
-/// ROCm 은 유휴 풀이 320 MiB 이상일 때만 256 MiB 핫 풀을 남기고 돌려주어 `hipMallocAsync`/`hipFreeAsync` 스톨을 방지한다.
+/// CUDA · ROCm 은 유휴 풀이 320 MiB 이상일 때만 256 MiB 핫 풀을 남기고 돌려주어 할당기 트림 스톨을 방지한다.
 pub fn trim_idle_gpu_pool(device: &Device) {
+    const HIGH_WATER: usize = 320 << 20;
+    const KEEP_HOT: usize = 256 << 20;
     match device {
         #[cfg(feature = "rocm")]
         Device::Rocm(rd) => {
-            const HIGH_WATER: usize = 320 << 20;
-            const KEEP_HOT: usize = 256 << 20;
             if rd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
                 let _ = rd.trim_memory_pool_to(KEEP_HOT);
             }
         }
-        Device::Cuda(_) | Device::Vulkan(_) => {
-            let _ = device.trim_memory_pool(0);
+        #[cfg(feature = "cuda")]
+        Device::Cuda(cd) => {
+            if cd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
+                let _ = cd.trim_memory_pool(KEEP_HOT);
+            }
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vd) => {
+            const VK_HIGH_WATER: usize = 64 << 20;
+            if vd.pooled_bytes() >= VK_HIGH_WATER {
+                let _ = vd.trim_memory_pool();
+            }
         }
         _ => {}
     }
@@ -502,7 +518,9 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             let l = Tensor::from_vec(det_vec(2 * 64, 13), (2, 64), &Device::Cpu)?;
             let want = candle_core::lm_head::logits_argmax_cs(&l, None, None, None)?;
             let got = candle_core::lm_head::logits_argmax_cs(&l.to_device(device)?, None, None, None)?;
-            if want.ids.to_vec1::<u32>()? != got.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+            let (want_ids, _) = want.download_ids_and_mask()?;
+            let (got_ids, _) = got.download_ids_and_mask()?;
+            if want_ids != got_ids {
                 return Ok(f32::INFINITY);
             }
             let e_mode_b = rel_err_f32(got.max_vals.as_ref().unwrap(), want.max_vals.as_ref().unwrap())?;
@@ -517,14 +535,16 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
                 None,
                 None,
             )?;
-            if want_a.ids.to_vec1::<u32>()? != got_a.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
+            let (want_a_ids, _) = want_a.download_ids_and_mask()?;
+            let (got_a_ids, _) = got_a.download_ids_and_mask()?;
+            if want_a_ids != got_a_ids {
                 return Ok(f32::INFINITY);
             }
             let e_mode_a = rel_err_f32(got_a.max_vals.as_ref().unwrap(), want_a.max_vals.as_ref().unwrap())?;
             let mut worst = e_mode_b.max(e_mode_a);
-            if device.is_rocm() {
+            if device.is_cuda_or_rocm() {
                 use candle_core::quantized::{GgmlDType, QTensor};
-                // M=12 (> 8) exercises candle@708b2f2 chunked ROCm Mode A across Q8_0 / Q4_0 / Q4K / Q5K / Q6K.
+                // M=12 (> 8) exercises chunked CUDA/ROCm Quantized Mode A across Q8_0 / Q4_0 / Q4K / Q5K / Q6K.
                 let hq = Tensor::from_vec(det_vec(12 * 256, 18), (12, 256), &Device::Cpu)?;
                 let wq = Tensor::from_vec(det_vec(64 * 256, 19), (64, 256), &Device::Cpu)?;
                 let hq_dev = hq.to_device(device)?;
@@ -546,7 +566,7 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             Ok(worst)
         }
         AccelOp::GatedDeltaRule => {
-            use candle_core::delta_rule::{fused_gated_delta_rule, GdnConfig};
+            use candle_core::delta_rule::{fused_gated_delta_rule, fused_gated_rms_norm, GdnConfig};
             let cfg = GdnConfig::new(2, 2, 16, 16);
             let (b, t, c, hv) = (1usize, 6usize, cfg.conv_dim(), cfg.num_v_heads);
             let mixed = Tensor::from_vec(det_vec(b * t * c, 21), (b, t, c), &Device::Cpu)?;
@@ -571,7 +591,18 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             let e_out = rel_err_f32(&got.out, &want.out)?;
             let e_conv = rel_err_f32(&got.conv_state, &want.conv_state)?;
             let e_rec = rel_err_f32(&got.recurrent_state, &want.recurrent_state)?;
-            Ok(e_out.max(e_conv).max(e_rec))
+            // Also verify fused_gated_rms_norm (single-pass GDN output norm + SiLU gate)
+            let z = Tensor::from_vec(det_vec(b * t * hv * 16, 26), (b * t * hv, 16), &Device::Cpu)?;
+            let nw = Tensor::from_vec(det_vec(16, 27), 16, &Device::Cpu)?;
+            let want_gn = fused_gated_rms_norm(&want.out.reshape((b * t * hv, 16))?, &z, &nw, 1e-6)?;
+            let got_gn = fused_gated_rms_norm(
+                &got.out.reshape((b * t * hv, 16))?,
+                &z.to_device(device)?,
+                &nw.to_device(device)?,
+                1e-6,
+            )?;
+            let e_gn = rel_err_f32(&got_gn, &want_gn)?;
+            Ok(e_out.max(e_conv).max(e_rec).max(e_gn))
         }
         AccelOp::QuantQ8 => {
             use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
