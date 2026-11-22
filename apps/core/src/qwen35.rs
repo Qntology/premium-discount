@@ -281,8 +281,29 @@ impl Qwen35 {
                     out
                 }
             };
-            x = (x + mixed)?;
-            let h = rms_norm_1p(&x, &layer.post_norm)?;
+            let h = if !x.device().is_cpu()
+                && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::DecoderOps)
+            {
+                match candle_core::decoder_ops::residual_rmsnorm_inplace(
+                    x.clone(),
+                    Some(&mixed),
+                    &layer.post_norm,
+                    EPS as f32,
+                    false,
+                ) {
+                    Ok((res, normed)) => {
+                        x = res;
+                        normed
+                    }
+                    Err(_) => {
+                        x = (x + mixed)?;
+                        rms_norm_1p(&x, &layer.post_norm)?
+                    }
+                }
+            } else {
+                x = (x + mixed)?;
+                rms_norm_1p(&x, &layer.post_norm)?
+            };
             let gate = layer.gate.forward(&h)?;
             let up = layer.up.forward(&h)?;
             let glu = if !gate.device().is_cpu()
@@ -307,18 +328,49 @@ impl Qwen35 {
         let b = g.in_b.forward(h)?.unsqueeze(0)?;
         let a = g.in_a.forward(h)?.unsqueeze(0)?;
         let cfg = candle_core::delta_rule::GdnConfig::new(LIN_HEADS, LIN_HEADS, LIN_DIM, LIN_DIM);
-        let gdn_out = candle_core::delta_rule::fused_gated_delta_rule(
-            &mixed,
-            &g.conv_w,
-            None,
-            conv.as_ref(),
-            &a,
-            &b,
-            &g.neg_a,
-            &g.dt_bias,
-            ssm.as_ref(),
-            &cfg,
-        )?;
+        let dev = h.device();
+        let gdn_out = if dev.is_cpu()
+            || crate::utils::accel_op_ok(dev, crate::utils::AccelOp::GatedDeltaRule)
+        {
+            candle_core::delta_rule::fused_gated_delta_rule(
+                &mixed,
+                &g.conv_w,
+                None,
+                conv.as_ref(),
+                &a,
+                &b,
+                &g.neg_a,
+                &g.dt_bias,
+                ssm.as_ref(),
+                &cfg,
+            )?
+        } else {
+            let conv_cpu = match conv.as_ref() {
+                Some(t) => Some(t.to_device(&Device::Cpu)?),
+                None => None,
+            };
+            let ssm_cpu = match ssm.as_ref() {
+                Some(t) => Some(t.to_device(&Device::Cpu)?),
+                None => None,
+            };
+            let cpu_out = candle_core::delta_rule::fused_gated_delta_rule(
+                &mixed.to_device(&Device::Cpu)?,
+                &g.conv_w.to_device(&Device::Cpu)?,
+                None,
+                conv_cpu.as_ref(),
+                &a.to_device(&Device::Cpu)?,
+                &b.to_device(&Device::Cpu)?,
+                &g.neg_a.to_device(&Device::Cpu)?,
+                &g.dt_bias.to_device(&Device::Cpu)?,
+                ssm_cpu.as_ref(),
+                &cfg,
+            )?;
+            candle_core::delta_rule::GdnOutput {
+                out: cpu_out.out.to_device(dev)?,
+                conv_state: cpu_out.conv_state.to_device(dev)?,
+                recurrent_state: cpu_out.recurrent_state.to_device(dev)?,
+            }
+        };
         *conv = Some(gdn_out.conv_state);
         *ssm = Some(gdn_out.recurrent_state);
         let core_2d = gdn_out.out.reshape((t * LIN_HEADS, LIN_DIM))?;
@@ -455,7 +507,8 @@ impl Qwen35 {
                 Head::Trimmed { ids, weight } => (weight, Some(ids.as_slice())),
             };
             if let Ok(out) = candle_core::lm_head::fused_linear_argmax_cs(&h_row, weight, None, None, None) {
-                let local_id = out.ids.to_vec1::<u32>()?[0];
+                let (ids_vec, _) = out.download_ids_and_mask()?;
+                let local_id = ids_vec[0];
                 let val = out
                     .max_vals
                     .and_then(|t| t.to_vec1::<f32>().ok())

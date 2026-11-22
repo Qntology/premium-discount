@@ -251,6 +251,9 @@ fn gpu_flash_attn_key(dev: &Device, hd: usize) -> Option<(u8, usize, usize)> {
 }
 
 fn gpu_flash_attn_ok(dev: &Device, hd: usize) -> bool {
+    if hd == 0 || hd > 256 {
+        return false;
+    }
     let Some(key) = gpu_flash_attn_key(dev, hd) else {
         return false;
     };
@@ -259,15 +262,38 @@ fn gpu_flash_attn_ok(dev: &Device, hd: usize) -> bool {
     if let Some(&ok) = map.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return ok;
     }
+    let det = |n: usize, seed: u64| -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    };
     let scale = (hd as f32).powf(-0.5);
     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> candle_core::Result<bool> {
-        let q = Tensor::zeros((1, 1, 2, hd), DType::F32, dev)?;
-        let k = Tensor::zeros((1, 1, 2, hd), DType::F32, dev)?;
-        let v = Tensor::ones((1, 1, 2, hd), DType::F32, dev)?;
+        let (bh, n) = (2usize, 8usize);
+        let q_cpu = Tensor::from_vec(det(bh * n * hd, 71), (1, bh, n, hd), &Device::Cpu)?;
+        let k_cpu = Tensor::from_vec(det(bh * n * hd, 72), (1, bh, n, hd), &Device::Cpu)?;
+        let v_cpu = Tensor::from_vec(det(bh * n * hd, 73), (1, bh, n, hd), &Device::Cpu)?;
+        let scores = (q_cpu.matmul(&k_cpu.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+        let want = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v_cpu)?;
         let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale);
-        let out = candle_nn::flash_attn::flash_attn_bhsd(&q, &k, &v, &cfg)?;
-        let vals = out.flatten_all()?.to_vec1::<f32>()?;
-        Ok(vals.len() == 2 * hd && vals.iter().all(|&x| (x - 1.0).abs() < 1e-3))
+        let got = candle_nn::flash_attn::flash_attn_bhsd(
+            &q_cpu.to_device(dev)?,
+            &k_cpu.to_device(dev)?,
+            &v_cpu.to_device(dev)?,
+            &cfg,
+        )?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?;
+        let diff_sq = (&got - &want)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let norm_sq = want.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let rel = (diff_sq / norm_sq.max(1e-30)).sqrt();
+        Ok(rel.is_finite() && rel <= 5e-3)
     }))
     .ok()
     .and_then(|r| r.ok())
@@ -912,5 +938,56 @@ mod tests {
         assert!(VisionAbort::of(&t.extend_sparse_cancellable(&g, &first, &cells[6..], &watch).err().unwrap()).is_some());
         // 다른 오류는 중단이 아니다
         assert_eq!(VisionAbort::of(&anyhow::anyhow!("other")), None);
+    }
+
+    #[test]
+    fn gpu_flash_attn_guard_and_attend_parity() {
+        assert!(!gpu_flash_attn_ok(&Device::Cpu, 72));
+        assert!(!gpu_flash_attn_ok(&Device::Cpu, 0));
+        assert!(!gpu_flash_attn_ok(&Device::Cpu, 512));
+
+        let dev = {
+            #[cfg(feature = "rocm")]
+            {
+                Device::new_rocm(0).unwrap_or(Device::Cpu)
+            }
+            #[cfg(all(not(feature = "rocm"), feature = "vulkan"))]
+            {
+                Device::new_vulkan(0).unwrap_or(Device::Cpu)
+            }
+            #[cfg(all(not(feature = "rocm"), not(feature = "vulkan")))]
+            {
+                Device::Cpu
+            }
+        };
+        if dev.is_cpu() {
+            return;
+        }
+        assert!(!gpu_flash_attn_ok(&dev, 512), "hd > 256 must be rejected");
+        assert!(gpu_flash_attn_ok(&dev, 72), "hd = 72 must pass non-trivial flash-attn probe");
+        let (bh, n, hd) = (4usize, 16usize, 72usize);
+        let mk = |seed: u64| -> Vec<f32> {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (0..bh * n * hd)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    ((s >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect()
+        };
+        let q = Tensor::from_vec(mk(1), (1, bh, n, hd), &Device::Cpu).unwrap();
+        let k = Tensor::from_vec(mk(2), (1, bh, n, hd), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(mk(3), (1, bh, n, hd), &Device::Cpu).unwrap();
+        let want = attend(&q, &k, &v, hd).unwrap();
+        let got = attend(&q.to_device(&dev).unwrap(), &k.to_device(&dev).unwrap(), &v.to_device(&dev).unwrap(), hd)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap();
+        let diff = (&want - &got).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+        assert!(diff < 1e-4, "GPU attend max diff {diff}");
+        let _ = dev.synchronize_all();
+        let _ = dev.trim_memory_pool(0);
     }
 }

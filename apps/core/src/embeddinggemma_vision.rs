@@ -163,34 +163,48 @@ fn antialias_taps(input: usize, output: usize) -> Vec<Taps> {
 /// torchvision의 tvF.resize(uint8 텐서, BICUBIC, antialias=True)와 같다. 중간 반올림까지 맞춰야 값이 일치한다
 /// 정수 고정소수점으로 계산한다. 작은 골든 값은 torch와 비트 단위로 같고, 큰 이미지는 일부 픽셀이 1만큼 다를 수 있다.
 pub fn resize_bicubic(image: &RgbImage, height: usize, width: usize) -> RgbImage {
+    use rayon::prelude::*;
+
     let (ih, iw) = (image.height, image.width);
     let htaps = antialias_taps(iw, width);
     let vtaps = antialias_taps(ih, height);
 
     let mut mid = vec![0u8; ih * width * 3];
-    for y in 0..ih {
+    let horiz_row = |(y, row): (usize, &mut [u8])| {
+        let src_base = y * iw;
         for (x, t) in htaps.iter().enumerate() {
             for c in 0..3 {
                 let mut acc = ROUND;
                 for (k, &w) in t.weights.iter().enumerate() {
-                    acc += w * image.pixels[(y * iw + t.start + k) * 3 + c] as i64;
+                    acc += w * image.pixels[(src_base + t.start + k) * 3 + c] as i64;
                 }
-                mid[(y * width + x) * 3 + c] = clip8(acc);
+                row[x * 3 + c] = clip8(acc);
             }
         }
+    };
+    if ih * width >= 65_536 {
+        mid.par_chunks_exact_mut(width * 3).enumerate().for_each(horiz_row);
+    } else {
+        mid.chunks_exact_mut(width * 3).enumerate().for_each(horiz_row);
     }
 
     let mut out = vec![0u8; height * width * 3];
-    for (y, t) in vtaps.iter().enumerate() {
+    let vert_row = |(y, row): (usize, &mut [u8])| {
+        let t = &vtaps[y];
         for x in 0..width {
             for c in 0..3 {
                 let mut acc = ROUND;
                 for (k, &w) in t.weights.iter().enumerate() {
                     acc += w * mid[((t.start + k) * width + x) * 3 + c] as i64;
                 }
-                out[(y * width + x) * 3 + c] = clip8(acc);
+                row[x * 3 + c] = clip8(acc);
             }
         }
+    };
+    if height * width >= 65_536 {
+        out.par_chunks_exact_mut(width * 3).enumerate().for_each(vert_row);
+    } else {
+        out.chunks_exact_mut(width * 3).enumerate().for_each(vert_row);
     }
     RgbImage { width, height, pixels: out }
 }
@@ -257,6 +271,15 @@ pub fn video_frame_indices(total_frames: usize, source_fps: f64) -> Vec<usize> {
 
 /// RMS norm: x / sqrt(mean(x^2) + eps) * weight. weight가 None이면 스케일 없이 정규화만 한다.
 fn rms_norm(x: &Tensor, weight: Option<&Tensor>) -> Result<Tensor> {
+    if let Some(w) = weight {
+        if !x.device().is_cpu()
+            && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::DecoderOps)
+        {
+            if let Ok(y) = candle_core::decoder_ops::rmsnorm_fused(x, w, RMS_EPS as f32, false) {
+                return Ok(y);
+            }
+        }
+    }
     let inv = x.sqr()?.mean_keepdim(D::Minus1)?.affine(1.0, RMS_EPS)?.powf(-0.5)?;
     let y = x.broadcast_mul(&inv)?;
     match weight {
@@ -597,6 +620,44 @@ mod tests {
             123, 38, 88, 138, 54, 104, 154, 69, 119, 169,
         ];
         assert_eq!(down.pixels, down_golden);
+    }
+
+    #[test]
+    fn resize_large_parallel_matches_serial() {
+        // 384x512 -> 240x320 exercises both horizontal (ih*width=122_880 >= 65_536) and vertical
+        // (height*width=76_800 >= 65_536) rayon parallel paths and verifies bit-exact parity.
+        let img = formula(512, 384);
+        let (height, width) = (240usize, 320usize);
+        let par = resize_bicubic(&img, height, width);
+
+        let (ih, iw) = (img.height, img.width);
+        let htaps = antialias_taps(iw, width);
+        let vtaps = antialias_taps(ih, height);
+        let mut mid = vec![0u8; ih * width * 3];
+        for y in 0..ih {
+            for (x, t) in htaps.iter().enumerate() {
+                for c in 0..3 {
+                    let mut acc = ROUND;
+                    for (k, &w) in t.weights.iter().enumerate() {
+                        acc += w * img.pixels[(y * iw + t.start + k) * 3 + c] as i64;
+                    }
+                    mid[(y * width + x) * 3 + c] = clip8(acc);
+                }
+            }
+        }
+        let mut serial = vec![0u8; height * width * 3];
+        for (y, t) in vtaps.iter().enumerate() {
+            for x in 0..width {
+                for c in 0..3 {
+                    let mut acc = ROUND;
+                    for (k, &w) in t.weights.iter().enumerate() {
+                        acc += w * mid[((t.start + k) * width + x) * 3 + c] as i64;
+                    }
+                    serial[(y * width + x) * 3 + c] = clip8(acc);
+                }
+            }
+        }
+        assert_eq!(par.pixels, serial);
     }
 
     #[test]

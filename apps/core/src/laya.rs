@@ -119,6 +119,31 @@ pub fn profanity_question() -> Question {
 }
 
 fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor> {
+    if x.device().is_cpu() && x.dtype() == DType::F32 {
+        let dims = x.dims().to_vec();
+        if let Some(&h) = dims.last() {
+            if h > 0 && w.dims() == [h] && b.is_none_or(|t| t.dims() == [h]) {
+                let xv = x.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                let wv = w.contiguous()?.to_vec1::<f32>()?;
+                let bv = match b {
+                    Some(t) => Some(t.contiguous()?.to_vec1::<f32>()?),
+                    None => None,
+                };
+                let mut out = vec![0.0f32; xv.len()];
+                premium_discount_cpu_kernels::layer_norm(&xv, h, &wv, bv.as_deref(), eps as f32, &mut out);
+                return Tensor::from_vec(out, dims, x.device());
+            }
+        }
+    }
+    if let Some(bias) = b {
+        if !x.device().is_cpu()
+            && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::LayerNorm)
+        {
+            if let Ok(y) = candle_nn::ops::layer_norm(x, w, bias, eps as f32) {
+                return Ok(y);
+            }
+        }
+    }
     let mean = x.mean_keepdim(D::Minus1)?;
     let xc = x.broadcast_sub(&mean)?;
     let var = xc.sqr()?.mean_keepdim(D::Minus1)?;
