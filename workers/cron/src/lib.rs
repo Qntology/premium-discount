@@ -11,6 +11,7 @@
 //! 주석과 docs/workers-rs.md 의 "고친 버그" 표에 있다(fix-return-await · fix-weight-own).
 
 pub mod moderation;
+pub mod nav_verdicts;
 pub mod navtrials;
 pub mod vector;
 pub mod verdict;
@@ -26,21 +27,31 @@ mod worker_main {
     use premium_discount_worker_common::platform::now;
     use premium_discount_worker_common::{console_log, R};
 
+    use crate::nav_verdicts::wasm::{cleanup_batch_receipts, process_nav_verdicts};
     use crate::navtrials::expire_wallet_trials;
     use crate::queue::process_queue;
     use crate::verdicts::process_verdicts;
 
-    /// 원본 `scheduled(_controller, env, _ctx)`
+    /// 원본 `scheduled(_controller, env, _ctx)` + Phase 5 PD-Verdict v2 (`nav` 트랙) 및 멱등 영수증 정리
     pub async fn scheduled(env: &Env) -> R<()> {
         let processed = process_queue(env, now()).await?;
         console_log!("eval queue processed", processed);
         // 대기열 다음에 판정을 처리한다
         let (computed, judged) = process_verdicts(env, now()).await?;
         console_log!("verdicts computed", computed, "judged", judged);
-        // 접근성 내비게이션: 기한(30일)이 지난 지갑 코스를 지운다
+        // Phase 5 Part 1: 타임트라이얼 코스·체크포인트 PD-Verdict v2 (nav 트랙) 판정
+        let (nav_computed, nav_judged) = process_nav_verdicts(env, now()).await?;
+        if nav_computed > 0.0 || nav_judged > 0.0 {
+            console_log!("nav verdicts computed", nav_computed, "judged", nav_judged);
+        }
+        // 접근성 내비게이션: 기한(30일)이 지난 지갑 코스와 24시간 지난 배치 멱등 영수증을 지운다
         let expired = expire_wallet_trials(&env.get("DB"), now()).await?;
         if expired > 0.0 {
             console_log!("wallet nav trials expired", expired);
+        }
+        let cleaned = cleanup_batch_receipts(&env.get("DB"), now()).await?;
+        if cleaned > 0.0 {
+            console_log!("nav batch receipts cleaned", cleaned);
         }
         Ok(())
     }

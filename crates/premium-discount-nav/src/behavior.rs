@@ -14,10 +14,10 @@
 //! 자리 비움 · 개인정보 잠금 동안 멈추고, 전투 중 연타는 광클로 넣지 않는다. 기준선이 아직 없으면 절대 임계값으로 경보
 //! 단계를 정한다([`FrictionAlertStage`]). 개인정보 잠금이 시작되면 지난 5초 사건을 지우고, 잠금을 걸친 에피소드는 기록하지 않는다.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use premium_discount_identity::wipe_string;
-use premium_discount_verdict::{Level, MinObs, Params, NAV};
+use premium_discount_verdict::{Level, MinObs, Params, Tier, NAV};
 use serde::{Deserialize, Serialize};
 
 use crate::mark::MarkType;
@@ -617,6 +617,33 @@ impl LiveEpisodeWindow {
         reading
     }
 
+    /// 키보드 Tab/화살표·UIA 포커스·단일 스위치 입력 등 비포인터 활성 신호를 기록해 AFK 오판을 막는다 (Phase 7 Part 1).
+    pub fn note_non_pointer_activity(&mut self, now_ms: i64) {
+        self.note_activity(now_ms);
+    }
+
+    /// 화면 텍스트 글자 수(`visible_chars`)에 비례한 독해 여유 시간 동안 정체/초과 카운터를 면책한 실시간 판독 (Phase 7 Part 3).
+    pub fn peek_with_reading_grace(
+        &self,
+        baselines: &FrictionBaselines,
+        now_ms: i64,
+        ghost_overrun_ms: u32,
+        visible_chars: usize,
+        p: &BehaviorParams,
+    ) -> LiveFrictionReading {
+        let grace = reading_grace_ms(visible_chars);
+        let probe = LiveProbeContext {
+            now_ms,
+            active_unacted_search_ms: self.active_unacted_search_ms().saturating_sub(grace),
+            ghost_overrun_ms: ghost_overrun_ms.saturating_sub(grace),
+        };
+        let mut reading = baselines.peek_live(&self.cc, &self.screen, &self.episode, &probe, p);
+        if self.locked {
+            reading.stage = FrictionAlertStage::Calm;
+        }
+        reading
+    }
+
     /// `cutoff_ms` 와 그 뒤의 사건을 지운다(위치 단서 글자는 0 으로 덮어 쓴 뒤 버린다). 지운 사건 수
     pub fn rollback_recent(&mut self, cutoff_ms: i64) -> usize {
         let before = self.episode.events.len();
@@ -686,6 +713,166 @@ fn wipe_events(events: &mut Vec<Event>) {
         }
     }
     events.clear();
+}
+
+/// Phase 7 Part 3: Calm Compass 독해 여유 시간(글자당 120 ms).
+pub const READING_MS_PER_CHAR: u32 = 120;
+
+/// 화면 가시 텍스트 글자 수(`visible_chars`)에 비례한 독해 면책 시간(ms, 최대 120초).
+pub fn reading_grace_ms(visible_chars: usize) -> u32 {
+    (visible_chars as u64).saturating_mul(u64::from(READING_MS_PER_CHAR)).min(120_000) as u32
+}
+
+/// Phase 4 Part 3: 화면·장면 전환 직후 1-Hop 역추적 관찰 창(8초)과 감쇠 계수(0.85).
+pub const CROSS_BOUNDARY_BOUNCE_WINDOW_MS: i64 = 8_000;
+pub const CROSS_BOUNDARY_HOP_DECAY: f64 = 0.85;
+
+/// 비DOM(무확장 UIA · 데스크톱 앱 · 인게임 배지) 범용 선택-마찰 교차 분류 (Phase 4 Part 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UniversalChoiceKind {
+    /// 고선호 + 저마찰 완주 → Premium (+1)
+    GoldenPath,
+    /// 고마찰 / 즉발 역류 / 패배 → Discount (-1 거부권)
+    FrictionTrap,
+    /// 저선호이나 무마찰 정상 동작 → Neutral (억울한 Discount 오염 방지)
+    BenignIgnored,
+    /// 표본 부족
+    UnratedCold,
+}
+
+impl UniversalChoiceKind {
+    pub fn tier(self) -> Tier {
+        match self {
+            UniversalChoiceKind::GoldenPath => Tier::Premium,
+            UniversalChoiceKind::FrictionTrap => Tier::Discount,
+            UniversalChoiceKind::BenignIgnored => Tier::Neutral,
+            UniversalChoiceKind::UnratedCold => Tier::Unrated,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UniversalChoiceEntry {
+    pub picks: u32,
+    pub exposures: u32,
+    pub expected: f64,
+    pub variance: f64,
+    pub post_windows: u32,
+    pub post_friction_sum: f64,
+    pub abandon_or_defeat: u32,
+}
+
+impl UniversalChoiceEntry {
+    pub fn z_choice(&self) -> Option<f64> {
+        (self.variance > 1e-6).then(|| (f64::from(self.picks) - self.expected) / self.variance.sqrt())
+    }
+
+    pub fn mean_post_friction(&self) -> f64 {
+        if self.post_windows == 0 {
+            0.0
+        } else {
+            self.post_friction_sum / f64::from(self.post_windows)
+        }
+    }
+
+    pub fn fail_rate(&self) -> f64 {
+        if self.post_windows == 0 {
+            0.0
+        } else {
+            f64::from(self.abandon_or_defeat) / f64::from(self.post_windows)
+        }
+    }
+}
+
+/// 무확장 UIA · 네이티브 앱 · 인게임 가시 후보 풀(`visible_regions`, 최대 16개)에 대한 범용 포아송-이항 선택 대조 및
+/// 1-Hop 화면 전환 역추적 마찰 장부 (Phase 4 Part 3).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UniversalChoiceBook {
+    pub entries: BTreeMap<String, UniversalChoiceEntry>,
+    pub post_baseline: Welford,
+}
+
+impl UniversalChoiceBook {
+    /// 가시 후보 풀(`visible_keys`, 최대 16개)에서 `chosen` 을 선택했다.
+    /// `vertical_list` 면 `(k + 1)^-0.35` 위치 감쇠 사전분포, 가로 탭·인게임 갈림길이면 균등 `1/n` 사전분포를 쓴다.
+    pub fn observe_pick(&mut self, chosen: &str, visible_keys: &[&str], vertical_list: bool) -> bool {
+        let mut pool: Vec<&str> = Vec::with_capacity(visible_keys.len().min(16) + 1);
+        for &k in visible_keys.iter().take(16) {
+            if !pool.contains(&k) {
+                pool.push(k);
+            }
+        }
+        if !pool.contains(&chosen) && pool.len() < 16 {
+            pool.push(chosen);
+        }
+        if pool.len() < 2 {
+            return false;
+        }
+        let weights: Vec<f64> = (0..pool.len())
+            .map(|k| if vertical_list { ((k + 1) as f64).powf(-0.35) } else { 1.0 })
+            .collect();
+        let wsum: f64 = weights.iter().sum::<f64>().max(1e-9);
+        for (&key, w) in pool.iter().zip(&weights) {
+            let p = *w / wsum;
+            let e = self.entries.entry(key.to_string()).or_default();
+            e.exposures += 1;
+            e.expected += p;
+            e.variance += p * (1.0 - p);
+            if key == chosen {
+                e.picks += 1;
+            }
+        }
+        true
+    }
+
+    /// 선택 `chosen` 직후 같은 화면 마찰(`same_screen_friction`)과 다음 화면 도착 초기(`arrival_dwell_ms <= 8s`)
+    /// 즉발 역류·포기·패배 마찰(`arrival_friction`)을 `γ_hop = 0.85` 로 역귀속 합산한다.
+    pub fn observe_post_pick_1hop(
+        &mut self,
+        chosen: &str,
+        same_screen_friction: f64,
+        arrival_dwell_ms: Option<i64>,
+        arrival_bounce_or_defeat: bool,
+        arrival_friction: f64,
+    ) {
+        let hop_triggered = arrival_bounce_or_defeat
+            && arrival_dwell_ms.is_some_and(|d| (0..=CROSS_BOUNDARY_BOUNCE_WINDOW_MS).contains(&d));
+        let total_friction = same_screen_friction.max(0.0)
+            + if hop_triggered { CROSS_BOUNDARY_HOP_DECAY * arrival_friction.max(0.0) } else { 0.0 };
+        let e = self.entries.entry(chosen.to_string()).or_default();
+        e.post_windows += 1;
+        e.post_friction_sum += total_friction;
+        if hop_triggered {
+            e.abandon_or_defeat += 1;
+        }
+        self.post_baseline.push(total_friction);
+    }
+
+    /// 선택 선호도와 1-Hop 인과 마찰 거부권을 결합해 [`UniversalChoiceKind`] 를 판정한다.
+    pub fn classify(&self, key: &str) -> UniversalChoiceKind {
+        let Some(e) = self.entries.get(key) else {
+            return UniversalChoiceKind::UnratedCold;
+        };
+        let mean_f = e.mean_post_friction();
+        let post_z = if self.post_baseline.n >= 3 {
+            Some((mean_f - self.post_baseline.mean) / (self.post_baseline.population_sd() + 0.25))
+        } else {
+            None
+        };
+        let high_friction = post_z.is_some_and(|z| z >= 1.0) || (e.post_windows >= 2 && e.fail_rate() >= 0.5);
+        if high_friction && (e.picks >= 2 || e.post_windows >= 2) {
+            return UniversalChoiceKind::FrictionTrap;
+        }
+        if e.exposures < 5 {
+            return UniversalChoiceKind::UnratedCold;
+        }
+        match e.z_choice() {
+            Some(z) if z >= 2.0 && e.picks >= 3 => UniversalChoiceKind::GoldenPath,
+            Some(z) if z <= -2.0 && e.expected >= 2.5 => UniversalChoiceKind::BenignIgnored,
+            _ => UniversalChoiceKind::UnratedCold,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1144,5 +1331,35 @@ mod tests {
         assert!((got.mean - rest.mean).abs() < 1e-12 && (got.population_sd() - rest.population_sd()).abs() < 1e-9, "{got:?} vs {rest:?}");
         assert_eq!(all.without(&Welford::default()), all);
         assert_eq!(part.without(&all).n, 0);
+    }
+
+    #[test]
+    fn universal_choice_book_1hop_trap_and_benign_ignored_and_reading_grace() {
+        let mut book = UniversalChoiceBook::default();
+        let pool = ["btn_trap", "btn_safe", "btn_rare", "btn_aux"];
+        // Users click btn_trap heavily (attractive dark pattern), then bounce/die in 3s on arrival!
+        for _ in 0..8 {
+            book.observe_pick("btn_trap", &pool, false);
+            book.observe_post_pick_1hop("btn_trap", 0.0, Some(3_000), true, 4.0);
+        }
+        for _ in 0..6 {
+            book.observe_pick("btn_safe", &pool, false);
+            book.observe_post_pick_1hop("btn_safe", 0.0, Some(12_000), false, 0.0);
+        }
+        assert_eq!(book.classify("btn_trap"), UniversalChoiceKind::FrictionTrap);
+        assert_eq!(book.classify("btn_rare"), UniversalChoiceKind::BenignIgnored);
+
+        // Non-pointer activity keeps exploration clock alive; reading grace suppresses stall alerts.
+        let p = BehaviorParams::default();
+        let baselines = FrictionBaselines::default();
+        let mut win = LiveEpisodeWindow::new("app.exe", "0xpage", 0);
+        win.note_non_pointer_activity(5_000);
+        win.note_non_pointer_activity(10_000);
+        win.note_non_pointer_activity(16_000);
+        assert_eq!(win.active_unacted_search_ms(), 16_000);
+        let raw = win.peek(&baselines, 16_000, 0, &p);
+        let calm = win.peek_with_reading_grace(&baselines, 16_000, 0, 200, &p);
+        assert!(raw.effective_friction > calm.effective_friction);
+        assert_eq!(calm.stage, FrictionAlertStage::Calm);
     }
 }

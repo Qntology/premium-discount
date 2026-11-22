@@ -553,6 +553,138 @@ pub fn tier(premium: u32, discount: u32) -> Tier {
     }
 }
 
+/// 체크포인트 판정 결과 4-상태 (Phase 4 Part 1 `route_marks 2.0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkOutcome {
+    /// 검증된 순항 통과 (+1)
+    Premium,
+    /// 쾌적·정속/고속 우회로 기존 스텝이 불필요함을 증명 (-1)
+    Discount,
+    /// 동일 `(kind, hash)` 를 다른 입력 모달리티(예: 스와이프 ↔ 클릭)로 통과 — 감점 금지 (0)
+    EquivalentPass,
+    /// 둔속·고마찰 우회 또는 국소 병목 억지 돌파 — 표 오염 방지 기권 (0)
+    Abstain,
+}
+
+impl MarkOutcome {
+    pub fn sign(self) -> Option<i32> {
+        match self {
+            MarkOutcome::Premium => Some(1),
+            MarkOutcome::Discount => Some(-1),
+            MarkOutcome::EquivalentPass | MarkOutcome::Abstain => None,
+        }
+    }
+}
+
+/// Phase 4 Part 1 `route_marks_v2` 평가 문맥.
+#[derive(Debug, Clone)]
+pub struct RouteEvalContext<'a> {
+    pub run_total_ms: u32,
+    pub run_kind: Option<MarkType>,
+    pub ghost_avg_ms: u32,
+    pub run_splits: &'a [u32],
+    pub ghost_splits: &'a [u32],
+    /// 비트 `i` 가 켜져 있으면 런의 `i` 번째 스텝에서 국소 고마찰 병목(`z >= 1.0`, FC-05)이 발생했다.
+    pub fault_steps_mask: u16,
+    /// 비트 `i` 가 켜져 있으면 사전 경고된 함정(`WarnedTrap`, FC-06)으로 긍정 보상을 차단한다.
+    pub warned_trap_mask: u16,
+    /// 10스텝 솎아내기에서 생략됐으나 실제로 통과한 고스트 체크포인트 증인 목록.
+    pub passed_witness: &'a [StepRef],
+    /// 우회 Discount 성립을 위한 속도 허용 비율 (기본 0.05 = +5%).
+    pub pace_eps: f64,
+    /// 반올림 지터(100ms)를 감안한 최소 속도 데드밴드 (기본 500ms).
+    pub pace_deadband_ms: u32,
+    /// Phase 7 Part 4 개인 기저 속도비 `ρ_u >= 1.0` (기본 1.0).
+    pub user_pace_ratio: f64,
+}
+
+impl Default for RouteEvalContext<'_> {
+    fn default() -> Self {
+        Self {
+            run_total_ms: 0,
+            run_kind: None,
+            ghost_avg_ms: 0,
+            run_splits: &[],
+            ghost_splits: &[],
+            fault_steps_mask: 0,
+            warned_trap_mask: 0,
+            passed_witness: &[],
+            pace_eps: 0.05,
+            pace_deadband_ms: 500,
+            user_pace_ratio: 1.0,
+        }
+    }
+}
+
+fn same_base_step(a: &StepRef, b: &StepRef) -> bool {
+    a.kind == b.kind && a.hash.eq_ignore_ascii_case(&b.hash)
+}
+
+/// 오염 방지 `route_marks 2.0` (Phase 4 Part 1 + Phase 7 Part 4 개인 속도비 정규화).
+///
+/// * 시작과 결승이 고스트와 다르면 `None` (모달리티만 다른 동일 기점/결승도 허용하지 않고 기존 계약처럼 일치 요구).
+/// * 정확 통과: 런 무마찰 또는 `fault_steps_mask` 순항 보호 시 `Premium(+1)`, 병목/경고 함정/역순 +25% 지연 시 `Abstain(0)`.
+/// * 등가 모달리티 통과(`(kind, hash)` 일치, `gesture` 만 상이): `EquivalentPass(0)` 로 상호 감점 차단.
+/// * 미통과 우회: `run_kind != Discount` 이고 개인 속도 정규화 완주 시간 `T_run / ρ_u <= max(T_ghost * (1 + pace_eps), T_ghost + pace_deadband_ms)` 일 때만 `Discount(-1)`, 둔속·고마찰 우회는 `Abstain(0)`.
+pub fn route_marks_v2(run: &[StepRef], ghost: &[StepRef], ctx: &RouteEvalContext<'_>) -> Option<Vec<(StepRef, MarkOutcome)>> {
+    if run.first()? != ghost.first()? || run.last()? != ghost.last()? {
+        return None;
+    }
+    let pace_ratio = if ctx.user_pace_ratio.is_finite() && ctx.user_pace_ratio >= 1.0 {
+        ctx.user_pace_ratio
+    } else {
+        1.0
+    };
+    let norm_total = ctx.run_total_ms as f64 / pace_ratio;
+    let avg = ctx.ghost_avg_ms as f64;
+    let pace_ceiling = (avg * (1.0 + ctx.pace_eps.max(0.0))).max(avg + ctx.pace_deadband_ms as f64);
+    let fast_enough_for_bypass = ctx.ghost_avg_ms == 0 || norm_total <= pace_ceiling;
+    let clean_for_bypass = ctx.run_kind != Some(MarkType::Discount) && fast_enough_for_bypass;
+
+    let mut out: Vec<(StepRef, MarkOutcome)> = Vec::new();
+    let mut last_matched_run_idx: Option<usize> = None;
+
+    for (gi, step) in ghost.iter().enumerate().skip(1).take(ghost.len().saturating_sub(2)) {
+        if out.iter().any(|(s, _)| s == step) {
+            continue;
+        }
+        if let Some(ri) = run.iter().position(|s| s == step) {
+            let bit = if ri < 16 { 1u16 << ri } else { 0 };
+            let step_faulted = (ctx.fault_steps_mask & bit) != 0;
+            let step_warned = (ctx.warned_trap_mask & bit) != 0;
+            let out_of_order = last_matched_run_idx.is_some_and(|prev| ri < prev);
+            let out_of_order_slow = out_of_order && {
+                let r_seg = ctx.run_splits.get(ri).copied().unwrap_or(0) as f64 / pace_ratio;
+                let g_seg = ctx.ghost_splits.get(gi).copied().unwrap_or(0) as f64;
+                g_seg > 0.0 && r_seg > g_seg * 1.25
+            };
+            // `fault_steps_mask` 가 제공되면 순항 스텝은 전체 런이 discount 여도 보호(FC-05); 미제공 시 전체 discount 런은 병목 세탁 차단.
+            let run_level_blocked = ctx.run_kind == Some(MarkType::Discount) && ctx.fault_steps_mask == 0;
+            let outcome = if step_faulted || step_warned || run_level_blocked || out_of_order_slow {
+                MarkOutcome::Abstain
+            } else {
+                MarkOutcome::Premium
+            };
+            last_matched_run_idx = Some(last_matched_run_idx.map_or(ri, |prev| prev.max(ri)));
+            out.push((step.clone(), outcome));
+        } else if ctx.passed_witness.contains(step) {
+            let outcome = if ctx.run_kind == Some(MarkType::Discount) && ctx.fault_steps_mask == 0 {
+                MarkOutcome::Abstain
+            } else {
+                MarkOutcome::Premium
+            };
+            out.push((step.clone(), outcome));
+        } else if run.iter().any(|s| same_base_step(s, step)) {
+            out.push((step.clone(), MarkOutcome::EquivalentPass));
+        } else {
+            let outcome = if clean_for_bypass { MarkOutcome::Discount } else { MarkOutcome::Abstain };
+            out.push((step.clone(), outcome));
+        }
+    }
+    Some(out)
+}
+
 /// 다른 사용자의 코스(고스트)를 따라 달린 런의 체크포인트 판정. 시작과 결승이 고스트와 같을 때만 판정한다(같은 목적지로 가는
 /// 길의 비교). 고스트의 중간 체크포인트(시작 · 결승을 뺀 것)마다, 런이 그 체크포인트를 지났으면 premium, 지나지 않았으면
 /// (다른 길로 갔으면) discount 다. 런에만 있는 체크포인트는 판정하지 않는다. 시작이나 결승이 다르면 None.
@@ -585,6 +717,31 @@ impl CheckpointTally {
     }
 }
 
+/// 서버 PD-Verdict v2 (`nav` 트랙) 판정 요약 (Phase 5 Part 1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerdictSummary {
+    pub tier: Tier,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<f64>,
+    #[serde(default)]
+    pub evidence: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default = "default_nav_recipe")]
+    pub recipe: String,
+}
+
+fn default_nav_recipe() -> String {
+    RECIPE_V2.to_string()
+}
+
+/// Phase 7 Part 4: 코스 물리 조작 요구 특성 비트 (신체·장애 정보 수집 0%, 코스 구조만으로 결정론적 산출).
+pub const TRAIT_NO_FINE_GESTURE: u16 = 1 << 0;
+pub const TRAIT_TREE_ACCESSIBLE: u16 = 1 << 1;
+pub const TRAIT_LOW_DENSITY_CALM: u16 = 1 << 2;
+
 /// 콜렉션의 코스 하나 (내 기록)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CourseEntry {
@@ -601,6 +758,9 @@ pub struct CourseEntry {
     pub last_day: i64,
     /// 덮어쓸 순서: 클수록 최근에 달렸다
     pub touched: u64,
+    /// 사용자가 [▲] 핀으로 고정한 주력 코스 (Pinned-SLRU 퇴출 면제, 최대 3개, Phase 5 Part 2)
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl CourseEntry {
@@ -629,6 +789,12 @@ pub struct PublicCourse {
     /// 체크포인트마다의 판정 수 (`steps` 와 같은 순서, [`route_marks`] 로 쌓인 것)
     #[serde(default)]
     pub checkpoints: Vec<CheckpointTally>,
+    /// 서버 PD-Verdict v2 (`nav` 트랙) 공식 판정 요약 (있으면 2/3 비율 대신 우선 사용, Phase 5 Part 1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<VerdictSummary>,
+    /// 코스 물리 조작 요구 특성 비트마스크 (`TRAIT_*`, Phase 7 Part 4)
+    #[serde(default)]
+    pub interaction_traits: u16,
 }
 
 /// 런을 콜렉션에 넣은 결과
@@ -720,6 +886,293 @@ fn utility(tier: Tier, runs: u32, finish_ms: u32) -> f64 {
 /// 많이 달린 길보다 premium 이고 빠른 길을 고스트로 고른다. 사람이 많이 지나도 마찰이 큰 길(discount)은 권하지 않는다
 pub fn ghost_utility(course: &PublicCourse) -> f64 {
     utility(tier(course.premium, course.discount), course.runs, course.average.last().copied().unwrap_or(0))
+}
+
+/// Phase 5 Part 1: PD-Verdict v2 (`grade` · 연속 `rank` · `superseded`)를 반영한 연속 효용 점수.
+/// `course.verdict` 가 없으면 기존 [`ghost_utility`] 로 매끄럽게 폴백한다.
+pub fn ghost_utility_v3(course: &PublicCourse) -> f64 {
+    let finish_ms = course.average.last().copied().unwrap_or(0);
+    let Some(v) = &course.verdict else {
+        return ghost_utility(course);
+    };
+    let r = v.rank.filter(|x| x.is_finite()).unwrap_or(0.0).clamp(-1.0, 1.0);
+    let superseded = v.reasons.iter().any(|s| s == "superseded");
+    let v_score = if superseded {
+        -3.5
+    } else {
+        match v.tier {
+            Tier::Premium => 1.5 + if v.grade == Some(2) { 0.5 } else { 0.0 } + 0.4 * r.max(0.0),
+            Tier::Neutral => {
+                if v.rank.is_some() {
+                    0.25 * r
+                } else {
+                    0.0
+                }
+            }
+            Tier::Discount => -2.5 - if v.grade == Some(-2) { 0.5 } else { 0.0 },
+            Tier::Unrated => 0.0,
+        }
+    };
+    100.0 * v_score + 10.0 * (1.0 + course.runs as f64).ln() - finish_ms as f64 / 1000.0
+}
+
+/// Phase 5 Part 1: 상위 호환 지름길 및 패치 폐쇄에 의한 구 코스 대체(`superseded`) 판정.
+/// 동일 기점·결승을 가진 신규 코스가 PD-Verdict v2 `Premium(grade +2)` 이고, 구 코스의 부분집합 직행이거나
+/// 갈림길 맞대결에서 결정적 우위(wins >= 5, 승률 >= 0.80, 평균 25% 이상 단축 + 구 코스 최근 마찰 악화)를 입증하면 true.
+pub fn is_course_superseded(old: &PublicCourse, new: &PublicCourse, duel_wins: u32, duel_losses: u32, old_recent_friction_worse: bool) -> bool {
+    if old.course == new.course || old.steps.first() != new.steps.first() || old.steps.last() != new.steps.last() {
+        return false;
+    }
+    let new_strong_premium = new
+        .verdict
+        .as_ref()
+        .is_some_and(|v| v.tier == Tier::Premium && v.grade == Some(2));
+    if !new_strong_premium {
+        return false;
+    }
+    let old_avg = old.average.last().copied().unwrap_or(0) as f64;
+    let new_avg = new.average.last().copied().unwrap_or(0) as f64;
+    if old_avg <= 0.0 || new_avg >= old_avg {
+        return false;
+    }
+    // 조건 A: 엄격 부분집합 직행 단축 (C_new.steps ⊂ C_old.steps)
+    let strict_subset = new.steps.len() < old.steps.len() && new.steps.iter().all(|s| old.steps.contains(s));
+    if strict_subset {
+        return true;
+    }
+    // 조건 B: 갈림길 맞대결 결정적 우위 + 25% 이상 단축 + 구 코스 최근 마찰 악화
+    let total_duels = duel_wins + duel_losses;
+    let win_rate = if total_duels == 0 { 0.0 } else { duel_wins as f64 / total_duels as f64 };
+    let speedup = (old_avg - new_avg) / old_avg;
+    duel_wins >= 5 && win_rate >= 0.80 && speedup >= 0.25 && old_recent_friction_worse
+}
+
+/// Phase 7 Part 4: 코스의 물리 조작 요구 특성 비트마스크를 결정론적으로 산출한다.
+pub fn compute_interaction_traits(steps: &[StepRef], splits: &[u32], has_vision_only: bool, discount: u32, runs: u32) -> u16 {
+    let mut traits = 0u16;
+    let no_fine_gesture = steps.iter().all(|s| {
+        !matches!(
+            s.gesture,
+            Some(Gesture::SwipeLeft | Gesture::SwipeRight | Gesture::SwipeUp | Gesture::SwipeDown)
+        )
+    });
+    if no_fine_gesture {
+        traits |= TRAIT_NO_FINE_GESTURE;
+    }
+    if !has_vision_only {
+        traits |= TRAIT_TREE_ACCESSIBLE;
+    }
+    let no_rapid_chain = splits.windows(2).all(|w| w[1].saturating_sub(w[0]) >= 800);
+    let low_friction_rate = runs == 0 || (discount as f64 / runs as f64) <= 0.15;
+    if no_rapid_chain && low_friction_rate {
+        traits |= TRAIT_LOW_DENSITY_CALM;
+    }
+    traits
+}
+
+/// 기기 로컬 전용 접근성 라우팅 선호 (서버 전송 0바이트, Phase 7 Part 4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessibilityRoutePrefs {
+    pub require_tree_accessible: bool,
+    pub prefer_no_fine_gesture: bool,
+    pub prefer_calm: bool,
+}
+
+/// 로컬 접근성 조건과 [`ghost_utility_v3`] 를 결합해 포용적 고스트 우선순위를 산출한다.
+pub fn contextual_ghost_utility(course: &PublicCourse, prefs: &AccessibilityRoutePrefs) -> f64 {
+    let mut score = ghost_utility_v3(course);
+    let traits = if course.interaction_traits != 0 {
+        course.interaction_traits
+    } else {
+        compute_interaction_traits(&course.steps, &course.average, false, course.discount, course.runs)
+    };
+    if prefs.require_tree_accessible && (traits & TRAIT_TREE_ACCESSIBLE) == 0 {
+        score -= 500.0;
+    }
+    if prefs.prefer_no_fine_gesture {
+        if (traits & TRAIT_NO_FINE_GESTURE) != 0 {
+            score += 120.0;
+        } else {
+            score -= 120.0;
+        }
+    }
+    if prefs.prefer_calm && (traits & TRAIT_LOW_DENSITY_CALM) != 0 {
+        score += 40.0;
+    }
+    score
+}
+
+/// Phase 7 Part 4: 기기 로컬 개인 속도비 `ρ_u = median(Δt_user / Δt_public) >= 1.0`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PersonalPaceProfile {
+    ratios: Vec<f64>,
+}
+
+impl PersonalPaceProfile {
+    pub fn observe_segment(&mut self, user_ms: u32, public_avg_ms: u32) {
+        if user_ms == 0 || public_avg_ms == 0 {
+            return;
+        }
+        let r = (user_ms as f64 / public_avg_ms as f64).clamp(1.0, 20.0);
+        self.ratios.push(r);
+        if self.ratios.len() > 64 {
+            self.ratios.remove(0);
+        }
+    }
+
+    pub fn ratio(&self) -> f64 {
+        if self.ratios.is_empty() {
+            return 1.0;
+        }
+        let mut sorted = self.ratios.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let mid = sorted.len() / 2;
+        if sorted.len() % 2 == 1 {
+            sorted[mid]
+        } else {
+            0.5 * (sorted[mid - 1] + sorted[mid])
+        }
+    }
+}
+
+/// Phase 4 Part 2: 구간 증분 지름길 대결 최소 단축량(500ms) 및 최소 단축률(8%).
+pub const MIN_SHORTCUT_SAVED_MS: u32 = 500;
+pub const MIN_SHORTCUT_MARGIN: f32 = 0.08;
+
+/// 지름길 분기 유형: 대안 경유(`AltBranch`) vs 중간 스텝 생략 직행(`DirectBypass`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutKind {
+    AltBranch,
+    DirectBypass,
+}
+
+/// 구간 증분 시간 대결(Window-Local Split Duel) 결과 (Phase 4 Part 2 + Phase 7 Part 4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShortcutWinV2 {
+    pub kind: ShortcutKind,
+    pub fork_anchor_id: String,
+    pub merge_anchor_id: String,
+    pub skipped: StepRef,
+    pub skipped_id: String,
+    pub taken: StepRef,
+    pub taken_id: String,
+    pub saved_ms: u32,
+    pub margin: f32,
+    pub window_run_ms: u32,
+    pub window_ghost_ms: u32,
+}
+
+/// LCS 공통 앵커 창 `[a → b]` 내부의 순수 구간 소요 시간만 비교하는 `shortcut_wins 2.0`.
+///
+/// * 1차 분기에서 시간을 잃고 2차 분기에서 만회한 런의 무임승차를 차단하고, 초반 실수가 있어도 후반 진성 지름길을 구제한다.
+/// * 깔끔한 화면(`run.kind == None`)에서도 비함정(`kind != Discount`)·창 내부 무병목이면 정상 포착한다.
+/// * `user_pace_ratio` (`ρ_u >= 1.0`)로 보조기기 사용자의 구간 소요 시간을 개인 정규화해 동등한 지름길 승리를 인정한다.
+pub fn shortcut_wins_v2(run: &Run, ghost: &PublicCourse, fault_steps_mask: u16, user_pace_ratio: f64) -> Vec<ShortcutWinV2> {
+    let refs = run.refs();
+    if refs.len() < 2
+        || ghost.steps.len() < 2
+        || ghost.average.len() != ghost.steps.len()
+        || run.kind == Some(MarkType::Discount)
+        || refs.first() != ghost.steps.first()
+        || refs.last() != ghost.steps.last()
+    {
+        return Vec::new();
+    }
+    let pace_ratio = if user_pace_ratio.is_finite() && user_pace_ratio >= 1.0 {
+        user_pace_ratio
+    } else {
+        1.0
+    };
+    let mut out = Vec::new();
+    for w in common_steps(&refs, &ghost.steps).windows(2) {
+        let ((i0, j0), (i1, j1)) = (w[0], w[1]);
+        if j1 <= j0 + 1 {
+            continue;
+        }
+        let skipped = &ghost.steps[j0 + 1];
+        if refs.contains(skipped) {
+            continue;
+        }
+        // 창 내부 런 스텝에 국소 마찰 병목이 있으면 기각 (Clean-Segment Gate).
+        let window_faulted = (i0..=i1).any(|idx| idx < 16 && (fault_steps_mask & (1u16 << idx)) != 0);
+        if window_faulted {
+            continue;
+        }
+        let raw_run_dt = run.steps[i1].split_ms.saturating_sub(run.steps[i0].split_ms);
+        let norm_run_dt = (raw_run_dt as f64 / pace_ratio).round() as u32;
+        let ghost_dt = ghost.average[j1].saturating_sub(ghost.average[j0]);
+        if ghost_dt == 0 || norm_run_dt >= ghost_dt {
+            continue;
+        }
+        let saved_ms = ghost_dt - norm_run_dt;
+        let margin = saved_ms as f32 / ghost_dt as f32;
+        if saved_ms < MIN_SHORTCUT_SAVED_MS || margin < MIN_SHORTCUT_MARGIN {
+            continue;
+        }
+        let kind = if i1 > i0 + 1 { ShortcutKind::AltBranch } else { ShortcutKind::DirectBypass };
+        let taken = refs[i0 + 1].clone();
+        out.push(ShortcutWinV2 {
+            kind,
+            fork_anchor_id: ghost.steps[j0].id().unwrap_or_default(),
+            merge_anchor_id: ghost.steps[j1].id().unwrap_or_default(),
+            skipped: skipped.clone(),
+            skipped_id: skipped.id().unwrap_or_default(),
+            taken_id: taken.id().unwrap_or_default(),
+            taken,
+            saved_ms,
+            margin,
+            window_run_ms: norm_run_dt,
+            window_ghost_ms: ghost_dt,
+        });
+    }
+    out
+}
+
+/// Phase 4 Part 3: 미완주·중도 이탈/사망 에피소드의 생존자 편향을 깨뜨리는 단일 말단 함정 보고(전체 동선 무유출).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadEndMark {
+    pub app: String,
+    pub checkpoint_id: String,
+    pub recipe: String,
+    pub day: i64,
+}
+
+/// 3대 비함정 이탈 면책 게이트(Universal Abandon Exemption) 입력.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AbandonContext {
+    /// 같은 브라우저/작업 세션의 인접 탭·창이 10분 내 목표 전환 완료 (비교 탐색 면책)
+    pub sibling_converted_within_10m: bool,
+    /// 광클·재시도·에러 없이 단순 조회 후 이탈 (탐색 면책)
+    pub clean_exploratory: bool,
+    /// 패배 직후 자책 발화 방패 활성
+    pub defeat_shielded: bool,
+    /// Alt-Tab 비활성/장기 유휴 자연 종료
+    pub afk_unfocused: bool,
+    /// 말단 체크포인트의 마찰 z 점수 (고확신 병목 하한 1.5)
+    pub friction_z: f64,
+    /// 인게임 즉사/패배(`vision.game_defeat`) 발생
+    pub game_defeat: bool,
+}
+
+pub const DEAD_END_MIN_FRICTION_Z: f64 = 1.5;
+
+/// 비면책 고확신 중단·패배 에피소드에서 원인 체크포인트 단 1개의 [`DeadEndMark`] 를 추출한다.
+pub fn dead_end_mark_if_eligible(app: &str, checkpoint_id: &str, day: i64, ctx: &AbandonContext) -> Option<DeadEndMark> {
+    if ctx.sibling_converted_within_10m || ctx.clean_exploratory || ctx.defeat_shielded || ctx.afk_unfocused {
+        return None;
+    }
+    if !ctx.game_defeat && (!ctx.friction_z.is_finite() || ctx.friction_z < DEAD_END_MIN_FRICTION_Z) {
+        return None;
+    }
+    let app = address(app)?;
+    let cp = address(checkpoint_id)?;
+    Some(DeadEndMark {
+        app,
+        checkpoint_id: cp,
+        recipe: RECIPE_V2.to_string(),
+        day,
+    })
 }
 
 /// 지름길 대결 한 판 ([`shortcut_wins`]): 고스트가 간 체크포인트(`skipped`)를 지나지 않고 다른 체크포인트(`taken`)로 가서 고스트의
@@ -875,13 +1328,43 @@ pub struct Collection {
     pub clock: u64,
 }
 
+/// Pinned-SLRU 수동 핀 고정 최대 슬롯 수 (Phase 5 Part 2)
+pub const SLRU_MAX_PINNED: usize = 3;
+/// Pinned-SLRU 숙련 보호 세그먼트 진입 최소 주행 수
+pub const SLRU_PROTECTED_MIN_RUNS: u32 = 3;
+
 impl Collection {
     pub fn courses(&self, app: &str) -> &[CourseEntry] {
         self.apps.get(app).map_or(&[], |v| v.as_slice())
     }
 
-    /// 런을 넣는다. 같은 코스면 횟수 · 결정 수 · 최고 · 마지막 기록을 고치고, 새 코스가 넘치면 가장 오래 달리지 않은 코스를 덮어쓴다
+    /// 코스를 수동 핀(`[▲]`)으로 고정하거나 해제한다 (앱당 최대 [`SLRU_MAX_PINNED`] 개).
+    pub fn pin_course(&mut self, app: &str, course: &str, pinned: bool) -> bool {
+        let Some(courses) = self.apps.get_mut(app) else {
+            return false;
+        };
+        if pinned {
+            let currently_pinned = courses.iter().filter(|e| e.pinned && e.course != course).count();
+            if currently_pinned >= SLRU_MAX_PINNED {
+                return false;
+            }
+        }
+        let Some(entry) = courses.iter_mut().find(|e| e.course == course) else {
+            return false;
+        };
+        entry.pinned = pinned;
+        true
+    }
+
+    /// 런을 넣는다. 같은 코스면 횟수 · 결정 수 · 최고 · 마지막 기록을 고치고, 새 코스가 넘치면
+    /// 2-세그먼트 Pinned-SLRU 규칙으로 일회성 Probation 코스 중 가장 오래된 것을 우선 퇴출한다.
     pub fn add(&mut self, run: &Run) -> Added {
+        self.add_with_cap(run, MAX_COURSES)
+    }
+
+    /// 보관 상한(`max_courses`, 예: 서버 10 · raon-zena 로컬 존 금고 64)을 지정해 Pinned-SLRU 로 런을 추가한다.
+    pub fn add_with_cap(&mut self, run: &Run, max_courses: usize) -> Added {
+        let cap = max_courses.max(1);
         self.clock += 1;
         let clock = self.clock;
         let courses = self.apps.entry(run.app.clone()).or_default();
@@ -914,14 +1397,39 @@ impl Collection {
             last: splits,
             last_day: run.day,
             touched: clock,
+            pinned: false,
         };
-        if courses.len() < MAX_COURSES {
+        if courses.len() < cap {
             courses.push(entry);
             return Added::New;
         }
-        let oldest = courses.iter().enumerate().min_by_key(|(_, e)| e.touched).map_or(0, |(i, _)| i);
+        // Pinned-SLRU 퇴출 순서:
+        // 1. Tier 0 Probation (미고정 & runs < 3) 중 touched 최소
+        // 2. 모두 보호(runs >= 3)면 미고정 Tier 1 Protected 중 retention = 2*ln(runs) - idle_days/14 최소
+        // 3. 최후 폴백: 전체 touched 최소
+        let probation_victim = courses
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.pinned && e.runs < SLRU_PROTECTED_MIN_RUNS)
+            .min_by_key(|(_, e)| e.touched)
+            .map(|(i, _)| i);
+        let victim = probation_victim.unwrap_or_else(|| {
+            courses
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.pinned)
+                .min_by(|(_, a), (_, b)| {
+                    let retention = |e: &CourseEntry| {
+                        let idle_days = (run.day - e.last_day).max(0) as f64;
+                        2.0 * (e.runs.max(1) as f64).ln() - idle_days / 14.0
+                    };
+                    retention(a).total_cmp(&retention(b)).then(a.touched.cmp(&b.touched))
+                })
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| courses.iter().enumerate().min_by_key(|(_, e)| e.touched).map_or(0, |(i, _)| i))
+        });
         Added::Replaced {
-            evicted: std::mem::replace(&mut courses[oldest], entry).course,
+            evicted: std::mem::replace(&mut courses[victim], entry).course,
         }
     }
 
@@ -1362,6 +1870,8 @@ mod tests {
             record: vec![0, 800, 1500],
             average: vec![0, 1400, 3500],
             checkpoints: vec![CheckpointTally::default(), CheckpointTally { premium: 1, discount: 3 }, CheckpointTally::default()],
+            verdict: None,
+            interaction_traits: 0,
         }];
 
         // 출발만 했을 때: 다음은 영역 R2, 차이는 0
@@ -1396,6 +1906,7 @@ mod tests {
 
     // 공개 코스 하나 (체크포인트 판정 수는 비워 둔다)
     fn public(steps: Vec<StepRef>, runs: u32, premium: u32, discount: u32, record: Vec<u32>, average: Vec<u32>) -> PublicCourse {
+        let interaction_traits = compute_interaction_traits(&steps, &average, false, discount, runs);
         PublicCourse {
             course: course_hash(APP, &steps).unwrap(),
             checkpoints: vec![CheckpointTally::default(); steps.len()],
@@ -1405,6 +1916,8 @@ mod tests {
             discount,
             record,
             average,
+            verdict: None,
+            interaction_traits,
         }
     }
 
@@ -1745,6 +2258,7 @@ mod tests {
                 last: vec![0, 15_000, 31_000],
                 last_day: DAY,
                 touched: 1,
+                pinned: false,
             }],
         );
         let mine = c.courses(APP)[0].course.clone();
@@ -1995,5 +2509,247 @@ mod tests {
         assert!(shortcut_wins(&run(&[&s0, &g2, &goal], 24_000, Some(MarkType::Premium)), &ghost).is_empty());
         assert!(shortcut_wins(&run(&[&s0, &g2, &g1], 12_000, Some(MarkType::Premium)), &ghost).is_empty());
         assert!(shortcut_wins(&run(&[&s0, &g2, &g1, &goal], 12_000, Some(MarkType::Premium)), &ghost).is_empty());
+    }
+
+    #[test]
+    fn cn245_route_marks_v2_blocks_slow_lost_wanderer_and_broken_step_whitewashing() {
+        let s0 = step(StepKind::Screen, &hash_n(0xd0));
+        let a = step(StepKind::Region, &hash_n(0xd1));
+        let b = StepRef { kind: StepKind::Element, hash: hash_n(0xd2), gesture: Some(Gesture::SwipeLeft) };
+        let alt = step(StepKind::Region, &hash_n(0xd3));
+        let x1 = step(StepKind::Region, &hash_n(0xd4));
+        let x2 = step(StepKind::Region, &hash_n(0xd5));
+        let finish = step(StepKind::Screen, &hash_n(0xdf));
+        let ghost = vec![s0.clone(), a.clone(), b.clone(), finish.clone()];
+        let g_splits = [0u32, 5_000, 10_000, 15_000];
+
+        // ③ 길 잃은 둔속 고마찰 우회(45s, discount): 본선 A, B 모두 Abstain(0) 보호!
+        let slow_ctx = RouteEvalContext {
+            run_total_ms: 45_000,
+            run_kind: Some(MarkType::Discount),
+            ghost_avg_ms: 15_000,
+            ghost_splits: &g_splits,
+            ..Default::default()
+        };
+        let slow_res = route_marks_v2(&[s0.clone(), x1, x2, finish.clone()], &ghost, &slow_ctx).unwrap();
+        assert_eq!(slow_res, vec![(a.clone(), MarkOutcome::Abstain), (b.clone(), MarkOutcome::Abstain)]);
+
+        // ② 고속 지름길 우회(11s, premium): 통과한 A는 Premium(+1), 건너뛴 B는 Discount(-1)!
+        let fast_ctx = RouteEvalContext {
+            run_total_ms: 11_000,
+            run_kind: Some(MarkType::Premium),
+            ghost_avg_ms: 15_000,
+            ghost_splits: &g_splits,
+            ..Default::default()
+        };
+        let fast_res = route_marks_v2(&[s0.clone(), a.clone(), alt, finish.clone()], &ghost, &fast_ctx).unwrap();
+        assert_eq!(fast_res, vec![(a.clone(), MarkOutcome::Premium), (b.clone(), MarkOutcome::Discount)]);
+
+        // ⑤ 국소 병목 억지 돌파(A 순항 bit=0, B 병목 bit 2 켜짐, 전체 discount): A만 +1 보호, B는 Abstain!
+        let fault_ctx = RouteEvalContext {
+            run_total_ms: 32_000,
+            run_kind: Some(MarkType::Discount),
+            ghost_avg_ms: 15_000,
+            ghost_splits: &g_splits,
+            fault_steps_mask: 1u16 << 2,
+            ..Default::default()
+        };
+        let fault_res = route_marks_v2(&[s0, a.clone(), b.clone(), finish], &ghost, &fault_ctx).unwrap();
+        assert_eq!(fault_res, vec![(a, MarkOutcome::Premium), (b, MarkOutcome::Abstain)]);
+    }
+
+    #[test]
+    fn cn247_route_marks_v2_protects_cross_modality_equivalent_pass() {
+        let s0 = step(StepKind::Page, &hash_n(0xe0));
+        let a = step(StepKind::Element, &hash_n(0xe1));
+        let b_swipe = StepRef { kind: StepKind::Element, hash: hash_n(0xe2), gesture: Some(Gesture::SwipeLeft) };
+        let b_click = StepRef { kind: StepKind::Element, hash: hash_n(0xe2), gesture: None };
+        let finish = step(StepKind::Page, &hash_n(0xef));
+        let ghost = vec![s0.clone(), a.clone(), b_swipe.clone(), finish.clone()];
+        let ctx = RouteEvalContext {
+            run_total_ms: 13_800,
+            run_kind: Some(MarkType::Premium),
+            ghost_avg_ms: 15_000,
+            ..Default::default()
+        };
+        let res = route_marks_v2(&[s0, a.clone(), b_click, finish], &ghost, &ctx).unwrap();
+        assert_eq!(res, vec![(a, MarkOutcome::Premium), (b_swipe, MarkOutcome::EquivalentPass)]);
+        assert_eq!(res[1].1.sign(), None, "no cross-modality discount");
+    }
+
+    #[test]
+    fn cn249_shortcut_wins_v2_window_local_splits_block_free_rider_and_rescue_late_shortcut() {
+        let s0 = step(StepKind::Screen, &hash_n(0xf0));
+        let g1 = step(StepKind::Region, &hash_n(0xf1));
+        let mid = step(StepKind::Screen, &hash_n(0xf2));
+        let g2 = step(StepKind::Region, &hash_n(0xf3));
+        let goal = step(StepKind::Screen, &hash_n(0xff));
+        let alt1 = step(StepKind::Region, &hash_n(0xf4));
+        let alt2 = step(StepKind::Region, &hash_n(0xf5));
+        // Ghost: S0(0s) -> G1(5s) -> Mid(10s) -> G2(20s) -> Goal(30s)
+        let ghost = public(
+            vec![s0.clone(), g1.clone(), mid.clone(), g2.clone(), goal.clone()],
+            20,
+            15,
+            1,
+            vec![0, 4_000, 9_000, 18_000, 27_000],
+            vec![0, 5_000, 10_000, 20_000, 30_000],
+        );
+        // Case A (Free-rider check): Window 1 via alt1 LOSES +3s (13s vs 10s), Window 2 via alt2 SAVES -10s (10s vs 20s); total 23s (-7s), kind=None (clean UI!).
+        let run_a = Run::from_checkpoints(
+            APP,
+            &[pass(0, &s0), pass(6_000, &alt1), pass(13_000, &mid), pass(18_000, &alt2), pass(23_000, &goal)],
+            None,
+        )
+        .unwrap();
+        let wins_a = shortcut_wins_v2(&run_a, &ghost, 0, 1.0);
+        assert_eq!(wins_a.len(), 1, "free-rider alt1 must be rejected, only alt2 wins");
+        assert_eq!(wins_a[0].taken, alt2);
+        assert_eq!(wins_a[0].skipped, g2);
+        assert_eq!(wins_a[0].saved_ms, 10_000);
+        assert_eq!(wins_a[0].kind, ShortcutKind::AltBranch);
+        assert_eq!(wins_a[0].taken_id, alt2.id().unwrap());
+
+        // Case B (Sunk-delay rescue): Window 1 is +8s slower (18s vs 10s), Window 2 saves -6s (14s vs 20s); total 32s (> 30s ghost avg!).
+        let run_b = Run::from_checkpoints(
+            APP,
+            &[pass(0, &s0), pass(10_000, &g1), pass(18_000, &mid), pass(25_000, &alt2), pass(32_000, &goal)],
+            None,
+        )
+        .unwrap();
+        let wins_b = shortcut_wins_v2(&run_b, &ghost, 0, 1.0);
+        assert_eq!(wins_b.len(), 1, "late-stage genuine shortcut must be rescued despite early delay");
+        assert_eq!(wins_b[0].taken, alt2);
+        assert_eq!(wins_b[0].saved_ms, 6_000);
+
+        // Case C (DirectBypass): skipping G2 straight from Mid -> Goal separates DirectBypass from AltBranch.
+        let run_c = Run::from_checkpoints(
+            APP,
+            &[pass(0, &s0), pass(5_000, &g1), pass(10_000, &mid), pass(22_000, &goal)],
+            None,
+        )
+        .unwrap();
+        let wins_c = shortcut_wins_v2(&run_c, &ghost, 0, 1.0);
+        assert_eq!(wins_c.len(), 1);
+        assert_eq!(wins_c[0].kind, ShortcutKind::DirectBypass);
+        assert_eq!(wins_c[0].saved_ms, 8_000);
+    }
+
+    #[test]
+    fn cn259_ghost_utility_v3_ranks_grade_and_rank_and_demotes_superseded() {
+        let s0 = step(StepKind::Screen, &hash_n(0x90));
+        let a = step(StepKind::Region, &hash_n(0x91));
+        let b = step(StepKind::Region, &hash_n(0x92));
+        let goal = step(StepKind::Screen, &hash_n(0x9f));
+
+        let mut strong = public(vec![s0.clone(), a.clone(), goal.clone()], 15, 13, 1, vec![0, 4_000, 10_000], vec![0, 5_000, 12_000]);
+        strong.verdict = Some(VerdictSummary {
+            tier: Tier::Premium,
+            grade: Some(2),
+            rank: Some(0.92),
+            evidence: 5.5,
+            reasons: vec!["rank".into()],
+            recipe: RECIPE_V2.into(),
+        });
+
+        let mut held = public(vec![s0.clone(), b.clone(), goal.clone()], 15, 13, 1, vec![0, 4_000, 10_000], vec![0, 5_000, 12_000]);
+        held.verdict = Some(VerdictSummary {
+            tier: Tier::Premium,
+            grade: Some(1),
+            rank: Some(0.32),
+            evidence: 4.0,
+            reasons: vec!["held".into()],
+            recipe: RECIPE_V2.into(),
+        });
+
+        let mut old_route = public(vec![s0.clone(), a.clone(), b.clone(), goal.clone()], 40, 30, 5, vec![0, 4_000, 12_000, 20_000], vec![0, 5_000, 14_000, 22_000]);
+        assert!(is_course_superseded(&old_route, &strong, 0, 0, false), "strict subset shortcut supersedes old route");
+        old_route.verdict = Some(VerdictSummary {
+            tier: Tier::Discount,
+            grade: Some(-2),
+            rank: Some(-0.8),
+            evidence: 8.0,
+            reasons: vec!["superseded".into()],
+            recipe: RECIPE_V2.into(),
+        });
+
+        assert!(ghost_utility_v3(&strong) > ghost_utility_v3(&held));
+        assert!(ghost_utility_v3(&old_route) < -300.0);
+    }
+
+    #[test]
+    fn cn263_pinned_slru_protects_practiced_and_pinned_courses_from_one_shot_exploration() {
+        let mut c = Collection::default();
+        let make_run = |id: u8, day: i64| {
+            let s0 = step(StepKind::Screen, &hash_n(0x60));
+            let mid = step(StepKind::Region, &hash_n(usize::from(id)));
+            let end = step(StepKind::Screen, &hash_n(0x6f));
+            Run::from_checkpoints(APP, &[pass(day * DAY_MS, &s0), pass(day * DAY_MS + 2_000, &mid), pass(day * DAY_MS + 5_000, &end)], Some(MarkType::Premium)).unwrap()
+        };
+        // 5 practiced core courses (10 runs each).
+        let mut core_ids = Vec::new();
+        for k in 1..=5u8 {
+            let r = make_run(k, 10);
+            core_ids.push(r.course.clone());
+            for _ in 0..10 {
+                c.add(&r);
+            }
+        }
+        // Pin one 1-run course as well.
+        let pinned_run = make_run(99, 10);
+        c.add(&pinned_run);
+        assert!(c.pin_course(APP, &pinned_run.course, true));
+
+        // Now add 10 brand-new one-shot exploratory courses (1 run each).
+        for k in 20..30u8 {
+            c.add(&make_run(k, 11));
+        }
+        assert_eq!(c.courses(APP).len(), MAX_COURSES);
+        for cid in &core_ids {
+            assert!(c.courses(APP).iter().any(|e| &e.course == cid), "practiced core course {cid} must never be evicted");
+        }
+        assert!(c.courses(APP).iter().any(|e| e.course == pinned_run.course && e.pinned), "pinned course must never be evicted");
+    }
+
+    #[test]
+    fn ac03_personal_pace_normalized_shortcut_win_and_accessible_trait_routing() {
+        let s0 = step(StepKind::Screen, &hash_n(0xa0));
+        let g1 = StepRef { kind: StepKind::Element, hash: hash_n(0xa1), gesture: Some(Gesture::SwipeLeft) };
+        let alt = step(StepKind::Element, &hash_n(0xa2));
+        let goal = step(StepKind::Screen, &hash_n(0xaf));
+
+        let ghost = public(
+            vec![s0.clone(), g1.clone(), goal.clone()],
+            30,
+            20,
+            2,
+            vec![0, 7_000, 14_000],
+            vec![0, 8_000, 15_000],
+        );
+        // Switch user has personal pace ratio ρ_u = 3.0.
+        let mut pace = PersonalPaceProfile::default();
+        pace.observe_segment(24_000, 8_000);
+        pace.observe_segment(21_000, 7_000);
+        pace.observe_segment(30_000, 10_000);
+        assert!((pace.ratio() - 3.0).abs() < 1e-6);
+
+        // User completes clean accessible bypass in 33s (> 15s raw, but 33/3 = 11s < 15s normalized -> 26.7% speedup!).
+        let run = Run::from_checkpoints(APP, &[pass(0, &s0), pass(15_000, &alt), pass(33_000, &goal)], None).unwrap();
+        let wins = shortcut_wins_v2(&run, &ghost, 0, pace.ratio());
+        assert_eq!(wins.len(), 1);
+        assert_eq!(wins[0].taken, alt);
+        assert_eq!(wins[0].saved_ms, 4_000);
+        assert!((wins[0].margin - (4.0 / 15.0)).abs() < 0.01);
+
+        // Accessible routing boosts NO_FINE_GESTURE + TREE_ACCESSIBLE course over swipe-based ghost.
+        let accessible_course = public(vec![s0, alt, goal], 15, 12, 1, vec![0, 8_000, 16_000], vec![0, 9_000, 17_000]);
+        assert_eq!(ghost.interaction_traits & TRAIT_NO_FINE_GESTURE, 0);
+        assert_ne!(accessible_course.interaction_traits & TRAIT_NO_FINE_GESTURE, 0);
+        let prefs = AccessibilityRoutePrefs {
+            require_tree_accessible: true,
+            prefer_no_fine_gesture: true,
+            prefer_calm: true,
+        };
+        assert!(contextual_ghost_utility(&accessible_course, &prefs) > contextual_ghost_utility(&ghost, &prefs));
     }
 }

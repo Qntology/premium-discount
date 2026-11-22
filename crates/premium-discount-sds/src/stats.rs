@@ -97,6 +97,34 @@ impl Welford {
         }
         (self.recent_mean() - self.mean) / sd
     }
+
+    /// Adaptive half-life compressed by recent drift (`|drift_z| > 1.5`).
+    pub fn adaptive_half_life_ms(&self, base_half_life_ms: f64) -> f64 {
+        adaptive_half_life_ms(base_half_life_ms, self.drift_z(), DRIFT_HALF_LIFE_GAMMA, DRIFT_MIN_HALF_LIFE_MS)
+    }
+}
+
+/// Drift z threshold above which half-life compression engages (Phase 5 Part 1).
+pub const DRIFT_HALF_LIFE_TRIGGER_Z: f64 = 1.5;
+/// Sensitivity multiplier γ for adaptive drift half-life compression.
+pub const DRIFT_HALF_LIFE_GAMMA: f64 = 1.2;
+/// Floor half-life (2 days in ms) so sudden spikes never collapse decay to zero.
+pub const DRIFT_MIN_HALF_LIFE_MS: f64 = 2.0 * 86_400_000.0;
+
+/// Compresses `base_half_life_ms` when `|drift_z|` exceeds [`DRIFT_HALF_LIFE_TRIGGER_Z`]:
+/// `H_eff = max(min_half_life_ms, H_0 / (1 + gamma * max(0, |drift_z| - 1.5)))`.
+pub fn adaptive_half_life_ms(base_half_life_ms: f64, drift_z: f64, gamma: f64, min_half_life_ms: f64) -> f64 {
+    if !base_half_life_ms.is_finite() || base_half_life_ms <= 0.0 {
+        return min_half_life_ms.max(1.0);
+    }
+    let excess = if drift_z.is_finite() { (drift_z.abs() - DRIFT_HALF_LIFE_TRIGGER_Z).max(0.0) } else { 0.0 };
+    let denom = 1.0 + gamma.max(0.0) * excess;
+    let floor = if min_half_life_ms.is_finite() && min_half_life_ms > 0.0 {
+        min_half_life_ms.min(base_half_life_ms)
+    } else {
+        1.0
+    };
+    (base_half_life_ms / denom).max(floor)
 }
 
 /// Shape of one ranked score list: decisive (one clear winner) or flat.
@@ -575,5 +603,30 @@ pub(crate) mod tests {
             !tie_verdict(Some((true, 0.8)), Some(0.4), Some(0.2)),
             "rejected 0.2 more often than the rival"
         );
+    }
+
+    #[test]
+    fn adaptive_half_life_compresses_under_patch_drift_and_respects_floor() {
+        let h0 = 14.0 * 86_400_000.0;
+        // Normal operation: |drift_z| <= 1.5 keeps exact base half-life.
+        assert_eq!(adaptive_half_life_ms(h0, 0.0, DRIFT_HALF_LIFE_GAMMA, DRIFT_MIN_HALF_LIFE_MS), h0);
+        assert_eq!(adaptive_half_life_ms(h0, 1.5, DRIFT_HALF_LIFE_GAMMA, DRIFT_MIN_HALF_LIFE_MS), h0);
+        // Patch drift z = +3.0 => 14 / (1 + 1.2 * 1.5) = 14 / 2.8 = 5.0 days.
+        let h_patch = adaptive_half_life_ms(h0, 3.0, DRIFT_HALF_LIFE_GAMMA, DRIFT_MIN_HALF_LIFE_MS);
+        assert!((h_patch - 5.0 * 86_400_000.0).abs() < 1.0, "got {h_patch}");
+        // Extreme drift clamps to 2-day floor.
+        let h_extreme = adaptive_half_life_ms(h0, 20.0, DRIFT_HALF_LIFE_GAMMA, DRIFT_MIN_HALF_LIFE_MS);
+        assert_eq!(h_extreme, DRIFT_MIN_HALF_LIFE_MS);
+        // Welford wrapper reacts to sudden shift in the recent ring.
+        let mut w = Welford::default();
+        for _ in 0..20 {
+            w.push(1.0, 4);
+        }
+        w.push(1.1, 4);
+        for _ in 0..4 {
+            w.push(6.0, 4);
+        }
+        assert!(w.drift_z() > 1.5);
+        assert!(w.adaptive_half_life_ms(h0) < h0);
     }
 }

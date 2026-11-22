@@ -30,6 +30,7 @@ pub mod graph;
 pub mod handler;
 pub mod legacy;
 pub mod navtrials;
+pub mod navtrials_v2;
 pub mod projection;
 pub mod ratelimit;
 pub mod render;

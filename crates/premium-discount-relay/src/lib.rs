@@ -1158,6 +1158,181 @@ pub fn curate_cross_scope(entries: &[Entry<'_>], embedder: &dyn TextEmbedder, cf
     report
 }
 
+/// Phase 6 Part 1: 비문장 물리 체크포인트(화면 구조·비전 도메인·배지 라벨·탭 제목·활성 토픽)의 메타데이터.
+#[derive(Debug, Clone, Default)]
+pub struct CheckpointMeta<'a> {
+    pub vision_tag: Option<&'a str>,
+    pub screen_label: Option<&'a str>,
+    pub badge_labels: &'a [&'a str],
+    pub tab_title: Option<&'a str>,
+    pub active_topics: &'a [&'a str],
+    /// 민감 화면이거나 시크릿 탭이면 키 추출을 0건으로 차단한다.
+    pub sensitive_or_incognito: bool,
+}
+
+/// Phase 6 Part 1: 문장이 없는 UIA·비전 체크포인트에서 비민감 RelayKey 를 승격 추출한다 (`CheckpointRelayExtractor`).
+pub fn lift_checkpoint_relay_keys(meta: &CheckpointMeta<'_>) -> Vec<RelayKey> {
+    if meta.sensitive_or_incognito {
+        return Vec::new();
+    }
+    let mut out: BTreeSet<RelayKey> = BTreeSet::new();
+    let mut ingest = |raw: &str, default_kind: KeyKind| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        for q in quoted_spans(trimmed) {
+            out.insert(RelayKey { key: q, kind: KeyKind::Quoted });
+        }
+        for tok in trimmed.split(|c: char| c.is_whitespace() || matches!(c, '|' | '/' | '-' | '·' | ',' | '(' | ')' | '[' | ']')) {
+            let clean = tok.trim_matches(|c: char| matches!(c, '.' | '!' | '?' | '"' | '\'' | ':' | ';'));
+            if clean.chars().count() < 2 {
+                continue;
+            }
+            if clean.starts_with("0x") && clean.len() >= 10 {
+                continue; // 원시 해시는 RelayKey 로 올리지 않는다
+            }
+            let kind = if is_identifier(clean) {
+                KeyKind::Identifier
+            } else if clean.contains("::") || clean.contains('_') {
+                KeyKind::Symbol
+            } else {
+                default_kind
+            };
+            out.insert(RelayKey { key: lower(clean), kind });
+        }
+    };
+    if let Some(tag) = meta.vision_tag {
+        ingest(tag, KeyKind::Symbol);
+    }
+    if let Some(lbl) = meta.screen_label {
+        ingest(lbl, KeyKind::Proper);
+    }
+    for &b in meta.badge_labels {
+        ingest(b, KeyKind::Proper);
+    }
+    if let Some(t) = meta.tab_title {
+        ingest(t, KeyKind::Proper);
+    }
+    for &topic in meta.active_topics {
+        ingest(topic, KeyKind::Proper);
+    }
+    out.into_iter().collect()
+}
+
+/// Phase 6 Part 1: 영점 붕괴 없는 가산-보정 메타 전이 점수 `S_meta(a -> b)` 와 공유 대표 키 목록.
+///
+/// * 정규화 대표 키 교집합 `K*(a) ∩ K*(b)` 이 비어 있으면(무관한 앱 전환, CR-02) 즉시 `(0.0, [])` 를 반환해 PLINKO 절벽을 유지한다.
+/// * 공유 키가 있으면 `π_trans * (0.65 * J_canon + 0.35 * max(0, cos(v_a, v_b)))` 로 궤적 연속성을 산출한다.
+pub fn meta_transition_score(
+    keys_a: &[RelayKey],
+    keys_b: &[RelayKey],
+    vec_a: &[f32],
+    vec_b: &[f32],
+    clusters: &KeyClusters,
+    transition_prior: f32,
+) -> (f32, Vec<String>) {
+    let set_a: BTreeSet<String> = keys_a.iter().map(|k| clusters.canon(&k.key)).collect();
+    let set_b: BTreeSet<String> = keys_b.iter().map(|k| clusters.canon(&k.key)).collect();
+    let shared: Vec<String> = set_a.intersection(&set_b).cloned().collect();
+    if shared.is_empty() {
+        return (0.0, Vec::new());
+    }
+    let union_len = set_a.union(&set_b).count().max(1);
+    let jaccard = shared.len() as f32 / union_len as f32;
+    let cos = if !vec_a.is_empty() && vec_a.len() == vec_b.len() {
+        cosine(vec_a, vec_b).max(0.0)
+    } else {
+        0.0
+    };
+    let pi = if transition_prior.is_finite() && transition_prior > 0.0 {
+        transition_prior.clamp(0.85, 1.25)
+    } else {
+        1.0
+    };
+    (pi * (0.65 * jaccard + 0.35 * cos), shared)
+}
+
+/// 서로 다른 `cc`(앱 · 웹) 엔트리 사이의 로컬 Relay Key 브리지 간선 (Phase 6 Part 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelayFederationLink {
+    pub a_id: String,
+    pub a_cc: String,
+    pub b_id: String,
+    pub b_cc: String,
+    pub shared_keys: Vec<String>,
+    pub relation: Relation,
+}
+
+/// Phase 6 Part 1: 서로 다른 `cc`(예: `eldenring.exe` ↔ `fextralife.com`) 기록끼리도 다국어 `cluster_keys` 로
+/// 공유 대표 키를 찾아 로컬 브리지 간선 및 로컬 격리 후보를 산출한다.
+///
+/// 서버 `POST /evaluations/supersedes` 는 반드시 같은 `(cc, to)` 여야 하므로 이 함수가 낸 교차 `cc` 대체 후보는
+/// 호출 측에서 [`supersede_sync`] (`same_scope = false` -> `LocalOnly(CrossScope)`)를 거쳐 서버 호출 0건을 보장한다.
+pub fn curate_relay_federation(
+    entries: &[Entry<'_>],
+    embedder: &dyn TextEmbedder,
+    cfg: &RelayConfig,
+) -> (Vec<RelayFederationLink>, Vec<CrossScopeSupersession>) {
+    if entries.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut ordered: Vec<&Entry<'_>> = entries.iter().collect();
+    ordered.sort_by(|a, b| a.record.at_ms.cmp(&b.record.at_ms).then_with(|| a.id.cmp(b.id)));
+    let all_keys: Vec<RelayKey> = ordered.iter().flat_map(|e| e.record.sentences.iter().flat_map(relay_keys)).collect();
+    let keys = cluster_keys(&all_keys, embedder, cfg);
+    let core_terms: Vec<RelayKey> = ordered
+        .iter()
+        .flat_map(|e| e.record.sentences.iter().flat_map(|s| claim(s).core))
+        .map(|key| RelayKey { key, kind: KeyKind::Compound })
+        .collect();
+    let cores = cluster_keys(&core_terms, embedder, cfg);
+    let topics: Vec<BTreeSet<String>> = ordered.iter().map(|e| topic_set(e.record, &keys)).collect();
+    let texts: Vec<&str> = ordered.iter().flat_map(|e| e.record.sentences.iter().map(|s| s.text.as_str())).collect();
+    let mut vecs = embedder.embed_batch(&texts).into_iter();
+    let per: Vec<Vec<Vec<f32>>> = ordered.iter().map(|e| e.record.sentences.iter().map(|_| vecs.next().unwrap_or_default()).collect()).collect();
+    let space = embedder.space().to_string();
+
+    let mut links = Vec::new();
+    let mut local_supersessions = Vec::new();
+    for i in 0..ordered.len() {
+        for j in i + 1..ordered.len() {
+            if ordered[i].cc == ordered[j].cc {
+                continue;
+            }
+            let shared: Vec<String> = topics[i].intersection(&topics[j]).cloned().collect();
+            if shared.is_empty() {
+                continue;
+            }
+            let (old, new) = (ordered[i], ordered[j]);
+            let (relation, _) = compare_vectors(old.record, new.record, &per[i], &per[j], &keys, Some(&cores), &space, cfg);
+            if let Relation::Supersedes { changes, containment } = &relation {
+                local_supersessions.push(CrossScopeSupersession {
+                    cc: old.cc.to_string(),
+                    old_id: old.id.to_string(),
+                    new_id: new.id.to_string(),
+                    old_to: old.to.map(str::to_string),
+                    new_to: None, // 교차 cc: same_scope() == false 보장 → 서버 supersede 오호출 0건!
+                    old_at_ms: old.record.at_ms,
+                    new_at_ms: new.record.at_ms,
+                    changes: changes.clone(),
+                    containment: *containment,
+                    value_diff: value_diff(changes),
+                });
+            }
+            links.push(RelayFederationLink {
+                a_id: old.id.to_string(),
+                a_cc: old.cc.to_string(),
+                b_id: new.id.to_string(),
+                b_cc: new.cc.to_string(),
+                shared_keys: shared,
+                relation,
+            });
+        }
+    }
+    (links, local_supersessions)
+}
+
 /// 서버 보고(pd_supersede) 자격을 가리는 사실들. 부르는 쪽(raon-zena pd_bridge)이 동기화 스냅샷 · 로그인 상태에서 채운다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SupersedeFacts {
@@ -1988,5 +2163,114 @@ mod tests {
         l.record(other);
         assert_eq!(l.len(), 3);
         assert_eq!(QuarantineLedger::from_entries(l.entries().to_vec()).entries(), l.entries());
+    }
+
+    #[test]
+    fn cn269_cross_cc_relay_federation_links_multilingual_names_with_zero_server_supersede() {
+        struct CrossLangEmbedder;
+        impl TextEmbedder for CrossLangEmbedder {
+            fn dim(&self) -> usize {
+                3
+            }
+            fn space(&self) -> &str {
+                "granite-97m-r2-cls-v1"
+            }
+            fn embed(&self, text: &str) -> Vec<f32> {
+                let lower = text.to_lowercase();
+                if lower.contains("말레니아") || lower.contains("malenia") {
+                    vec![0.99, 0.14, 0.0]
+                } else if lower.contains("피해") || lower.contains("damage") {
+                    vec![0.1, 0.99, 0.0]
+                } else {
+                    vec![0.0, 0.0, 1.0]
+                }
+            }
+        }
+        let emb = CrossLangEmbedder;
+        let cfg = RelayConfig::default();
+
+        // Checkpoint lifting (non-sentence UIA/vision metadata) & incognito block.
+        let cp_keys = lift_checkpoint_relay_keys(&CheckpointMeta {
+            vision_tag: Some("boss_arena"),
+            screen_label: Some("말레니아 보스방"),
+            badge_labels: &["안개문"],
+            tab_title: None,
+            active_topics: &["말레니아"],
+            sensitive_or_incognito: false,
+        });
+        assert!(cp_keys.iter().any(|k| k.key == "말레니아"));
+        assert!(lift_checkpoint_relay_keys(&CheckpointMeta {
+            screen_label: Some("말레니아"),
+            sensitive_or_incognito: true,
+            ..Default::default()
+        })
+        .is_empty());
+
+        let game_rec = Record {
+            at_ms: 1_000,
+            sentences: vec![Sentence {
+                text: "말레니아 피해 20% 감소".into(),
+                tokens: vec![
+                    Token { text: "말레니아".into(), lemma: "말레니아".into(), upos: "PROPN".into(), deprel: "nsubj".into(), head: 2 },
+                    Token { text: "피해".into(), lemma: "피해".into(), upos: "NOUN".into(), deprel: "obj".into(), head: 4 },
+                    Token { text: "20%".into(), lemma: "20+%".into(), upos: "NUM".into(), deprel: "nummod".into(), head: 2 },
+                    Token { text: "감소".into(), lemma: "감소".into(), upos: "VERB".into(), deprel: "root".into(), head: 0 },
+                ],
+            }],
+        };
+        let web_rec = Record {
+            at_ms: 2_000,
+            sentences: vec![Sentence {
+                text: "Malenia damage 15% reduced".into(),
+                tokens: vec![
+                    Token { text: "Malenia".into(), lemma: "malenia".into(), upos: "PROPN".into(), deprel: "nsubj".into(), head: 2 },
+                    Token { text: "damage".into(), lemma: "damage".into(), upos: "NOUN".into(), deprel: "obj".into(), head: 4 },
+                    Token { text: "15%".into(), lemma: "15%".into(), upos: "NUM".into(), deprel: "nummod".into(), head: 2 },
+                    Token { text: "reduced".into(), lemma: "reduce".into(), upos: "VERB".into(), deprel: "root".into(), head: 0 },
+                ],
+            }],
+        };
+        let entries = [
+            Entry { id: "game-1", cc: "eldenring.exe", to: Some("0x1111"), record: &game_rec },
+            Entry { id: "web-2", cc: "fextralife.com", to: Some("0x2222"), record: &web_rec },
+        ];
+        let (links, local_sup) = curate_relay_federation(&entries, &emb, &cfg);
+        assert_eq!(links.len(), 1, "eldenring.exe and fextralife.com must connect via malenia");
+        assert!(links[0].shared_keys.contains(&"malenia".to_string()));
+        for s in &local_sup {
+            assert!(!s.same_scope(), "cross-cc supersession must never trigger same-scope server sync");
+            let sync = supersede_sync(
+                s.old_to.as_deref(),
+                s.new_to.as_deref(),
+                &SupersedeFacts {
+                    old_mine: true,
+                    new_mine: true,
+                    signed_in: true,
+                    old_stored: true,
+                    new_stored: true,
+                    sharing_consent: true,
+                },
+            );
+            assert_eq!(sync, SupersedeSync::LocalOnly(LocalOnlyReason::CrossScope));
+        }
+
+        // Meta transition score: shared key yields > 0, unrelated app yields 0.0 (PLINKO cliff preserved!).
+        let web_keys = lift_checkpoint_relay_keys(&CheckpointMeta {
+            tab_title: Some("Malenia Boss Guide - Fextralife"),
+            ..Default::default()
+        });
+        let shop_keys = lift_checkpoint_relay_keys(&CheckpointMeta {
+            tab_title: Some("Steam Summer Sale Discount"),
+            ..Default::default()
+        });
+        let mut all = cp_keys.clone();
+        all.extend(web_keys.clone());
+        all.extend(shop_keys.clone());
+        let cl = cluster_keys(&all, &emb, &cfg);
+        let (s_related, shared) = meta_transition_score(&cp_keys, &web_keys, &emb.embed("말레니아"), &emb.embed("Malenia"), &cl, 1.0);
+        assert!(s_related > 0.3 && shared.contains(&"malenia".to_string()));
+        let (s_unrelated, empty) = meta_transition_score(&cp_keys, &shop_keys, &emb.embed("말레니아"), &emb.embed("Steam"), &cl, 1.0);
+        assert_eq!(s_unrelated, 0.0);
+        assert!(empty.is_empty());
     }
 }

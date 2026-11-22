@@ -302,6 +302,48 @@ impl StickyNumberer {
         (out, sensitive)
     }
 
+    /// 번호가 다 찼을 때 10번 이후 요소를 여는 순환 배지 뱅크 페이징 (Phase 7 Part 1, `#0` 키 / 음성 "다음 번호").
+    ///
+    /// * `bank == 0` 은 [`StickyNumberer::update`] 와 100% 동일하다.
+    /// * `bank >= 1` 은 `cx.locked_numbers` 에 잠긴 발화 번호는 그 자리에 고정 핀으로 보호하고, 남는 번호 칸을
+    ///   `bank` 페이지에 해당하는 10번 이후 후보들에게 배정한다.
+    /// * 셋째 반환값은 총 페이지 수(`total_banks >= 1`)다.
+    pub fn update_bank(&mut self, candidates: Vec<Region>, tiers: &HashMap<String, Tier>, iou: f32, cx: &FrameContext, bank: usize) -> (Vec<Numbered>, bool, usize) {
+        let (mut base, sensitive) = self.update(candidates, tiers, iou, cx);
+        let total = base.len();
+        let total_banks = total.div_ceil(MAX_NUMBERED).max(1);
+        let page = bank % total_banks;
+        if page == 0 || total <= MAX_NUMBERED {
+            return (base, sensitive, total_banks);
+        }
+        // 잠긴 발화 번호는 페이지 전환 시에도 고정 핀으로 지킨다.
+        let mut pinned_slots = [false; MAX_NUMBERED];
+        for item in &mut base {
+            if let Some(n) = item.number {
+                if cx.locked(n) {
+                    pinned_slots[usize::from(n - 1)] = true;
+                } else {
+                    item.number = None;
+                    item.origin = None;
+                }
+            }
+        }
+        let free_slots: Vec<u8> = (0..MAX_NUMBERED).filter(|&k| !pinned_slots[k]).map(|k| k as u8 + 1).collect();
+        let start = page * MAX_NUMBERED;
+        let overflow_indices: Vec<usize> = (start..total).filter(|&i| base[i].number.is_none()).collect();
+        for (&idx, &num) in overflow_indices.iter().zip(&free_slots) {
+            base[idx].number = Some(num);
+            base[idx].origin = Some(SlotOrigin::Fresh);
+        }
+        base.sort_by(|a, b| match (a.number, b.number) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        });
+        (base, sensitive, total_banks)
+    }
+
     /// 비전 · 이벤트 후보를 앞 프레임의 트랙에 잇는다. 이어지면 트랙의 위치 단서를 물려받고 사각형을 부드럽게 따라간다. 홀로 나온
     /// 이벤트 후보는 번호 후보가 될 때까지(두 번 잇달아 보이거나 250 ms 머묾) 내보내지 않는다. 트리 후보는 그대로 지나간다
     fn follow(&mut self, merged: Vec<Region>, cx: &FrameContext) -> Vec<Region> {
@@ -455,6 +497,20 @@ pub fn number(regions: Vec<Region>, tiers: &HashMap<String, Tier>) -> Vec<Number
         item.number = Some(i as u8 + 1);
     }
     items
+}
+
+/// 2단계 재귀 3×3 격자 타겟팅 (`Recursive 3x3 GridInvoke`, Phase 7 Part 1).
+/// `cell` 은 1..=9 (왼쪽 위 1 → 오른쪽 아래 9)이며, 접근성 트리가 없는 캔버스·인게임 지형 조작에 쓰인다.
+pub fn grid_subrect(parent: Rect, cell: u8) -> Option<Rect> {
+    if !(1..=9).contains(&cell) {
+        return None;
+    }
+    let idx = cell - 1;
+    let row = (idx / 3) as f32;
+    let col = (idx % 3) as f32;
+    let cw = parent.w / 3.0;
+    let ch = parent.h / 3.0;
+    Rect::new(parent.x + col * cw, parent.y + row * ch, cw, ch)
 }
 
 #[cfg(test)]
@@ -711,5 +767,45 @@ mod tests {
         assert_eq!(out[8].number, Some(9));
         assert!(out[9..].iter().all(|n| n.number.is_none()));
         assert_eq!(anchors(&out)[..3], ["a00", "a01", "a02"]);
+    }
+
+    #[test]
+    fn ac02_badge_bank_paging_preserves_spoken_lock_and_reaches_overflow_elements() {
+        let make = || {
+            (0..15)
+                .map(|i| region(&format!("el{i:02}"), Role::Button, &format!("Btn {i}"), (0.05, i as f32 * 0.06, 0.2, 0.04), Source::Tree))
+                .collect::<Vec<_>>()
+        };
+        let mut sticky = StickyNumberer::default();
+        let tiers = HashMap::new();
+        let cx0 = at("s1", 100);
+        let (b0, sens0, total_banks) = sticky.update_bank(make(), &tiers, crate::MERGE_IOU, &cx0, 0);
+        assert!(!sens0);
+        assert_eq!(total_banks, 2);
+        assert_eq!(b0.iter().filter(|n| n.number.is_some()).count(), 9);
+        assert_eq!(b0[1].region.anchor, "el01");
+        assert_eq!(b0[1].number, Some(2));
+
+        // Lock spoken slot #2 ("el01") and switch to bank 1 (#0 key): #2 stays pinned, el09..el14 get numbers!
+        let mut cx1 = at("s1", 200);
+        cx1.locked_numbers = 1u16 << 2;
+        let (b1, _, banks1) = sticky.update_bank(make(), &tiers, crate::MERGE_IOU, &cx1, 1);
+        assert_eq!(banks1, 2);
+        let locked_el = b1.iter().find(|n| n.region.anchor == "el01").unwrap();
+        assert_eq!(locked_el.number, Some(2), "spoken lock #2 must survive bank switch");
+        for idx in 9..15 {
+            let key = format!("el{idx:02}");
+            let entry = b1.iter().find(|n| n.region.anchor == key).unwrap();
+            assert!(entry.number.is_some(), "{key} must be reachable in bank 1");
+            assert_ne!(entry.number, Some(2), "overflow item must not steal locked #2");
+        }
+
+        // Recursive 3x3 grid zoom: cell 5 (center) then cell 9 (bottom-right).
+        let full = Rect::new(0.0, 0.0, 1.0, 1.0).unwrap();
+        let mid = grid_subrect(full, 5).unwrap();
+        assert!((mid.center().0 - 0.5).abs() < 1e-5 && (mid.center().1 - 0.5).abs() < 1e-5);
+        let sub = grid_subrect(mid, 9).unwrap();
+        assert!(sub.w < 0.12 && sub.x > 0.5 && sub.y > 0.5);
+        assert!(grid_subrect(full, 0).is_none());
     }
 }

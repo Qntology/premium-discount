@@ -28,7 +28,10 @@ pub use ledger::{Band, Ledger, Level};
 pub use matrix::{AssignDiag, TieKind};
 pub use moments::{backoff, Moments};
 pub use scope::{MinObs, Scope};
-pub use stats::{decay_shape, tie_verdict, ConfusionStat, DecayShape, DecayStat, RejectStat, ScopeStat, Welford};
+pub use stats::{
+    adaptive_half_life_ms, decay_shape, tie_verdict, ConfusionStat, DecayShape, DecayStat, RejectStat, ScopeStat,
+    Welford, DRIFT_HALF_LIFE_GAMMA, DRIFT_HALF_LIFE_TRIGGER_Z, DRIFT_MIN_HALF_LIFE_MS,
+};
 
 /// 장부 · 실행 파일에 적는 세대 표시. 다른 recipe 의 파일은 합치지 않고 비켜 둔다. 기기에 쌓인 장부를 그대로 읽도록
 /// `zena-sds` 때의 값을 그대로 쓴다.

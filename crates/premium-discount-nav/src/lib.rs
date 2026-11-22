@@ -32,15 +32,22 @@ mod resume;
 mod trial;
 
 pub use behavior::{
-    split_episodes, split_episodes_with_freezes, BehaviorParams, Decision, Episode, Event, FrictionAlertStage, FrictionBaselines, Judgement, LiveEpisodeWindow, LiveFrictionReading, LiveParams,
-    LiveProbeContext, Signal, Welford, IDLE_AFK_CUTOFF_MS, PRIVACY_PURGE_MS,
+    reading_grace_ms, split_episodes, split_episodes_with_freezes, BehaviorParams, Decision, Episode, Event, FrictionAlertStage, FrictionBaselines, Judgement, LiveEpisodeWindow, LiveFrictionReading,
+    LiveParams, LiveProbeContext, Signal, UniversalChoiceBook, UniversalChoiceEntry, UniversalChoiceKind, Welford, CROSS_BOUNDARY_BOUNCE_WINDOW_MS, CROSS_BOUNDARY_HOP_DECAY, IDLE_AFK_CUTOFF_MS,
+    PRIVACY_PURGE_MS, READING_MS_PER_CHAR,
 };
 pub use dom::{selector_template, DomNode, SELECTOR_DEPTH};
-pub use gesture::{classify_stroke, rage_presses, scroll_bursts, Gesture, GestureParams, PointerKind, PointerSample, ScrollBurst, ScrollSample, Stroke};
+pub use gesture::{
+    classify_stroke, classify_stroke_adaptive, filter_spastic_bounces, rage_presses, rage_presses_adaptive, scroll_bursts, Gesture, GestureParams, KinematicProfile, PointerKind, PointerSample,
+    ScrollBurst, ScrollSample, Stroke, BASE_HOLD_MS, HOLD_SHIFT_MARGIN_MS, SPASTIC_BOUNCE_MS,
+};
 pub use hash::{app_hash, element_hash, hash_id, hash_message, page_hash, region_hash, screen_hash, structure_template, url_template};
-pub use mark::{region_label, screen_label, MarkError, MarkType, MarkVector, NavMark, LABEL_SPACE, MARK_SCHEMA};
+pub use mark::{
+    canonical_space_dims, canonical_vision_space, dequantize_unit_i8, is_uploadable_space, quantize_unit_i8, region_label, screen_label, CanonicalSpace, MarkError, MarkType, MarkVector, NavMark,
+    CANONICAL_SPACES, HASH_NGRAM_SPACE, LABEL_SPACE, MARK_SCHEMA, VISION_SPACE_RAON_VE, VISION_SPACE_SIGLIP2_HF,
+};
 pub use navmap::{MapRegion, NavMap, NAVMAP_SCHEMA};
-pub use order::{number, FrameContext, Numbered, SlotOrigin, StickyConfig, StickyNumberer, MAX_NUMBERED};
+pub use order::{grid_subrect, number, FrameContext, Numbered, SlotOrigin, StickyConfig, StickyNumberer, MAX_NUMBERED};
 pub use privacy::{evaluate_privacy, privacy_triggers, scrub_anchor, scrub_name, split_pin_fields, virtual_keypad, PrivacyProbeInput, PrivacyShield, PrivacyTrigger, NAME_MAX_CHARS};
 pub use region::{merge, merge_absorbing, sensitive_screen, Rect, Region, Role, Source, CONTAIN_ABSORB, MERGE_IOU};
 pub use resume::{
@@ -48,9 +55,12 @@ pub use resume::{
     GRACE_MS, GRACE_TICKS, POST_PAYMENT_ARM_MS,
 };
 pub use trial::{
-    checkpoint_id, course_chain, course_hash, ghost_utility, reduce_course_points, route_marks, selection_gesture, shortcut_wins, tier, Added, Checkpoint, CheckpointTally, Collection, CourseEntry,
-    GhostSyncState, Guide, LiveGuide, PublicCourse, ReduceOptions, Run, ShortcutWin, Step, StepKind, StepRef, TrialError, MAX_COURSES, MAX_DETOUR_LOOP_MS, MAX_RUN_MS, MAX_STEPS, SCROLL_REWIND_MS,
-    SELECTION_SWIPE_MIN_PX, SPLIT_UNIT_MS, TIER_MIN_DECIDED, TRIAL_SCHEMA,
+    checkpoint_id, compute_interaction_traits, contextual_ghost_utility, course_chain, course_hash, dead_end_mark_if_eligible, ghost_utility, ghost_utility_v3, is_course_superseded,
+    reduce_course_points, route_marks, route_marks_v2, selection_gesture, shortcut_wins, shortcut_wins_v2, tier, AbandonContext, AccessibilityRoutePrefs, Added, Checkpoint, CheckpointTally,
+    Collection, CourseEntry, DeadEndMark, GhostSyncState, Guide, LiveGuide, MarkOutcome, PersonalPaceProfile, PublicCourse, ReduceOptions, RouteEvalContext, Run, ShortcutKind, ShortcutWin,
+    ShortcutWinV2, Step, StepKind, StepRef, TrialError, VerdictSummary, DEAD_END_MIN_FRICTION_Z, MAX_COURSES, MAX_DETOUR_LOOP_MS, MAX_RUN_MS, MAX_STEPS, MIN_SHORTCUT_MARGIN,
+    MIN_SHORTCUT_SAVED_MS, SCROLL_REWIND_MS, SELECTION_SWIPE_MIN_PX, SLRU_MAX_PINNED, SLRU_PROTECTED_MIN_RUNS, SPLIT_UNIT_MS, TIER_MIN_DECIDED, TRAIT_LOW_DENSITY_CALM, TRAIT_NO_FINE_GESTURE,
+    TRAIT_TREE_ACCESSIBLE, TRIAL_SCHEMA,
 };
 
 #[cfg(test)]

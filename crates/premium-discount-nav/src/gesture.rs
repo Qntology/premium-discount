@@ -8,6 +8,7 @@
 //! 기준값(누름 허용 움직임 10 px, 스와이프 50 px · 500 ms 안, 스크롤 묶음 300 ms · 100 px)은 흔히 쓰는 값에서 시작한 초깃값이고
 //! 실측으로 고친다.
 
+use premium_discount_sds::Moments;
 use serde::{Deserialize, Serialize};
 
 /// 체크포인트에 붙는 제스처. 누름(클릭 · 탭)은 기본 동작이라 체크포인트에는 붙이지 않는다(붙어 오면 지운다)
@@ -219,6 +220,123 @@ pub fn rage_presses(presses: &[(i64, f32, f32)], p: &GestureParams) -> bool {
     })
 }
 
+/// 80 ms 미만의 초단기 경직 바운스(Spasticity bounce)는 비자발적 떨림으로 보고 광클 마찰에서 디바운스 면책한다 (Phase 7 Part 1).
+pub const SPASTIC_BOUNCE_MS: i64 = 80;
+/// 기본 `@hold` 판정 하한(ms). 운동 기저선이 느린 사용자는 [`KinematicProfile::hold_threshold_ms`] 로 동반 상향 시프트한다.
+pub const BASE_HOLD_MS: i64 = 600;
+/// 느린 클릭 해제 뒤 실제 길게 누름으로 분리하는 여유(ms).
+pub const HOLD_SHIFT_MARGIN_MS: i64 = 450;
+
+/// 기기 로컬 전용 개인 운동 기저선 (Phase 7 Part 1, 서버 전송 0바이트).
+///
+/// 손떨림·뇌병변·스위치 사용자의 성공 클릭 분포(포인터 이동 반경 `wander` · 누름 유지 시간 `duration`)를 Welford 로 누적해
+/// 클릭 허용 반경과 시간을 탄성 확장하고, `@hold` 임계치도 동반 상향시켜 비장애인과 동일한 `Gesture::Press` (기본 체크포인트 해시)로 수렴시킨다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KinematicProfile {
+    pub wander_px: Moments,
+    pub duration_ms: Moments,
+    /// 경직 바운스 디바운스 간격 (기본 [`SPASTIC_BOUNCE_MS`]).
+    #[serde(default = "default_spastic_bounce_ms")]
+    pub spastic_bounce_ms: i64,
+    /// 지나친 이상치로 스와이프까지 삼키지 않도록 하는 최대 슬롭 상한(px).
+    #[serde(default = "default_max_slop_px")]
+    pub max_slop_px: f32,
+    /// 최대 클릭 유지 시간 상한(ms).
+    #[serde(default = "default_max_press_ms")]
+    pub max_press_ms: i64,
+}
+
+fn default_spastic_bounce_ms() -> i64 {
+    SPASTIC_BOUNCE_MS
+}
+fn default_max_slop_px() -> f32 {
+    60.0
+}
+fn default_max_press_ms() -> i64 {
+    2_500
+}
+
+impl Default for KinematicProfile {
+    fn default() -> Self {
+        Self {
+            wander_px: Moments::default(),
+            duration_ms: Moments::default(),
+            spastic_bounce_ms: SPASTIC_BOUNCE_MS,
+            max_slop_px: default_max_slop_px(),
+            max_press_ms: default_max_press_ms(),
+        }
+    }
+}
+
+impl KinematicProfile {
+    /// 성공한 일반 클릭 획의 이동 반경(px)과 누름 유지 시간(ms)을 기저선에 반영한다.
+    pub fn observe_press_stroke(&mut self, stroke: &Stroke) {
+        let (Some(first), Some(last)) = (stroke.samples.first(), stroke.samples.last()) else {
+            return;
+        };
+        let duration = (last.t_ms - first.t_ms).max(0) as f64;
+        let wander = stroke.samples.iter().map(|s| (s.x - first.x).hypot(s.y - first.y)).fold(0.0f32, f32::max) as f64;
+        self.observe_press_sample(wander, duration);
+    }
+
+    pub fn observe_press_sample(&mut self, wander_px: f64, duration_ms: f64) {
+        if wander_px.is_finite() && wander_px >= 0.0 && wander_px <= self.max_slop_px as f64 {
+            self.wander_px.push(wander_px);
+        }
+        if duration_ms.is_finite() && duration_ms >= 0.0 && duration_ms <= self.max_press_ms as f64 {
+            self.duration_ms.push(duration_ms);
+        }
+    }
+
+    /// `slop_eff = max(base.press_slop_px, mu_wander + 2.5 * sd_wander)`,
+    /// `press_max_eff = max(base.press_max_ms, 1.8 * mu_dur)` (상한으로 클램프).
+    pub fn effective_params(&self, base: &GestureParams) -> GestureParams {
+        let mut out = base.clone();
+        if self.wander_px.n >= 3 {
+            let eff_slop = (self.wander_px.mean + 2.5 * self.wander_px.sample_sd()) as f32;
+            out.press_slop_px = eff_slop.max(base.press_slop_px).min(self.max_slop_px);
+            out.swipe_min_px = out.swipe_min_px.max(out.press_slop_px + 15.0);
+        }
+        if self.duration_ms.n >= 3 {
+            let eff_ms = (1.8 * self.duration_ms.mean).round() as i64;
+            out.press_max_ms = eff_ms.max(base.press_max_ms).min(self.max_press_ms);
+        }
+        out
+    }
+
+    /// `@hold` 판정 임계치: `max(600ms, press_max_eff + 450ms)`.
+    pub fn hold_threshold_ms(&self, base: &GestureParams) -> i64 {
+        let eff = self.effective_params(base);
+        BASE_HOLD_MS.max(eff.press_max_ms + HOLD_SHIFT_MARGIN_MS)
+    }
+}
+
+/// 개인 운동 기저선([`KinematicProfile`])을 적용한 획 분류. 손떨림·지연 해제가 있는 일반 클릭도 표준 [`Gesture::Press`] 로 수렴한다.
+pub fn classify_stroke_adaptive(stroke: &Stroke, base: &GestureParams, profile: &KinematicProfile) -> Option<Gesture> {
+    let eff = profile.effective_params(base);
+    classify_stroke(stroke, &eff)
+}
+
+/// 근육 경직(spasticity)으로 인한 초단기 바운스 연타(`< min_bounce_ms`, 같은 반경 안)를 단일 클릭으로 디바운스한다.
+pub fn filter_spastic_bounces(presses: &[(i64, f32, f32)], min_bounce_ms: i64, radius_px: f32) -> Vec<(i64, f32, f32)> {
+    let mut out: Vec<(i64, f32, f32)> = Vec::with_capacity(presses.len());
+    for &(t, x, y) in presses {
+        let is_bounce = out
+            .last()
+            .is_some_and(|&(pt, px, py)| t - pt >= 0 && t - pt < min_bounce_ms && (x - px).hypot(y - py) <= radius_px);
+        if !is_bounce {
+            out.push((t, x, y));
+        }
+    }
+    out
+}
+
+/// 경직 바운스를 면책한 뒤 광클(RageClick)을 판정한다.
+pub fn rage_presses_adaptive(presses: &[(i64, f32, f32)], p: &GestureParams, profile: &KinematicProfile) -> bool {
+    let cleaned = filter_spastic_bounces(presses, profile.spastic_bounce_ms, p.rage_radius_px);
+    rage_presses(&cleaned, p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +420,28 @@ mod tests {
         for g in [Gesture::Press, Gesture::SwipeLeft, Gesture::ScrollDown, Gesture::ScrollRight] {
             assert_eq!(serde_json::to_value(g).unwrap(), g.name());
         }
+    }
+
+    #[test]
+    fn ac01_tremor_and_slow_release_converge_to_press_and_spastic_bounce_is_exempt() {
+        let base = GestureParams::default();
+        let mut profile = KinematicProfile::default();
+        // Train local kinematic profile with a motor-impaired user's normal clicks (wander ~22-30px, dur ~650-800ms).
+        for &(w, d) in &[(22.0, 680.0), (26.0, 740.0), (24.0, 720.0), (29.0, 790.0), (25.0, 710.0)] {
+            profile.observe_press_sample(w, d);
+        }
+        // Raw defaults reject wander=28px, dur=820ms.
+        let tremor_click = stroke(PointerKind::Mouse, &[(0, 100.0, 100.0), (400, 128.0, 100.0), (820, 118.0, 106.0)]);
+        assert_eq!(classify_stroke(&tremor_click, &base), None);
+        // Adaptive kinematic profile converges it to standard Gesture::Press (no @hold split!).
+        assert_eq!(classify_stroke_adaptive(&tremor_click, &base, &profile), Some(Gesture::Press));
+        assert!(profile.hold_threshold_ms(&base) > 820, "hold threshold must shift above slow press");
+        // Spastic triple bounce within 45ms intervals is debounced to 1 press (not RageClick).
+        let spastic = [(0, 50.0, 50.0), (35, 52.0, 51.0), (70, 51.0, 52.0)];
+        assert!(rage_presses(&spastic, &base));
+        assert!(!rage_presses_adaptive(&spastic, &base, &profile));
+        // Genuine intentional rage clicks spaced >= 180ms apart still trigger RageClick.
+        let genuine_rage = [(0, 50.0, 50.0), (200, 52.0, 51.0), (420, 51.0, 52.0)];
+        assert!(rage_presses_adaptive(&genuine_rage, &base, &profile));
     }
 }
