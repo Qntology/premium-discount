@@ -34,6 +34,15 @@ struct RmsNorm {
 
 impl RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(w) = &self.weight {
+            if !x.device().is_cpu()
+                && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::DecoderOps)
+            {
+                if let Ok(y) = candle_core::decoder_ops::rmsnorm_fused(x, w, RMS_EPS as f32, false) {
+                    return Ok(y);
+                }
+            }
+        }
         let mean_sq = x.sqr()?.mean_keepdim(D::Minus1)?;
         let inv = mean_sq.affine(1.0, RMS_EPS)?.powf(-0.5)?;
         let y = x.broadcast_mul(&inv)?;
@@ -167,6 +176,7 @@ impl SelfAttention {
         let v = v.transpose(1, 2)?.contiguous()?;
 
         if mask.is_none()
+            && self.head_dim <= 256
             && !x.device().is_cpu()
             && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::FlashAttn)
         {

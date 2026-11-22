@@ -144,16 +144,19 @@ fn open_best_vulkan(ordinal: usize) -> Result<Device> {
     if count <= 1 {
         return Ok(Device::new_vulkan(0)?);
     }
-    let mut best_dev: Option<(u64, Device)> = None;
+    let mut best_hw: Option<(u64, Device)> = None;
+    let mut best_cpu: Option<(u64, Device)> = None;
     for id in 0..count {
         if let Ok(d) = Device::new_vulkan(id) {
             let free = d.mem_info().ok().flatten().map_or(0, |(f, _)| f as u64);
-            if best_dev.as_ref().is_none_or(|(b, _)| free > *b) {
-                best_dev = Some((free, d));
+            let is_cpu = d.as_vulkan_device().is_ok_and(|v| v.is_cpu_device());
+            let slot = if is_cpu { &mut best_cpu } else { &mut best_hw };
+            if slot.as_ref().is_none_or(|(b, _)| free > *b) {
+                *slot = Some((free, d));
             }
         }
     }
-    match best_dev {
+    match best_hw.or(best_cpu) {
         Some((_, d)) => Ok(d),
         None => Ok(Device::new_vulkan(0)?),
     }
@@ -368,9 +371,13 @@ fn accel_faults() -> &'static Mutex<HashMap<AccelOp, bool>> {
 }
 
 /// 테스트용 결함 주입 (지정 연산을 강제 실패시켜 CPU 폴백 경로를 검증한다).
+/// `fail = true` 일 때만 기존 캐시를 지워 다음 호출이 `catch_unwind` 경로에서 실패·음성 캐시되도록 한다.
+/// `fail = false` 로 되돌려도 음성 캐시는 유지되며 `reset_accel_cache()` 로만 재검증한다.
 pub fn set_accel_fault(op: AccelOp, fail: bool) {
     accel_faults().lock().unwrap_or_else(|p| p.into_inner()).insert(op, fail);
-    accel_verdicts().lock().unwrap_or_else(|p| p.into_inner()).retain(|(_, o), _| *o != op);
+    if fail {
+        accel_verdicts().lock().unwrap_or_else(|p| p.into_inner()).retain(|(_, o), _| *o != op);
+    }
 }
 
 pub fn reset_accel_cache() {
@@ -404,14 +411,22 @@ pub fn accel_op_ok(device: &Device, op: AccelOp) -> bool {
     if device.is_cpu() {
         return true;
     }
-    if accel_faults().lock().unwrap_or_else(|p| p.into_inner()).get(&op).copied().unwrap_or(false) {
-        return false;
-    }
     let key = (device_label(device), op);
     if let Some(&ok) = accel_verdicts().lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return ok;
     }
-    let ok = match catch_unwind(AssertUnwindSafe(|| probe_accel_op(device, op))) {
+    let ok = match catch_unwind(AssertUnwindSafe(|| {
+        if accel_faults()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&op)
+            .copied()
+            .unwrap_or(false)
+        {
+            panic!("injected accel fault for {op:?}");
+        }
+        probe_accel_op(device, op)
+    })) {
         Ok(Ok(err)) if err <= 5e-3 => true,
         Ok(Ok(err)) => {
             eprintln!("[PD-ACCEL] ❌ {} {:?}: 상대오차 {err:.2e} > 5e-3 → 폴백", key.0, op);
@@ -509,23 +524,23 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             let mut worst = e_mode_b.max(e_mode_a);
             if device.is_rocm() {
                 use candle_core::quantized::{GgmlDType, QTensor};
-                let hq = Tensor::from_vec(det_vec(4 * 256, 18), (4, 256), &Device::Cpu)?;
+                // M=12 (> 8) exercises candle@708b2f2 chunked ROCm Mode A across Q8_0 / Q4_0 / Q4K / Q5K / Q6K.
+                let hq = Tensor::from_vec(det_vec(12 * 256, 18), (12, 256), &Device::Cpu)?;
                 let wq = Tensor::from_vec(det_vec(64 * 256, 19), (64, 256), &Device::Cpu)?;
-                let qt_cpu = QTensor::quantize(&wq, GgmlDType::Q4K)?;
-                let want_q = candle_core::lm_head::logits_argmax_cs(&qt_cpu.forward_exact(&hq)?, None, None, None)?;
-                let qt_dev = QTensor::quantize(&wq.to_device(device)?, GgmlDType::Q4K)?;
-                let got_q = candle_core::lm_head::fused_quant_argmax_cs(
-                    &hq.to_device(device)?,
-                    &qt_dev,
-                    None,
-                    None,
-                    None,
-                )?;
-                if want_q.ids.to_vec1::<u32>()? != got_q.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()? {
-                    return Ok(f32::INFINITY);
-                }
-                if let (Some(gv), Some(wv)) = (got_q.max_vals.as_ref(), want_q.max_vals.as_ref()) {
-                    worst = worst.max(rel_err_f32(gv, wv)?);
+                let hq_dev = hq.to_device(device)?;
+                let wq_dev = wq.to_device(device)?;
+                for dt in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+                    let qt_cpu = QTensor::quantize(&wq, dt)?;
+                    let want_q = candle_core::lm_head::logits_argmax_cs(&qt_cpu.forward_exact(&hq)?, None, None, None)?;
+                    let qt_dev = QTensor::quantize(&wq_dev, dt)?;
+                    let got_q = candle_core::lm_head::fused_quant_argmax_cs(&hq_dev, &qt_dev, None, None, None)?;
+                    let (got_ids, _) = got_q.download_ids_and_mask()?;
+                    if want_q.ids.to_vec1::<u32>()? != got_ids {
+                        return Ok(f32::INFINITY);
+                    }
+                    if let (Some(gv), Some(wv)) = (got_q.max_vals.as_ref(), want_q.max_vals.as_ref()) {
+                        worst = worst.max(rel_err_f32(gv, wv)?);
+                    }
                 }
             }
             Ok(worst)
@@ -610,15 +625,24 @@ mod tests {
     }
 
     /// GPU 백엔드를 켜고 빌드했고(`--features rocm` …) 장치가 있으면, 밀집 · 양자화 계산이 그 장치에서 돌고
-    /// CPU와 같은 값을 낸다. GPU가 없으면 CPU가 골라지는지만 본다.
+    /// CPU와 같은 값을 낸다. `PD_REQUIRE_GPU=1` 이면 GPU 부재 시 실패한다.
     #[test]
     fn gpu_backend_runs_and_matches_cpu() -> Result<()> {
+        let require_gpu = std::env::var("PD_REQUIRE_GPU")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let dev = select_device(Backend::Auto, 0)?;
         eprintln!("장치: {} (빌드: {})", describe(&dev), compiled_backends().join(", "));
         if dev.is_cpu() {
+            assert!(!require_gpu, "PD_REQUIRE_GPU=1 이지만 GPU 장치를 열지 못했습니다");
             return Ok(());
         }
         assert!(dev.is_cuda_or_rocm() || dev.is_vulkan() || dev.is_metal());
+
+        #[cfg(feature = "vulkan")]
+        let vk_native_before = dev
+            .as_vulkan_device()
+            .is_ok_and(|v| !v.is_cpu_device())
+            .then(candle_core::vulkan_backend::shaders::native_exec_count);
 
         // GPU 텐서는 이 블록 안에서만 살고, 끝나면 release_gpu로 풀을 비운다 (Windows HIP 종료 멈춤 방지)
         let (dense, quant, scale) = {
@@ -628,10 +652,10 @@ mod tests {
             let gpu = candle_nn::ops::softmax_last_dim(&a.to_device(&dev)?.matmul(&w.to_device(&dev)?.t()?)?)?;
             let dense = max_abs_diff(&cpu, &gpu)?;
 
-            // 앱의 양자화 경로(quant.rs)가 쓰는 Q8_0 · K-quant(Q4K/Q5K/Q6K).
-            // candle@b90b12c 는 ROCm w8a16 및 Vulkan GpuQuant 로 모든 형식을 GPU 에서 직접 계산한다.
+            // 앱의 양자화 경로(quant.rs)가 쓰는 Q8_0 · Q4_0 · K-quant(Q4K/Q5K/Q6K).
+            // candle@708b2f2 는 ROCm w8a16 및 Vulkan GpuQuant 로 모든 형식을 GPU 에서 직접 계산한다.
             let mut max_ratio = 0f32;
-            for dt in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+            for dt in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
                 let cpu_q = QMatMul::from_qtensor(QTensor::quantize(&w, dt)?)?.forward(&a)?;
                 let gpu_q = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&dev)?, dt)?)?.forward(&a.to_device(&dev)?)?;
                 let scale = cpu_q.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
@@ -640,15 +664,29 @@ mod tests {
             }
             (dense, max_ratio, 1.0f32)
         };
+        #[cfg(feature = "vulkan")]
+        if let Some(before) = vk_native_before {
+            let after = candle_core::vulkan_backend::shaders::native_exec_count();
+            assert!(
+                after > before,
+                "Vulkan hardware GPU must execute native GpuQuant shaders (before={before}, after={after})"
+            );
+            eprintln!("Vulkan native GpuQuant dispatches: {}", after - before);
+        }
         release_gpu(&dev)?;
         assert!(dense < 1e-4, "softmax(matmul) 차이 {dense}");
-        assert!(quant <= 0.05 * scale.max(1e-3), "Q8_0 행렬곱 차이 {quant} (크기 {scale})");
+        assert!(quant <= 0.05 * scale.max(1e-3), "양자화 행렬곱 차이 {quant} (크기 {scale})");
         Ok(())
     }
 
     #[test]
     fn accel_check_verifies_ops_and_fault_injection() -> Result<()> {
+        let require_gpu = std::env::var("PD_REQUIRE_GPU")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
         let dev = select_device(Backend::Auto, 0)?;
+        if dev.is_cpu() {
+            assert!(!require_gpu, "PD_REQUIRE_GPU=1 이지만 GPU 장치를 열지 못했습니다");
+        }
         reset_accel_cache();
         for op in [
             AccelOp::Matmul,
@@ -663,11 +701,15 @@ mod tests {
             assert!(accel_op_ok(&dev, op), "accel_op_ok failed for {op:?} on {}", describe(&dev));
         }
         if !dev.is_cpu() {
-            // Fault injection must trip catch_unwind and cache false without crashing.
+            // Fault injection must trip catch_unwind and cache false until explicit reset_accel_cache().
             reset_accel_cache();
             set_accel_fault(AccelOp::DecoderOps, true);
             assert!(!accel_op_ok(&dev, AccelOp::DecoderOps));
             set_accel_fault(AccelOp::DecoderOps, false);
+            assert!(
+                !accel_op_ok(&dev, AccelOp::DecoderOps),
+                "negative verdict must stay cached after clearing fault until reset_accel_cache()"
+            );
             reset_accel_cache();
             assert!(accel_op_ok(&dev, AccelOp::DecoderOps));
             release_gpu(&dev)?;

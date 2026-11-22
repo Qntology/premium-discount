@@ -32,6 +32,7 @@ candle-nn = "0.11.0"
 # 입력 임베딩 표를 파일 매핑에서 행 단위로 읽는다 (candle 포크가 쓰는 판과 같아야 Dtype 타입이 맞는다)
 safetensors = "0.8"
 half = "2"
+rayon.workspace = true
 futures = "0.3"
 getrandom = "0.3"
 # 로컬 원본 저장소(local.rs). raon-zena(zena-lexicon)와 같은 0.41 이고, 빌드에 protoc가 필요하다 (링크가 무거워 CARGO_BUILD_JOBS를 낮추는 편이 안전하다)
