@@ -232,7 +232,7 @@ impl Qwen35 {
     /// 출력 헤드: 전체 어휘 (입력 임베딩 표 전체를 F32로, 약 1GB)
     pub fn full_head(&self) -> Result<Head> {
         let ids: Vec<u32> = (0..VOCAB as u32).collect();
-        let mut rows = Vec::with_capacity(VOCAB);
+        let mut rows = Vec::with_capacity(VOCAB.div_ceil(16_384));
         for chunk in ids.chunks(16_384) {
             rows.push(self.tokens.rows(chunk)?);
         }
@@ -310,16 +310,7 @@ impl Qwen35 {
                 x = (x + mixed)?;
                 rms_norm_1p(&x, &layer.post_norm)?
             };
-            let gate = layer.gate.forward(&h)?;
-            let up = layer.up.forward(&h)?;
-            let glu = if !gate.device().is_cpu()
-                && crate::utils::accel_op_ok(gate.device(), crate::utils::AccelOp::DecoderOps)
-            {
-                candle_core::decoder_ops::silu_mul(&gate, &up)
-                    .or_else(|_| &gate.silu()? * &up)?
-            } else {
-                (&gate.silu()? * &up)?
-            };
+            let glu = layer.gate.fused_gate_up_silu(&layer.up, &h)?;
             let y = layer.down.forward(&glu)?;
             x = (x + y)?;
         }
@@ -380,8 +371,8 @@ impl Qwen35 {
         *conv = Some(gdn_out.conv_state);
         *ssm = Some(gdn_out.recurrent_state);
         let core_2d = gdn_out.out.reshape((t * LIN_HEADS, LIN_DIM))?;
-        let gated = if !core_2d.device().is_cpu()
-            && crate::utils::accel_op_ok(core_2d.device(), crate::utils::AccelOp::GatedDeltaRule)
+        let gated = if core_2d.device().is_cpu()
+            || crate::utils::accel_op_ok(core_2d.device(), crate::utils::AccelOp::GatedDeltaRule)
         {
             candle_core::delta_rule::fused_gated_rms_norm(&core_2d, &z, &g.norm_w, EPS)
                 .or_else(|_| {
@@ -478,6 +469,11 @@ impl Qwen35 {
         self.next_token_inner(h, head, allow, true)
     }
 
+    /// 마지막 은닉 → 다음 토큰 ID 만 반환 (GPU `max_vals` D2H 전송 생략).
+    pub fn next_token_id(&self, h: &Tensor, head: &Head, allow: Option<&[u32]>) -> Result<u32> {
+        Ok(self.next_token_inner(h, head, allow, false)?.0)
+    }
+
     fn next_token_inner(&self, h: &Tensor, head: &Head, allow: Option<&[u32]>, need_val: bool) -> Result<(u32, f32)> {
         if let Some(allowed) = allow {
             if !allowed.is_empty() && allowed.len() <= 64 {
@@ -498,10 +494,20 @@ impl Qwen35 {
                     Head::Trimmed { ids, weight } => {
                         let mut idxs = Vec::with_capacity(allowed.len());
                         let mut matched_ids = Vec::with_capacity(allowed.len());
-                        for (i, &id) in ids.iter().enumerate() {
-                            if allowed.contains(&id) {
-                                idxs.push(i as u32);
-                                matched_ids.push(id);
+                        let is_sorted = ids.windows(2).all(|w| w[0] <= w[1]);
+                        if is_sorted {
+                            for &id in allowed {
+                                if let Ok(i) = ids.binary_search(&id) {
+                                    idxs.push(i as u32);
+                                    matched_ids.push(id);
+                                }
+                            }
+                        } else {
+                            for (i, &id) in ids.iter().enumerate() {
+                                if allowed.contains(&id) {
+                                    idxs.push(i as u32);
+                                    matched_ids.push(id);
+                                }
                             }
                         }
                         if idxs.is_empty() {

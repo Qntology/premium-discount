@@ -606,7 +606,11 @@ impl VisionTower {
             wx.broadcast_left(gh)?.contiguous()?.matmul(&by_rows)?.reshape((gh * gw, d))?
         }
         .to_dtype(self.format.dtype())?;
-        self.pos_cache.lock().unwrap_or_else(|p| p.into_inner()).insert((gh, gw), t.clone());
+        let mut cache = self.pos_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert((gh, gw), t.clone());
         Ok(t)
     }
 
@@ -947,15 +951,28 @@ mod tests {
         assert!(!gpu_flash_attn_ok(&Device::Cpu, 512));
 
         let dev = {
-            #[cfg(feature = "rocm")]
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(0).unwrap_or(Device::Cpu)
+            }
+            #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
             {
                 Device::new_rocm(0).unwrap_or(Device::Cpu)
             }
-            #[cfg(all(not(feature = "rocm"), feature = "vulkan"))]
+            #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "vulkan"))]
             {
                 Device::new_vulkan(0).unwrap_or(Device::Cpu)
             }
-            #[cfg(all(not(feature = "rocm"), not(feature = "vulkan")))]
+            #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), not(feature = "vulkan"), feature = "metal"))]
+            {
+                Device::new_metal(0).unwrap_or(Device::Cpu)
+            }
+            #[cfg(all(
+                not(feature = "cuda"),
+                not(feature = "rocm"),
+                not(feature = "vulkan"),
+                not(feature = "metal")
+            ))]
             {
                 Device::Cpu
             }

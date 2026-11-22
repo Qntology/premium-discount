@@ -56,7 +56,7 @@ fn generate_string(
 ) -> Result<(String, String), AppError> {
     let mut ids: Vec<u32> = Vec::with_capacity(max);
     for step in 0..max {
-        let (id, _) = model.next_token(h, head, None).map_err(err)?;
+        let id = model.next_token_id(h, head, None).map_err(err)?;
         ids.push(id);
         // ASCII '"' (0x22) never appears inside multi-byte UTF-8 continuation bytes, so we only run
         // full sequence decode when the newest token piece contains '"' (avoiding O(N^2) decoding).
@@ -132,21 +132,22 @@ pub fn draft(model: &Qwen35, head: &Head, page: &str, link: &str) -> Result<Item
 
 fn draft_preprocessed(model: &Qwen35, head: &Head, page: &str, link: &str) -> Result<ItemDraft, AppError> {
     let prompt = chat_prompt(SYSTEM, &format!("{page}\n\nlink: {link}"));
-    let mut st = model.new_state();
     let mut ids = model.encode(&prompt);
     ids.extend(model.encode("{\"type\": "));
+    let mut st = model.new_state_with_capacity(ids.len() + MAX_HEAD_TOKENS + MAX_BODY_TOKENS + 32);
     let mut h = model.forward(&ids, &mut st).map_err(err)?;
 
     // type: "1"과 "2" 중에서만 고른다
     let one = *model.encode("1").first().ok_or_else(|| AppError::Embed("토큰 1".into()))?;
     let two = *model.encode("2").first().ok_or_else(|| AppError::Embed("토큰 2".into()))?;
-    let (choice, _) = model.next_token(&h, head, Some(&[one, two])).map_err(err)?;
+    let choice = model.next_token_id(&h, head, Some(&[one, two])).map_err(err)?;
     let kind = if choice == one { 1 } else { 2 };
 
     h = model.forward(&[&[choice][..], &model.encode(", \"head\": \"")].concat(), &mut st).map_err(err)?;
     let (title, rest) = generate_string(model, head, &mut st, &mut h, MAX_HEAD_TOKENS, true)?;
     h = model.forward(&model.encode(remaining(", \"body\": \"", &rest)), &mut st).map_err(err)?;
     let (body, _) = generate_string(model, head, &mut st, &mut h, MAX_BODY_TOKENS, false)?;
+    crate::utils::trim_idle_gpu_pool(model.device());
     Ok(ItemDraft { kind, digest: digest(title.trim()), head: title.trim().to_string(), body: body.trim().to_string(), link: link.to_string() })
 }
 

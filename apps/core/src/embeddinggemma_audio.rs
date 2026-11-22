@@ -594,7 +594,7 @@ impl AudioTower {
     pub fn encode_pcm(&self, samples: &[f32]) -> Result<Tensor> {
         let mel = compute_mel(samples);
         if mel.valid == 0 {
-            return Tensor::zeros((0, OUTPUT_DIM), DType::F32, &Device::Cpu);
+            return Tensor::zeros((0, OUTPUT_DIM), DType::F32, self.output_proj_w.device());
         }
         let tokens = mel.valid.div_ceil(FRAMES_PER_TOKEN);
 
@@ -610,7 +610,7 @@ impl AudioTower {
     /// 두 번의 2배 다운샘플링 합성곱 (프레임 4개 -> 1개) 후 입력 투영. 결과는 [ceil(frames / 4), 1024]
     fn subsample(&self, mel: &Mel) -> Result<Tensor> {
         // Python은 [B, F, 128]을 [B, 1, F(시간), 128(주파수)]로 본다
-        let x = Tensor::from_slice(&mel.data, (1, 1, mel.frames, NUM_MEL_BINS), &Device::Cpu)?;
+        let x = Tensor::from_slice(&mel.data, (1, 1, mel.frames, NUM_MEL_BINS), self.conv0.device())?;
         let x = x.conv2d(&self.conv0, 1, 2, 1, 1)?;
         let x = channel_norm_relu(&x, &self.norm0)?;
         let x = mask_time(&x, mel.valid.div_ceil(2))?;

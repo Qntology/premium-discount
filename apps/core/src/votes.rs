@@ -388,7 +388,14 @@ impl VoteStore {
     }
 
     async fn upsert_vote(&self, rec: &VoteRecord) -> Result<(), AppError> {
-        let batch = votes_batch(std::slice::from_ref(rec))?;
+        self.upsert_votes(std::slice::from_ref(rec)).await
+    }
+
+    async fn upsert_votes(&self, recs: &[VoteRecord]) -> Result<(), AppError> {
+        if recs.is_empty() {
+            return Ok(());
+        }
+        let batch = votes_batch(recs)?;
         let reader = RecordBatchIterator::new(vec![Ok::<_, ArrowError>(batch)], votes_schema());
         let mut merge = self.votes.merge_insert(&["request_id"]);
         merge.when_matched_update_all(None).when_not_matched_insert_all();
@@ -485,16 +492,14 @@ impl VoteStore {
         Ok(latest)
     }
 
-    async fn persist(&self, rec: &mut VoteRecord, state: VoteState, counted: Option<bool>, reason: Option<String>, report: &mut VoteFlushReport) {
+    fn stage_persist(rec: &mut VoteRecord, state: VoteState, counted: Option<bool>, reason: Option<String>, dirty: &mut Vec<VoteRecord>) {
         rec.state = state;
         if counted.is_some() {
             rec.counted = counted;
         }
         rec.reason = reason;
         rec.updated_at = now_ms();
-        if let Err(e) = self.upsert_vote(rec).await {
-            report.persist_error.get_or_insert(e.to_string());
-        }
+        dirty.push(rec.clone());
     }
 
     /// 못 보낸 표를 오래된 순으로 보낸다. 연결이 없으면 멈추고, 그 밖의 일시 오류는 그 표만 다음으로 미룬다.
@@ -507,6 +512,7 @@ impl VoteStore {
                 return report;
             }
         };
+        let mut dirty: Vec<VoteRecord> = Vec::new();
         for mut rec in queued {
             if report.stopped.is_some() {
                 report.remaining += 1;
@@ -520,7 +526,7 @@ impl VoteStore {
             };
             match backend.vote(&req).await {
                 Ok(resp) => {
-                    self.persist(&mut rec, VoteState::Sent, Some(resp.counted), None, &mut report).await;
+                    Self::stage_persist(&mut rec, VoteState::Sent, Some(resp.counted), None, &mut dirty);
                     report.sent.push((rec.request_id.clone(), resp));
                 }
                 Err(AppError::Offline(m)) => {
@@ -536,7 +542,7 @@ impl VoteStore {
                     if is_missing_evaluation(status, &message) || matches!(status, 400 | 409 | 422) =>
                 {
                     let reason = format!("server returned {status}: {message}");
-                    self.persist(&mut rec, VoteState::Rejected, None, Some(reason.clone()), &mut report).await;
+                    Self::stage_persist(&mut rec, VoteState::Rejected, None, Some(reason.clone()), &mut dirty);
                     report.rejected.push(VoteRejected { request_id: rec.request_id.clone(), eval_id: rec.eval_id.clone(), reason });
                 }
                 // 401 · 403 · 429 는 표 탓이 아니다: 시도 횟수를 세지 않고 멈춘다 (남은 표는 그대로 다음에)
@@ -558,13 +564,18 @@ impl VoteStore {
                     rec.attempts += 1;
                     let reason = e.to_string();
                     if rec.attempts >= MAX_SERVER_ATTEMPTS {
-                        self.persist(&mut rec, VoteState::Failed, None, Some(reason.clone()), &mut report).await;
+                        Self::stage_persist(&mut rec, VoteState::Failed, None, Some(reason.clone()), &mut dirty);
                         report.rejected.push(VoteRejected { request_id: rec.request_id.clone(), eval_id: rec.eval_id.clone(), reason });
                     } else {
-                        self.persist(&mut rec, VoteState::Queued, None, Some(reason), &mut report).await;
+                        Self::stage_persist(&mut rec, VoteState::Queued, None, Some(reason), &mut dirty);
                         report.remaining += 1;
                     }
                 }
+            }
+        }
+        if !dirty.is_empty() {
+            if let Err(e) = self.upsert_votes(&dirty).await {
+                report.persist_error.get_or_insert(e.to_string());
             }
         }
         report
