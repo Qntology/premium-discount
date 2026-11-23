@@ -149,6 +149,83 @@ impl MeanCenteredCsGuard {
     }
 }
 
+impl ColdGuard {
+    /// Save the precomputed cluster guard to a compact binary cache (`.cold_guard.bin`).
+    pub fn save_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        f.write_all(b"LCCG")?;
+        f.write_all(&1u32.to_le_bytes())?;
+        f.write_all(&(self.dim as u32).to_le_bytes())?;
+        f.write_all(&(self.radius.len() as u32).to_le_bytes())?;
+        f.write_all(&(self.members.len() as u32).to_le_bytes())?;
+        for &v in &self.centers {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for &v in &self.radius {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for &v in &self.members {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for &v in &self.offsets {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        f.flush()?;
+        Ok(())
+    }
+
+    /// Load a cached cluster guard from `.cold_guard.bin`.
+    pub fn load_from_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        if bytes.len() < 20 || &bytes[0..4] != b"LCCG" {
+            anyhow::bail!("invalid cold guard cache header");
+        }
+        let ver = u32::from_le_bytes(bytes[4..8].try_into()?);
+        if ver != 1 {
+            anyhow::bail!("unsupported cold guard version {ver}");
+        }
+        let dim = u32::from_le_bytes(bytes[8..12].try_into()?) as usize;
+        let c = u32::from_le_bytes(bytes[12..16].try_into()?) as usize;
+        let n = u32::from_le_bytes(bytes[16..20].try_into()?) as usize;
+        let need = 20 + (c * dim + c + n + (c + 1)) * 4;
+        if bytes.len() != need {
+            anyhow::bail!("cold guard cache size {} != expected {need}", bytes.len());
+        }
+        let mut p = 20usize;
+        let read_f32s = |bytes: &[u8], pos: &mut usize, cnt: usize| -> Vec<f32> {
+            let out: Vec<f32> = bytes[*pos..*pos + cnt * 4]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            *pos += cnt * 4;
+            out
+        };
+        let read_u32s = |bytes: &[u8], pos: &mut usize, cnt: usize| -> Vec<u32> {
+            let out: Vec<u32> = bytes[*pos..*pos + cnt * 4]
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            *pos += cnt * 4;
+            out
+        };
+        let centers = read_f32s(&bytes, &mut p, c * dim);
+        let radius = read_f32s(&bytes, &mut p, c);
+        let members = read_u32s(&bytes, &mut p, n);
+        let offsets = read_u32s(&bytes, &mut p, c + 1);
+        Ok(Self {
+            dim,
+            centers,
+            radius,
+            members,
+            offsets,
+        })
+    }
+}
+
 /// Lloyd k-means (Euclidean) over the decoded cold rows `rows` (`n × dim`), seeded with evenly
 /// strided rows. Deterministic.
 pub fn build_cold_guard(rows: &[f32], ids: &[u32], dim: usize, clusters: usize, iters: usize) -> ColdGuard {

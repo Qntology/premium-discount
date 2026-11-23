@@ -15,6 +15,8 @@ whatlang = "0.18"
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
 # Stanza 는 ONNX Runtime 위에서 돈다 (logis-center 판 onnxruntime-rs 사본 + 실행할 때 라이브러리를 불러오는 `runtime-load` 기능)
 ndarray = { version = "0.15", optional = true }
 onnxruntime = { path = "../onnxruntime", optional = true }
@@ -26,7 +28,7 @@ onnxruntime-sys = { path = "../onnxruntime-sys", features = ["runtime-load"] }
 [features]
 default = ["stanza", "granite"]
 stanza = ["dep:ndarray", "dep:onnxruntime", "dep:onnxruntime-sys", "onnxruntime/runtime-load", "onnxruntime-sys/runtime-load"]
-granite = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers"]
+granite = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:half", "dep:memmap2"]
 cuda = ["granite", "candle-core/cuda", "candle-nn/cuda"]
 rocm = ["granite", "candle-core/rocm", "candle-nn/rocm"]
 vulkan = ["granite", "candle-core/vulkan", "candle-nn/vulkan"]
