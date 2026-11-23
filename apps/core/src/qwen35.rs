@@ -100,15 +100,27 @@ struct Layer {
     down: Lin,
 }
 
+enum KvStore {
+    Cpu {
+        keys: Vec<f32>,
+        values: Vec<f32>,
+    },
+    Gpu {
+        k: Option<Tensor>,
+        v: Option<Tensor>,
+        len: usize,
+        cap: usize,
+    },
+}
+
 /// 한 시퀀스의 상태 (프롬프트를 넣고 한 토큰씩 이어 간다)
 pub struct State {
     /// GDN 층별: `[1, CONV_DIM, CONV_K - 1]` 인과 합성곱 상태
     conv: Vec<Option<Tensor>>,
     /// GDN 층별: `[1, LIN_HEADS, LIN_DIM, LIN_DIM]` 순환 상태
     ssm: Vec<Option<Tensor>>,
-    /// 전역 층별: 지금까지의 k, v (위치 x KV_HEADS x HEAD_DIM)
-    keys: Vec<Vec<f32>>,
-    values: Vec<Vec<f32>>,
+    /// 전역 층별 KV 캐시 (CPU: `Vec<f32>`, GPU: 사전할당 `[1, KV_HEADS, cap, HEAD_DIM]` + `slice_set`)
+    kv: Vec<KvStore>,
     pub pos: usize,
 }
 
@@ -144,14 +156,22 @@ pub struct Qwen35 {
     layers: Vec<Layer>,
     norm: Tensor,
     rope_inv: Vec<f32>,
+    rope_gpu: std::sync::Mutex<Option<(usize, Tensor, Tensor)>>,
     device: Device,
 }
 
 impl Qwen35 {
-    /// 모델 폴더를 연다. `bits`가 있으면 층의 선형층(어텐션·GDN 투영·MLP)만 양자화한다 (제어 텐서·정규화·헤드는 F32)
+    /// 모델 폴더를 연다 (`PD_DEVICE` 환경 변수로 장치를 고른다; 비어 있으면 CPU).
+    /// `bits`가 있으면 층의 선형층(어텐션·GDN 투영·MLP)만 양자화한다 (제어 텐서·정규화·헤드는 F32).
     pub fn load(dir: &Path, bits: Option<Bits>) -> Result<Self> {
+        let device = crate::utils::device_from_env()
+            .map_err(|e| candle_core::Error::Msg(format!("장치 선택: {e}")))?;
+        Self::load_on(dir, bits, device)
+    }
+
+    /// 지정한 `device` 에 Qwen3.5 모델을 연다.
+    pub fn load_on(dir: &Path, bits: Option<Bits>, device: Device) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILE)).map_err(|e| candle_core::Error::Msg(format!("토크나이저: {e}")))?;
-        let device = Device::Cpu;
         // 원본 파일, 없으면 앱이 텍스트 부분만 받아 조립한 파일 (model_fetch.rs)
         let weights = [WEIGHTS_FILE, crate::embeddinggemma::TEXT_WEIGHTS_FILE]
             .iter()
@@ -208,7 +228,15 @@ impl Qwen35 {
         let norm = one_plus(lm.pp("norm").get(HIDDEN, "weight")?)?;
         let half = ROTARY_DIM / 2;
         let inv: Vec<f32> = (0..half).map(|i| (1.0 / ROPE_THETA.powf((2 * i) as f64 / ROTARY_DIM as f64)) as f32).collect();
-        Ok(Self { tokenizer, tokens, layers, norm, rope_inv: inv, device })
+        Ok(Self {
+            tokenizer,
+            tokens,
+            layers,
+            norm,
+            rope_inv: inv,
+            rope_gpu: std::sync::Mutex::new(None),
+            device,
+        })
     }
 
     pub fn new_state(&self) -> State {
@@ -219,12 +247,29 @@ impl Qwen35 {
     pub fn new_state_with_capacity(&self, planned_tokens: usize) -> State {
         let gdn = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Linear(_))).count();
         let full = LAYERS - gdn;
-        let cap = planned_tokens.saturating_mul(KV_HEADS * HEAD_DIM);
+        let kv = if self.device.is_cpu() {
+            let cap = planned_tokens.saturating_mul(KV_HEADS * HEAD_DIM);
+            (0..full)
+                .map(|_| KvStore::Cpu {
+                    keys: Vec::with_capacity(cap),
+                    values: Vec::with_capacity(cap),
+                })
+                .collect()
+        } else {
+            let cap = planned_tokens.max(128);
+            (0..full)
+                .map(|_| KvStore::Gpu {
+                    k: None,
+                    v: None,
+                    len: 0,
+                    cap,
+                })
+                .collect()
+        };
         State {
             conv: vec![None; gdn],
             ssm: vec![None; gdn],
-            keys: (0..full).map(|_| Vec::with_capacity(cap)).collect(),
-            values: (0..full).map(|_| Vec::with_capacity(cap)).collect(),
+            kv,
             pos: 0,
         }
     }
@@ -247,14 +292,49 @@ impl Qwen35 {
 
     /// 새 토큰들을 넣고 마지막 위치의 은닉(정규화 후)을 돌려준다
     pub fn forward(&self, ids: &[u32], st: &mut State) -> Result<Tensor> {
-        let x = self.forward_hidden(ids, st)?;
+        let (x, pending) = self.forward_hidden(ids, st)?;
         let t = x.dim(0)?;
-        rms_norm_1p(&x.get(t - 1)?.unsqueeze(0)?, &self.norm)?.squeeze(0)
+        let last_x = x.get(t - 1)?.unsqueeze(0)?;
+        if let Some(delta) = pending {
+            let last_d = delta.get(t - 1)?.unsqueeze(0)?;
+            if !last_x.device().is_cpu()
+                && crate::utils::accel_op_ok(last_x.device(), crate::utils::AccelOp::DecoderOps)
+            {
+                if let Ok((_, normed)) = candle_core::decoder_ops::residual_rmsnorm_inplace(
+                    last_x.clone(),
+                    Some(&last_d),
+                    &self.norm,
+                    EPS as f32,
+                    false,
+                ) {
+                    return normed.squeeze(0);
+                }
+            }
+            return rms_norm_1p(&(last_x + last_d)?, &self.norm)?.squeeze(0);
+        }
+        rms_norm_1p(&last_x, &self.norm)?.squeeze(0)
     }
 
     /// 모든 위치의 은닉(정규화 후, t x HIDDEN). 교사 강제 NLL을 잴 때 쓴다
     pub fn forward_all(&self, ids: &[u32], st: &mut State) -> Result<Tensor> {
-        rms_norm_1p(&self.forward_hidden(ids, st)?, &self.norm)
+        let (x, pending) = self.forward_hidden(ids, st)?;
+        if let Some(delta) = pending {
+            if !x.device().is_cpu()
+                && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::DecoderOps)
+            {
+                if let Ok((_, normed)) = candle_core::decoder_ops::residual_rmsnorm_inplace(
+                    x.clone(),
+                    Some(&delta),
+                    &self.norm,
+                    EPS as f32,
+                    false,
+                ) {
+                    return Ok(normed);
+                }
+            }
+            return rms_norm_1p(&(x + delta)?, &self.norm);
+        }
+        rms_norm_1p(&x, &self.norm)
     }
 
     /// 전체 어휘 헤드로 잰 평균 음의 로그우도 (ids[1..]을 앞 토큰들로 예측)
@@ -269,12 +349,39 @@ impl Qwen35 {
         Ok(-picked.mean_all()?.to_scalar::<f32>()?)
     }
 
-    fn forward_hidden(&self, ids: &[u32], st: &mut State) -> Result<Tensor> {
+    fn forward_hidden(&self, ids: &[u32], st: &mut State) -> Result<(Tensor, Option<Tensor>)> {
         let t = ids.len();
         let mut x = self.tokens.rows(ids)?;
+        let fused_decoder = !x.device().is_cpu()
+            && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::DecoderOps);
+        let mut pending_down: Option<Tensor> = None;
         let (mut gi, mut fi) = (0, 0);
         for layer in &self.layers {
-            let h = rms_norm_1p(&x, &layer.input_norm)?;
+            let h = match pending_down.take() {
+                Some(delta) if fused_decoder => {
+                    match candle_core::decoder_ops::residual_rmsnorm_inplace(
+                        x.clone(),
+                        Some(&delta),
+                        &layer.input_norm,
+                        EPS as f32,
+                        false,
+                    ) {
+                        Ok((res, normed)) => {
+                            x = res;
+                            normed
+                        }
+                        Err(_) => {
+                            x = (x + delta)?;
+                            rms_norm_1p(&x, &layer.input_norm)?
+                        }
+                    }
+                }
+                Some(delta) => {
+                    x = (x + delta)?;
+                    rms_norm_1p(&x, &layer.input_norm)?
+                }
+                None => rms_norm_1p(&x, &layer.input_norm)?,
+            };
             let mixed = match &layer.mixer {
                 Mixer::Linear(g) => {
                     let out = self.gdn(g, &h, &mut st.conv[gi], &mut st.ssm[gi])?;
@@ -282,14 +389,12 @@ impl Qwen35 {
                     out
                 }
                 Mixer::Full(a) => {
-                    let out = self.attention(a, &h, st.pos, &mut st.keys[fi], &mut st.values[fi])?;
+                    let out = self.attention(a, &h, st.pos, &mut st.kv[fi])?;
                     fi += 1;
                     out
                 }
             };
-            let h = if !x.device().is_cpu()
-                && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::DecoderOps)
-            {
+            let h = if fused_decoder {
                 match candle_core::decoder_ops::residual_rmsnorm_inplace(
                     x.clone(),
                     Some(&mixed),
@@ -312,19 +417,21 @@ impl Qwen35 {
             };
             let gate = layer.gate.forward(&h)?;
             let up = layer.up.forward(&h)?;
-            let glu = if !gate.device().is_cpu()
-                && crate::utils::accel_op_ok(gate.device(), crate::utils::AccelOp::DecoderOps)
-            {
+            let glu = if fused_decoder {
                 candle_core::decoder_ops::silu_mul(&gate, &up)
                     .or_else(|_| &gate.silu()? * &up)?
             } else {
                 (&gate.silu()? * &up)?
             };
             let y = layer.down.forward(&glu)?;
-            x = (x + y)?;
+            if fused_decoder {
+                pending_down = Some(y);
+            } else {
+                x = (x + y)?;
+            }
         }
         st.pos += t;
-        Ok(x)
+        Ok((x, pending_down))
     }
 
     fn gdn(&self, g: &Gdn, h: &Tensor, conv: &mut Option<Tensor>, ssm: &mut Option<Tensor>) -> Result<Tensor> {
@@ -425,50 +532,175 @@ impl Qwen35 {
         (cos, sin)
     }
 
-    fn attention(&self, a: &Attn, h: &Tensor, pos0: usize, keys: &mut Vec<f32>, values: &mut Vec<f32>) -> Result<Tensor> {
+    fn gpu_rope_slice(&self, pos0: usize, t: usize) -> Result<(Tensor, Tensor)> {
+        let need = pos0 + t;
+        let mut guard = self.rope_gpu.lock().unwrap_or_else(|p| p.into_inner());
+        let needs_grow = match guard.as_ref() {
+            Some((cap, _, _)) => *cap < need,
+            None => true,
+        };
+        if needs_grow {
+            let new_cap = need.next_power_of_two().max(512);
+            let half = ROTARY_DIM / 2;
+            let (cos_v, sin_v) = self.rope_rows(0, new_cap);
+            let cos = Tensor::from_vec(cos_v, (new_cap, half), &self.device)?;
+            let sin = Tensor::from_vec(sin_v, (new_cap, half), &self.device)?;
+            *guard = Some((new_cap, cos, sin));
+        }
+        let (_, cos, sin) = guard.as_ref().expect("rope table initialized");
+        Ok((cos.narrow(0, pos0, t)?.contiguous()?, sin.narrow(0, pos0, t)?.contiguous()?))
+    }
+
+    fn apply_partial_rope_gpu(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let rot = x.narrow(D::Minus1, 0, ROTARY_DIM)?.contiguous()?;
+        let pass = x.narrow(D::Minus1, ROTARY_DIM, HEAD_DIM - ROTARY_DIM)?;
+        let rotated = if crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::Rope) {
+            candle_nn::rotary_emb::rope(&rot, cos, sin)
+                .or_else(|_| candle_nn::rotary_emb::rope_slow(&rot, cos, sin))?
+        } else {
+            candle_nn::rotary_emb::rope_slow(&rot, cos, sin)?
+        };
+        Tensor::cat(&[&rotated, &pass], D::Minus1)
+    }
+
+    fn attention(&self, a: &Attn, h: &Tensor, pos0: usize, kv: &mut KvStore) -> Result<Tensor> {
         let t = h.dim(0)?;
         let qg = a.q.forward(h)?.reshape((t, HEADS, 2 * HEAD_DIM))?;
-        let q = qg.narrow(D::Minus1, 0, HEAD_DIM)?;
+        let q_raw = qg.narrow(D::Minus1, 0, HEAD_DIM)?;
         let gate = qg.narrow(D::Minus1, HEAD_DIM, HEAD_DIM)?.reshape((t, HEADS * HEAD_DIM))?;
-        let q: Vec<f32> = rms_norm_1p(&q, &a.q_norm)?.flatten_all()?.to_vec1()?;
-        let k: Vec<f32> = rms_norm_1p(&a.k.forward(h)?.reshape((t, KV_HEADS, HEAD_DIM))?, &a.k_norm)?.flatten_all()?.to_vec1()?;
-        let v: Vec<f32> = a.v.forward(h)?.flatten_all()?.to_vec1()?;
-        let (cos, sin) = self.rope_rows(pos0, t);
-        let half = ROTARY_DIM / 2;
-        let rotate = |x: &mut [f32], i: usize| {
-            for j in 0..half {
-                let (c, s) = (cos[i * half + j], sin[i * half + j]);
-                let (x1, x2) = (x[j], x[j + half]);
-                x[j] = x1 * c - x2 * s;
-                x[j + half] = x2 * c + x1 * s;
+        match kv {
+            KvStore::Cpu { keys, values } => {
+                let q: Vec<f32> = rms_norm_1p(&q_raw, &a.q_norm)?.flatten_all()?.to_vec1()?;
+                let k: Vec<f32> = rms_norm_1p(&a.k.forward(h)?.reshape((t, KV_HEADS, HEAD_DIM))?, &a.k_norm)?.flatten_all()?.to_vec1()?;
+                let v: Vec<f32> = a.v.forward(h)?.flatten_all()?.to_vec1()?;
+                let (cos, sin) = self.rope_rows(pos0, t);
+                let half = ROTARY_DIM / 2;
+                let rotate = |x: &mut [f32], i: usize| {
+                    for j in 0..half {
+                        let (c, s) = (cos[i * half + j], sin[i * half + j]);
+                        let (x1, x2) = (x[j], x[j + half]);
+                        x[j] = x1 * c - x2 * s;
+                        x[j + half] = x2 * c + x1 * s;
+                    }
+                };
+                let mut q = q;
+                let mut k = k;
+                for i in 0..t {
+                    for hd in 0..HEADS {
+                        rotate(&mut q[(i * HEADS + hd) * HEAD_DIM..(i * HEADS + hd + 1) * HEAD_DIM], i);
+                    }
+                    for hd in 0..KV_HEADS {
+                        rotate(&mut k[(i * KV_HEADS + hd) * HEAD_DIM..(i * KV_HEADS + hd + 1) * HEAD_DIM], i);
+                    }
+                }
+                keys.extend_from_slice(&k);
+                values.extend_from_slice(&v);
+                let n = keys.len() / (KV_HEADS * HEAD_DIM);
+                let mut out = vec![0f32; t * HEADS * HEAD_DIM];
+                let cfg = premium_discount_cpu_kernels::CpuStreamAttnCfg {
+                    num_heads: HEADS,
+                    num_kv_heads: KV_HEADS,
+                    head_dim: HEAD_DIM,
+                    scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                    causal: true,
+                    past_offset: pos0,
+                };
+                premium_discount_cpu_kernels::stream_attention_f32(&q, keys, values, t, n, &cfg, &mut out);
+                let out = Tensor::from_vec(out, (t, HEADS * HEAD_DIM), &self.device)?;
+                let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
+                a.o.forward(&out)
             }
-        };
-        let mut q = q;
-        let mut k = k;
-        for i in 0..t {
-            for hd in 0..HEADS {
-                rotate(&mut q[(i * HEADS + hd) * HEAD_DIM..(i * HEADS + hd + 1) * HEAD_DIM], i);
-            }
-            for hd in 0..KV_HEADS {
-                rotate(&mut k[(i * KV_HEADS + hd) * HEAD_DIM..(i * KV_HEADS + hd + 1) * HEAD_DIM], i);
+            KvStore::Gpu { k: k_buf, v: v_buf, len, cap } => {
+                let q = rms_norm_1p(&q_raw, &a.q_norm)?
+                    .transpose(0, 1)?
+                    .unsqueeze(0)?
+                    .contiguous()?;
+                let k = rms_norm_1p(&a.k.forward(h)?.reshape((t, KV_HEADS, HEAD_DIM))?, &a.k_norm)?
+                    .transpose(0, 1)?
+                    .unsqueeze(0)?
+                    .contiguous()?;
+                let v = a.v.forward(h)?
+                    .reshape((t, KV_HEADS, HEAD_DIM))?
+                    .transpose(0, 1)?
+                    .unsqueeze(0)?
+                    .contiguous()?;
+                let (cos, sin) = self.gpu_rope_slice(pos0, t)?;
+                let q = Self::apply_partial_rope_gpu(&q, &cos, &sin)?.contiguous()?;
+                let k = Self::apply_partial_rope_gpu(&k, &cos, &sin)?.contiguous()?;
+
+                let new_len = *len + t;
+                if k_buf.is_none() || new_len > *cap {
+                    let next_cap = (*cap).max(new_len).next_power_of_two().max(128);
+                    let nk = Tensor::zeros((1, KV_HEADS, next_cap, HEAD_DIM), k.dtype(), &self.device)?;
+                    let nv = Tensor::zeros((1, KV_HEADS, next_cap, HEAD_DIM), v.dtype(), &self.device)?;
+                    if *len > 0 {
+                        if let (Some(ok), Some(ov)) = (k_buf.as_ref(), v_buf.as_ref()) {
+                            nk.slice_set(&ok.narrow(2, 0, *len)?.contiguous()?, 2, 0)?;
+                            nv.slice_set(&ov.narrow(2, 0, *len)?.contiguous()?, 2, 0)?;
+                        }
+                    }
+                    *k_buf = Some(nk);
+                    *v_buf = Some(nv);
+                    *cap = next_cap;
+                }
+                let kb = k_buf.as_ref().expect("k_buf initialized");
+                let vb = v_buf.as_ref().expect("v_buf initialized");
+                kb.slice_set(&k, 2, *len)?;
+                vb.slice_set(&v, 2, *len)?;
+                *len = new_len;
+
+                let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+                let attended = if crate::utils::accel_op_ok(&self.device, crate::utils::AccelOp::FlashAttn) {
+                    let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale).causal();
+                    let blocks = [candle_nn::flash_attn::KvBlockRef { k: kb, v: vb, rows: new_len }];
+                    match candle_nn::flash_attn::flash_attn_blocks(&q, &blocks, &cfg) {
+                        Ok(o) => o,
+                        Err(_) => Self::attention_gpu_unfused(&q, kb, vb, new_len, pos0, scale)?,
+                    }
+                } else {
+                    Self::attention_gpu_unfused(&q, kb, vb, new_len, pos0, scale)?
+                };
+                let out = attended
+                    .squeeze(0)?
+                    .transpose(0, 1)?
+                    .contiguous()?
+                    .reshape((t, HEADS * HEAD_DIM))?;
+                let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
+                a.o.forward(&out)
             }
         }
-        keys.extend_from_slice(&k);
-        values.extend_from_slice(&v);
-        let n = keys.len() / (KV_HEADS * HEAD_DIM);
-        let mut out = vec![0f32; t * HEADS * HEAD_DIM];
-        let cfg = premium_discount_cpu_kernels::CpuStreamAttnCfg {
-            num_heads: HEADS,
-            num_kv_heads: KV_HEADS,
-            head_dim: HEAD_DIM,
-            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
-            causal: true,
-            past_offset: pos0,
-        };
-        premium_discount_cpu_kernels::stream_attention_f32(&q, keys, values, t, n, &cfg, &mut out);
-        let out = Tensor::from_vec(out, (t, HEADS * HEAD_DIM), &self.device)?;
-        let out = (out * candle_nn::ops::sigmoid(&gate)?)?;
-        a.o.forward(&out)
+    }
+
+    fn attention_gpu_unfused(
+        q: &Tensor,
+        kb: &Tensor,
+        vb: &Tensor,
+        kv_len: usize,
+        pos0: usize,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let sq = q.dim(2)?;
+        let reps = HEADS / KV_HEADS;
+        let k = kb
+            .narrow(2, 0, kv_len)?
+            .unsqueeze(2)?
+            .expand((1, KV_HEADS, reps, kv_len, HEAD_DIM))?
+            .contiguous()?
+            .reshape((1, HEADS, kv_len, HEAD_DIM))?;
+        let v = vb
+            .narrow(2, 0, kv_len)?
+            .unsqueeze(2)?
+            .expand((1, KV_HEADS, reps, kv_len, HEAD_DIM))?
+            .contiguous()?
+            .reshape((1, HEADS, kv_len, HEAD_DIM))?;
+        let mut scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+        if sq > 1 {
+            let mask: Vec<f32> = (0..sq)
+                .flat_map(|i| (0..kv_len).map(move |j| if j > pos0 + i { f32::NEG_INFINITY } else { 0.0 }))
+                .collect();
+            scores = scores.broadcast_add(&Tensor::from_vec(mask, (1, 1, sq, kv_len), q.device())?)?;
+        }
+        candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)
     }
 
     /// 마지막 은닉 → 다음 토큰 (그리디). 잘라 낸 헤드면 그 안에서 고른다.
@@ -476,6 +708,11 @@ impl Qwen35 {
     /// - `allow = None` on GPU uses Pack A/C fused tile argmax (`fused_linear_argmax_cs`) with 0-byte logits materialization.
     pub fn next_token(&self, h: &Tensor, head: &Head, allow: Option<&[u32]>) -> Result<(u32, f32)> {
         self.next_token_inner(h, head, allow, true)
+    }
+
+    /// 최대 로짓 값이 필요 없을 때 쓰는 그리디 선택 (GPU에서 `max_vals` 2차 D2H 동기화를 생략한다).
+    pub fn next_token_id(&self, h: &Tensor, head: &Head, allow: Option<&[u32]>) -> Result<u32> {
+        Ok(self.next_token_inner(h, head, allow, false)?.0)
     }
 
     fn next_token_inner(&self, h: &Tensor, head: &Head, allow: Option<&[u32]>, need_val: bool) -> Result<(u32, f32)> {
@@ -705,4 +942,142 @@ pub fn plan_vocab(tokenizer: &Tokenizer, corpus: &[&str], size: usize) -> std::r
     let mut fill: Vec<u32> = vocab.values().copied().filter(|id| !keep.contains(id)).collect();
     fill.sort_unstable();
     Ok(VocabPlan { required: keep.into_iter().collect(), fill, size })
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests {
+    use super::*;
+
+    fn det(len: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        (0..len)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u32 << 24) as f32) * 0.4 - 0.2
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cuda_partial_rope_and_preallocated_flash_kv_match_cpu() -> Result<()> {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let half = ROTARY_DIM / 2;
+        let rope_inv: Vec<f32> = (0..half)
+            .map(|i| (1.0 / ROPE_THETA.powf((2 * i) as f64 / ROTARY_DIM as f64)) as f32)
+            .collect();
+        let make_rope = |pos0: usize, t: usize| -> (Vec<f32>, Vec<f32>) {
+            let mut c = vec![0f32; t * half];
+            let mut s = vec![0f32; t * half];
+            for i in 0..t {
+                for (j, &f) in rope_inv.iter().enumerate() {
+                    let (sv, cv) = ((pos0 + i) as f32 * f).sin_cos();
+                    c[i * half + j] = cv;
+                    s[i * half + j] = sv;
+                }
+            }
+            (c, s)
+        };
+        // Prefill 10 tokens then decode 4 tokens (forcing cap growth from 12 -> 16+)
+        let steps = [10usize, 1, 1, 1, 1];
+        let mut cpu_k = Vec::<f32>::new();
+        let mut cpu_v = Vec::<f32>::new();
+        let mut gpu_k: Option<Tensor> = None;
+        let mut gpu_v: Option<Tensor> = None;
+        let mut gpu_len = 0usize;
+        let mut gpu_cap = 12usize;
+        let mut pos = 0usize;
+        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+
+        for (step_idx, &t) in steps.iter().enumerate() {
+            let q_raw = det(t * HEADS * HEAD_DIM, 100 + step_idx as u64 * 3);
+            let k_raw = det(t * KV_HEADS * HEAD_DIM, 101 + step_idx as u64 * 3);
+            let v_raw = det(t * KV_HEADS * HEAD_DIM, 102 + step_idx as u64 * 3);
+            let (cos_v, sin_v) = make_rope(pos, t);
+
+            // CPU reference
+            let mut q_c = q_raw.clone();
+            let mut k_c = k_raw.clone();
+            for i in 0..t {
+                for hd in 0..HEADS {
+                    let sl = &mut q_c[(i * HEADS + hd) * HEAD_DIM..(i * HEADS + hd + 1) * HEAD_DIM];
+                    for j in 0..half {
+                        let (c, s) = (cos_v[i * half + j], sin_v[i * half + j]);
+                        let (x1, x2) = (sl[j], sl[j + half]);
+                        sl[j] = x1 * c - x2 * s;
+                        sl[j + half] = x2 * c + x1 * s;
+                    }
+                }
+                for hd in 0..KV_HEADS {
+                    let sl = &mut k_c[(i * KV_HEADS + hd) * HEAD_DIM..(i * KV_HEADS + hd + 1) * HEAD_DIM];
+                    for j in 0..half {
+                        let (c, s) = (cos_v[i * half + j], sin_v[i * half + j]);
+                        let (x1, x2) = (sl[j], sl[j + half]);
+                        sl[j] = x1 * c - x2 * s;
+                        sl[j + half] = x2 * c + x1 * s;
+                    }
+                }
+            }
+            cpu_k.extend_from_slice(&k_c);
+            cpu_v.extend_from_slice(&v_raw);
+            let mut out_cpu = vec![0f32; t * HEADS * HEAD_DIM];
+            let cfg = premium_discount_cpu_kernels::CpuStreamAttnCfg {
+                num_heads: HEADS,
+                num_kv_heads: KV_HEADS,
+                head_dim: HEAD_DIM,
+                scale,
+                causal: true,
+                past_offset: pos,
+            };
+            premium_discount_cpu_kernels::stream_attention_f32(&q_c, &cpu_k, &cpu_v, t, pos + t, &cfg, &mut out_cpu);
+
+            // GPU preallocated KV + fused partial RoPE + flash_attn_blocks
+            let q_g = Tensor::from_vec(q_raw, (t, HEADS, HEAD_DIM), &dev)?.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+            let k_g = Tensor::from_vec(k_raw, (t, KV_HEADS, HEAD_DIM), &dev)?.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+            let v_g = Tensor::from_vec(v_raw, (t, KV_HEADS, HEAD_DIM), &dev)?.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+            let cos_g = Tensor::from_vec(cos_v, (t, half), &dev)?;
+            let sin_g = Tensor::from_vec(sin_v, (t, half), &dev)?;
+            let q_g = Qwen35::apply_partial_rope_gpu(&q_g, &cos_g, &sin_g)?.contiguous()?;
+            let k_g = Qwen35::apply_partial_rope_gpu(&k_g, &cos_g, &sin_g)?.contiguous()?;
+            let new_len = gpu_len + t;
+            if gpu_k.is_none() || new_len > gpu_cap {
+                let next_cap = gpu_cap.max(new_len).next_power_of_two().max(16);
+                let nk = Tensor::zeros((1, KV_HEADS, next_cap, HEAD_DIM), DType::F32, &dev)?;
+                let nv = Tensor::zeros((1, KV_HEADS, next_cap, HEAD_DIM), DType::F32, &dev)?;
+                if gpu_len > 0 {
+                    nk.slice_set(&gpu_k.as_ref().unwrap().narrow(2, 0, gpu_len)?.contiguous()?, 2, 0)?;
+                    nv.slice_set(&gpu_v.as_ref().unwrap().narrow(2, 0, gpu_len)?.contiguous()?, 2, 0)?;
+                }
+                gpu_k = Some(nk);
+                gpu_v = Some(nv);
+                gpu_cap = next_cap;
+            }
+            let kb = gpu_k.as_ref().unwrap();
+            let vb = gpu_v.as_ref().unwrap();
+            kb.slice_set(&k_g, 2, gpu_len)?;
+            vb.slice_set(&v_g, 2, gpu_len)?;
+            gpu_len = new_len;
+            let fcfg = candle_nn::flash_attn::FlashAttnConfig::new(scale).causal();
+            let blks = [candle_nn::flash_attn::KvBlockRef { k: kb, v: vb, rows: gpu_len }];
+            let out_gpu: Vec<f32> = candle_nn::flash_attn::flash_attn_blocks(&q_g, &blks, &fcfg)?
+                .squeeze(0)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .flatten_all()?
+                .to_device(&Device::Cpu)?
+                .to_vec1()?;
+            let max_diff = out_cpu
+                .iter()
+                .zip(&out_gpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-4, "step {step_idx} (pos={pos}, t={t}): max diff {max_diff}");
+            pos += t;
+        }
+        let _ = crate::utils::release_gpu(&dev);
+        Ok(())
+    }
 }

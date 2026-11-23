@@ -154,16 +154,19 @@ fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Te
     }
 }
 
-/// (t, HEAD_DIM) cos, sin (rotate_half 방식: 앞 절반과 뒤 절반이 같은 주파수)
-fn rope(t: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
+/// (t, HEAD_DIM) full cos/sin + (t, HEAD_DIM / 2) half cos/sin (rotate_half 방식)
+fn rope(t: usize, dev: &Device) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
     let half = HEAD_DIM / 2;
     let inv_freq: Vec<f64> = (0..half)
         .map(|i| 1.0 / ROPE_THETA.powf((2 * i) as f64 / HEAD_DIM as f64))
         .collect();
     let mut cos = vec![0f32; t * HEAD_DIM];
     let mut sin = vec![0f32; t * HEAD_DIM];
+    let mut cos_h = vec![0f32; t * half];
+    let mut sin_h = vec![0f32; t * half];
     for p in 0..t {
         let base = p * HEAD_DIM;
+        let hbase = p * half;
         let pf = p as f64;
         for (i, &inv) in inv_freq.iter().enumerate() {
             let (s, c) = (pf * inv).sin_cos();
@@ -172,13 +175,31 @@ fn rope(t: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
             cos[base + i + half] = c;
             sin[base + i] = s;
             sin[base + i + half] = s;
+            cos_h[hbase + i] = c;
+            sin_h[hbase + i] = s;
         }
     }
-    Ok((Tensor::from_vec(cos, (t, HEAD_DIM), dev)?, Tensor::from_vec(sin, (t, HEAD_DIM), dev)?))
+    Ok((
+        Tensor::from_vec(cos, (t, HEAD_DIM), dev)?,
+        Tensor::from_vec(sin, (t, HEAD_DIM), dev)?,
+        Tensor::from_vec(cos_h, (t, half), dev)?,
+        Tensor::from_vec(sin_h, (t, half), dev)?,
+    ))
 }
 
 /// x: (heads, t, HEAD_DIM)
-fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+fn apply_rope(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    cos_half: &Tensor,
+    sin_half: &Tensor,
+) -> Result<Tensor> {
+    if !x.device().is_cpu() && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::Rope) {
+        if let Ok(y) = candle_nn::rotary_emb::rope(&x.unsqueeze(0)?.contiguous()?, cos_half, sin_half) {
+            return y.squeeze(0);
+        }
+    }
     let half = HEAD_DIM / 2;
     let x1 = x.narrow(D::Minus1, 0, half)?;
     let x2 = x.narrow(D::Minus1, half, half)?;
@@ -257,22 +278,31 @@ struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    fn forward(&self, h: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(
+        &self,
+        h: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cos_half: &Tensor,
+        sin_half: &Tensor,
+        mask: Option<&Tensor>,
+        zero_bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let t = h.dim(0)?;
         let x = match &self.attn_norm {
-            Some(w) => layer_norm(h, w, None, NORM_EPS)?,
+            Some(w) => layer_norm(h, w, zero_bias, NORM_EPS)?,
             None => h.clone(),
         };
         // Wqkv 출력은 [3][헤드][64] 순서
         let qkv = self.wqkv.forward(&x)?.reshape((t, 3, HEADS, HEAD_DIM))?;
         let part = |i: usize| -> Result<Tensor> { qkv.i((.., i, .., ..))?.transpose(0, 1)?.contiguous() };
         let (q, k, v) = (part(0)?, part(1)?, part(2)?);
-        let q = apply_rope(&q, cos, sin)?;
-        let k = apply_rope(&k, cos, sin)?;
+        let q = apply_rope(&q, cos, sin, cos_half, sin_half)?;
+        let k = apply_rope(&k, cos, sin, cos_half, sin_half)?;
         let out = attention(&q, &k, &v, if self.global { None } else { mask })?;
         let out = out.transpose(0, 1)?.contiguous()?.reshape((t, HIDDEN))?;
         let h = (h + self.wo.forward(&out)?)?;
-        let x = layer_norm(&h, &self.mlp_norm, None, NORM_EPS)?;
+        let x = layer_norm(&h, &self.mlp_norm, zero_bias, NORM_EPS)?;
         let y = self.wi.forward(&x)?;
         let input = y.narrow(D::Minus1, 0, MLP_DIM)?;
         let gate = y.narrow(D::Minus1, MLP_DIM, MLP_DIM)?;
@@ -348,17 +378,26 @@ pub struct LayaModel {
     scorer1: (Tensor, Tensor),
     scorer2: (Tensor, Tensor),
     temperature: [f32; 3],
+    /// GPU에서 편향 없는 LayerNorm을 단일 융합 커널로 실행하기 위한 0 편향 텐서 (`CPU`에서는 None)
+    zero_bias: Option<Tensor>,
     device: Device,
-    seq_cache: Mutex<HashMap<usize, (Tensor, Tensor, Option<Tensor>)>>,
+    seq_cache: Mutex<HashMap<usize, (Tensor, Tensor, Tensor, Tensor, Option<Tensor>)>>,
 }
 
 impl LayaModel {
-    /// 모델 폴더(model.safetensors, tokenizer/tokenizer.json)를 연다. `bits`가 있으면 인코더 선형층만 그 비트로 양자화한다.
+    /// 모델 폴더(model.safetensors, tokenizer/tokenizer.json)를 연다 (`PD_DEVICE`로 장치 선택; 기본 CPU).
+    /// `bits`가 있으면 인코더 선형층만 그 비트로 양자화한다.
     pub fn load(dir: &Path, bits: Option<Bits>) -> std::result::Result<Self, AppError> {
+        let device = crate::utils::device_from_env()
+            .map_err(|e| AppError::Filter(format!("laya 장치 선택 실패: {e}")))?;
+        Self::load_on(dir, bits, device)
+    }
+
+    /// 지정한 `device` 에 laya 모델을 연다.
+    pub fn load_on(dir: &Path, bits: Option<Bits>, device: Device) -> std::result::Result<Self, AppError> {
         let err = |what: &'static str| move |e: candle_core::Error| AppError::Filter(format!("laya {what}: {e}"));
         let tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILE))
             .map_err(|e| AppError::Filter(format!("laya 토크나이저 로드 실패: {e}")))?;
-        let device = Device::Cpu;
         let weights = dir.join(WEIGHTS_FILE);
         if !weights.is_file() {
             return Err(AppError::Filter(format!("laya 가중치가 없습니다: {}", weights.display())));
@@ -391,6 +430,11 @@ impl LayaModel {
             .map_err(err("결정 헤드"))?;
         let s = vb.pp("scorer");
         let temperature: Vec<f32> = vb.get(3, "temperature").and_then(|t| t.to_vec1()).map_err(err("temperature"))?;
+        let zero_bias = if device.is_cpu() {
+            None
+        } else {
+            Some(Tensor::zeros(HIDDEN, DType::F32, &device).map_err(err("zero_bias"))?)
+        };
         Ok(Self {
             tokenizer,
             tokens,
@@ -409,6 +453,7 @@ impl LayaModel {
                 s.pp("3").get(1, "bias").map_err(err("scorer"))?,
             ),
             temperature: [temperature[0], temperature[1], temperature[2]],
+            zero_bias,
             device,
             seq_cache: Mutex::new(HashMap::new()),
         })
@@ -461,29 +506,30 @@ impl LayaModel {
         Ok((ids, markers))
     }
 
-    fn seq_tables(&self, t: usize) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+    fn seq_tables(&self, t: usize) -> Result<(Tensor, Tensor, Tensor, Tensor, Option<Tensor>)> {
         if let Some(entry) = self.seq_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&t) {
             return Ok(entry.clone());
         }
-        let (cos, sin) = rope(t, &self.device)?;
+        let (cos, sin, cos_h, sin_h) = rope(t, &self.device)?;
         let mask = window_mask(t, &self.device)?;
         let mut cache = self.seq_cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= 64 {
             cache.clear();
         }
-        cache.insert(t, (cos.clone(), sin.clone(), mask.clone()));
-        Ok((cos, sin, mask))
+        cache.insert(t, (cos.clone(), sin.clone(), cos_h.clone(), sin_h.clone(), mask.clone()));
+        Ok((cos, sin, cos_h, sin_h, mask))
     }
 
     /// 인코더 마지막 은닉 상태 (t, 768). 시험에서 참조와 중간값을 비교할 때 쓴다
     pub fn encoder_hidden(&self, ids: &[u32]) -> Result<Tensor> {
         let t = ids.len();
-        let mut h = layer_norm(&self.tokens.rows(ids)?, &self.emb_norm, None, NORM_EPS)?;
-        let (cos, sin, mask) = self.seq_tables(t)?;
+        let zb = self.zero_bias.as_ref();
+        let mut h = layer_norm(&self.tokens.rows(ids)?, &self.emb_norm, zb, NORM_EPS)?;
+        let (cos, sin, cos_h, sin_h, mask) = self.seq_tables(t)?;
         for layer in &self.layers {
-            h = layer.forward(&h, &cos, &sin, mask.as_ref())?;
+            h = layer.forward(&h, &cos, &sin, &cos_h, &sin_h, mask.as_ref(), zb)?;
         }
-        layer_norm(&h, &self.final_norm, None, NORM_EPS)
+        layer_norm(&h, &self.final_norm, zb, NORM_EPS)
     }
 
     /// 선택지마다의 원시 로짓 (온도 적용 전)

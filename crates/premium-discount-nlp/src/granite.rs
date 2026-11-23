@@ -208,18 +208,28 @@ pub fn set_glu_kernel(kernel: GluKernel) -> bool {
 }
 
 /// `silu(x[.., :I]) * x[.., I:]` with candle ops (gate and up copied out first).
+/// On CUDA / ROCm uses the single fused `silu_mul` kernel.
 pub fn silu_glu(x: &Tensor) -> candle_core::Result<Tensor> {
     let i = x.dim(D::Minus1)? / 2;
     let gate = x.narrow(D::Minus1, 0, i)?.contiguous()?;
     let up = x.narrow(D::Minus1, i, i)?.contiguous()?;
+    if x.device().is_cuda() || x.device().is_rocm() {
+        if let Ok(y) = candle_core::decoder_ops::silu_mul(&gate, &up) {
+            return Ok(y);
+        }
+    }
     (candle_nn::ops::silu(&gate)? * up)?.contiguous()
 }
 
-/// Softmax over the last axis. CPU F32 uses candle's fused `softmax_last_dim` (the same max · exp · sum · divide order
-/// as the composed ops, so the same bits, and much faster on long inputs); other devices keep the composed ops.
+/// Softmax over the last axis. CPU F32 and CUDA / ROCm use candle's fused `softmax_last_dim` (F32 internal
+/// accumulation on GPU avoids BF16 intermediate rounding and saves 4 kernel launches); other devices keep the
+/// composed ops.
 fn softmax_last(x: &Tensor) -> candle_core::Result<Tensor> {
     if x.device().is_cpu() && x.dtype() == DType::F32 && x.is_contiguous() {
         candle_nn::ops::softmax_last_dim(x)
+    } else if x.device().is_cuda() || x.device().is_rocm() {
+        let xc = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        candle_nn::ops::softmax_last_dim(&xc)
     } else {
         candle_nn::ops::softmax(x, D::Minus1)
     }
@@ -289,12 +299,16 @@ impl Rope {
         })
     }
 
-    /// `[1, 1, len, head_dim]` (cos, sin), zero-copy slice of the prebuilt table.
+    /// `[1, 1, len, head_dim]` (cos, sin) and `[len, head_dim / 2]` half-tables, zero-copy slices of the prebuilt table.
     fn cos_sin(&self, len: usize) -> candle_core::Result<(Tensor, Tensor)> {
         Ok((
             self.cos_full.narrow(2, 0, len)?,
             self.sin_full.narrow(2, 0, len)?,
         ))
+    }
+
+    fn cos_sin_half(&self, len: usize) -> candle_core::Result<(Tensor, Tensor)> {
+        Ok((self.cos.narrow(0, 0, len)?, self.sin.narrow(0, 0, len)?))
     }
 
     /// `x · cos + rotate_half(x) · sin`, in the tables' dtype (F32), back to `x`'s dtype.
@@ -307,6 +321,32 @@ impl Rope {
         let x2 = x.narrow(D::Minus1, half, half)?.contiguous()?;
         let rotated = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
         x.contiguous()?.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?
+    }
+
+    /// Uses fused `candle_nn::rotary_emb::rope` on CUDA / ROCm (single kernel in F32), falling back to [`Self::apply`].
+    fn apply_fast(
+        x: &Tensor,
+        cos_half: &Tensor,
+        sin_half: &Tensor,
+        cos_full: &Tensor,
+        sin_full: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        if x.device().is_cuda() || x.device().is_rocm() {
+            let orig_dtype = x.dtype();
+            let xf = if orig_dtype != cos_half.dtype() {
+                x.to_dtype(cos_half.dtype())?.contiguous()?
+            } else {
+                x.contiguous()?
+            };
+            if let Ok(y) = candle_nn::rotary_emb::rope(&xf, &cos_half.contiguous()?, &sin_half.contiguous()?) {
+                return if orig_dtype != y.dtype() {
+                    y.to_dtype(orig_dtype)
+                } else {
+                    Ok(y)
+                };
+            }
+        }
+        Self::apply(x, cos_full, sin_full)
     }
 }
 
@@ -341,15 +381,37 @@ impl Attention {
     }
 
     /// `x` is `[batch, len, hidden]`; `mask` is additive and broadcasts to `[batch, heads, len, len]`.
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        cos_half: &Tensor,
+        sin_half: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> candle_core::Result<Tensor> {
         let (b, len, _) = x.dims3()?;
         // [b, len, 3H] seen as [b, len, 3, heads, hd] (no copy); q / k / v each copied once to [b, heads, len, hd]
         let qkv = self.wqkv.forward(x)?.reshape((b, len, 3, self.heads, self.head_dim))?;
         let part = |i: usize| -> candle_core::Result<Tensor> { qkv.narrow(2, i, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous() };
         let (q, k, v) = (part(0)?, part(1)?, part(2)?);
-        let q = Rope::apply(&q, cos, sin)?.contiguous()?;
-        let k = Rope::apply(&k, cos, sin)?.transpose(2, 3)?.contiguous()?;
-        let scores = (q.matmul(&k)? / (self.head_dim as f64).sqrt())?;
+        let q = Rope::apply_fast(&q, cos_half, sin_half, cos, sin)?.contiguous()?;
+        let k = Rope::apply_fast(&k, cos_half, sin_half, cos, sin)?.contiguous()?;
+        if mask.is_none()
+            && self.head_dim <= 256
+            && (q.device().is_cuda() || q.device().is_rocm())
+        {
+            let cfg = candle_nn::flash_attn::FlashAttnConfig::new(1.0 / (self.head_dim as f32).sqrt());
+            if let Ok(out) = candle_nn::flash_attn::flash_attn_bhsd(&q, &k, &v, &cfg) {
+                let y = out
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, len, self.heads * self.head_dim))?;
+                return self.wo.forward(&y);
+            }
+        }
+        let kt = k.transpose(2, 3)?.contiguous()?;
+        let scores = (q.matmul(&kt)? / (self.head_dim as f64).sqrt())?;
         let scores = match mask {
             Some(m) => scores.broadcast_add(m)?,
             None => scores,
@@ -489,23 +551,25 @@ impl Encoder {
         let x = self.tok_embeddings.forward(ids)?.reshape((batch, len, ()))?;
         let mut x = self.embeddings_norm.forward(&x)?;
         let (cg, sg) = self.global_rope.cos_sin(len)?;
+        let (cgh, sgh) = self.global_rope.cos_sin_half(len)?;
         let (cl, sl) = self.local_rope.cos_sin(len)?;
+        let (clh, slh) = self.local_rope.cos_sin_half(len)?;
         let local_mask = match (mask, self.cached_window_mask(len, x.device(), x.dtype())?) {
             (Some(m), Some(w)) => Some(m.broadcast_add(&w)?),
             (None, w) => w,
             (m, None) => m.cloned(),
         };
         for layer in &self.layers {
-            let (c, s, m) = if layer.global {
-                (&cg, &sg, mask)
+            let (ch, sh, c, s, m) = if layer.global {
+                (&cgh, &sgh, &cg, &sg, mask)
             } else {
-                (&cl, &sl, local_mask.as_ref())
+                (&clh, &slh, &cl, &sl, local_mask.as_ref())
             };
             let h = match &layer.attn_norm {
                 Some(norm) => norm.forward(&x)?,
                 None => x.clone(),
             };
-            x = (&x + layer.attn.forward(&h, c, s, m)?)?;
+            x = (&x + layer.attn.forward(&h, ch, sh, c, s, m)?)?;
             x = (&x + layer.mlp.forward(&layer.mlp_norm.forward(&x)?)?)?;
         }
         self.final_norm.forward(&x)
@@ -655,35 +719,40 @@ impl Granite {
             None
         };
         let hidden = self.encoder.forward_batch(&ids, b, len, pad_mask.as_ref())?;
-        (0..b).map(|r| cls_vector(&hidden, r)).collect()
+        // Single batched D2H transfer for all [b, hidden] CLS vectors in F32 (avoids b GPU syncs and BF16 norm drift).
+        let cls_rows: Vec<Vec<f32>> = hidden
+            .narrow(1, 0, 1)?
+            .squeeze(1)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .to_vec2()?;
+        Ok(cls_rows.iter().map(|row| renormalize(&[row.as_slice()])).collect())
     }
 }
 
-/// The normalised [CLS] vector of row `row` of `hidden` (`[batch, len, hidden]`), with logis-center's arithmetic so
-/// both apps give the same bits for a text: on the device `v / ‖v‖` (‖v‖ = `sqrt(sum(v²))`), then on the host the
-/// F32 vector is normalised once more (a vector shorter than 1e-6 is left as it is).
+/// The normalised [CLS] vector of row `row` of `hidden` (`[batch, len, hidden]`), always accumulating its L2 norm
+/// in F32/F64 even when `hidden` is BF16/F16 on GPU (`PRC-09`). A vector shorter than 1e-6 is left as it is.
 pub fn cls_vector(hidden: &Tensor, row: usize) -> Result<Vec<f32>> {
-    let cls = hidden.narrow(0, row, 1)?.narrow(1, 0, 1)?;
-    let mean = (cls.sum(1)? / 1.0)?;
-    let norm = mean.sqr()?.sum_all()?.sqrt()?;
-    let v: Vec<f32> = mean
-        .broadcast_div(&norm)?
+    let cls = hidden
+        .narrow(0, row, 1)?
+        .narrow(1, 0, 1)?
+        .to_dtype(DType::F32)?;
+    let v: Vec<f32> = cls
         .to_device(&Device::Cpu)?
-        .to_dtype(DType::F32)?
         .flatten_all()?
         .to_vec1()?;
     Ok(renormalize(&[v.as_slice()]))
 }
 
-/// Mean of `parts`, L2-normalised in F32 (logis-center's way of joining the pieces of a long text; one part is just
+/// Mean of `parts`, L2-normalised in F64/F32 (logis-center's way of joining the pieces of a long text; one part is just
 /// renormalised). A result shorter than 1e-6 is left unnormalised.
 pub fn renormalize(parts: &[&[f32]]) -> Vec<f32> {
     let dim = parts.first().map_or(0, |p| p.len());
-    let mut acc = vec![0.0f32; dim];
-    let mut count = 0.0f32;
+    let mut acc = vec![0.0f64; dim];
+    let mut count = 0.0f64;
     for p in parts {
-        for (a, x) in acc.iter_mut().zip(p.iter()) {
-            *a += x;
+        for (a, &x) in acc.iter_mut().zip(p.iter()) {
+            *a += x as f64;
         }
         count += 1.0;
     }
@@ -691,14 +760,14 @@ pub fn renormalize(parts: &[&[f32]]) -> Vec<f32> {
         for a in acc.iter_mut() {
             *a /= count;
         }
-        let norm = acc.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let norm = acc.iter().map(|&v| v * v).sum::<f64>().sqrt();
         if norm > 1e-6 {
             for a in acc.iter_mut() {
                 *a /= norm;
             }
         }
     }
-    acc
+    acc.into_iter().map(|v| v as f32).collect()
 }
 
 /// Splits row indices into forward passes: rows sorted by length (stable), neighbours packed while
@@ -825,5 +894,47 @@ mod tests {
         let enc = cfg.encoder_config().unwrap();
         assert_eq!((enc.activation, enc.global_attn_every_n_layers, enc.local_window_half), (Activation::Silu, 3, 64));
         assert_eq!((enc.global_rope_theta, enc.local_rope_theta, enc.max_positions), (150_000.0, 160_000.0, MAX_TOKENS));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_rope_softmax_glu_and_bf16_cls_norm_match_cpu() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        // Fused RoPE parity (F32 & BF16)
+        let rope_cpu = Rope::new(32, 64, 160_000.0, &Device::Cpu).unwrap();
+        let rope_gpu = Rope::new(32, 64, 160_000.0, &dev).unwrap();
+        let x_cpu = Tensor::randn(0f32, 1.0, (2, 12, 64, 32), &Device::Cpu).unwrap();
+        let (cf, sf) = rope_cpu.cos_sin(64).unwrap();
+        let want = Rope::apply(&x_cpu, &cf, &sf).unwrap();
+        let (ch, sh) = rope_gpu.cos_sin_half(64).unwrap();
+        let (cfg, sfg) = rope_gpu.cos_sin(64).unwrap();
+        let got = Rope::apply_fast(&x_cpu.to_device(&dev).unwrap(), &ch, &sh, &cfg, &sfg)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap();
+        let max_rope = (&got - &want).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+        assert!(max_rope < 1e-5, "CUDA fused RoPE max diff {max_rope}");
+
+        // Fused SiLU-GLU parity
+        let wi_cpu = Tensor::randn(0f32, 1.0, (2, 16, 64), &Device::Cpu).unwrap();
+        let want_glu = silu_glu(&wi_cpu).unwrap();
+        let got_glu = silu_glu(&wi_cpu.to_device(&dev).unwrap()).unwrap().to_device(&Device::Cpu).unwrap();
+        let max_glu = (&got_glu - &want_glu).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+        assert!(max_glu < 1e-5, "CUDA fused silu_glu max diff {max_glu}");
+
+        // Fused softmax_last_dim parity on CUDA (F32 & BF16)
+        let scores_cpu = Tensor::randn(0f32, 2.0, (2, 12, 32, 32), &Device::Cpu).unwrap();
+        let want_sm = softmax_last(&scores_cpu).unwrap();
+        let got_sm = softmax_last(&scores_cpu.to_device(&dev).unwrap()).unwrap().to_device(&Device::Cpu).unwrap();
+        let max_sm = (&got_sm - &want_sm).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+        assert!(max_sm < 1e-5, "CUDA softmax_last max diff {max_sm}");
+
+        // BF16 CLS vector norm accumulation in F32/F64 (PRC-09)
+        let hidden_bf16 = Tensor::randn(0f32, 1.0, (2, 8, 384), &dev).unwrap().to_dtype(DType::BF16).unwrap();
+        let v0 = cls_vector(&hidden_bf16, 0).unwrap();
+        let norm: f64 = v0.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "BF16 CLS norm drift: {norm}");
     }
 }

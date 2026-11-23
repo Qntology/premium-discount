@@ -235,9 +235,17 @@ impl EmbeddingGemma {
         Self::load_with(dir, LoadOptions::default())
     }
 
-    /// 모델 디렉터리를 연다. 텍스트 백본의 층 가중치는 f32로 올리고, 입력 임베딩 표(262,144 x 512)는
+    /// 모델 디렉터리를 연다 (`PD_DEVICE` 환경 변수로 장치를 고른다; 비어 있으면 CPU).
+    /// 텍스트 백본의 층 가중치는 f32로 올리고, 입력 임베딩 표(262,144 x 512)는
     /// 파일 매핑에 둔 채 필요한 행만 읽는다. 이미지·오디오 타워는 여기서 올리지 않는다.
     pub fn load_with(dir: &Path, options: LoadOptions) -> Result<Self, AppError> {
+        let device = crate::utils::device_from_env()
+            .map_err(|e| AppError::Embed(format!("장치 선택 실패: {e}")))?;
+        Self::load_with_on(dir, options, device)
+    }
+
+    /// 지정한 `device` 에 EmbeddingGemma 모델을 연다.
+    pub fn load_with_on(dir: &Path, options: LoadOptions, device: Device) -> Result<Self, AppError> {
         let tokenizer = Tokenizer::from_file(dir.join(TOKENIZER_FILE))
             .map_err(|e| AppError::Embed(format!("토크나이저 로드 실패: {e}")))?;
         let weights = weights_file(dir).ok_or_else(|| {
@@ -248,7 +256,6 @@ impl EmbeddingGemma {
                 dir.display()
             ))
         })?;
-        let device = Device::Cpu;
         // SAFETY: 파일은 읽기 전용으로 매핑하고, 로드 중에 바꾸지 않는다고 가정한다
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, &device) }
             .map_err(embed_error("가중치 로드 실패"))?;

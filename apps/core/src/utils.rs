@@ -368,6 +368,7 @@ pub enum AccelOp {
     Matmul,
     Softmax,
     LayerNorm,
+    Rope,
     FlashAttn,
     DecoderOps,
     LmHeadArgmax,
@@ -484,6 +485,21 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             let got = candle_nn::ops::layer_norm(&x.to_device(device)?, &w.to_device(device)?, &b.to_device(device)?, 1e-5)?;
             rel_err_f32(&got, &want)
         }
+        AccelOp::Rope => {
+            let (b, h, t, d) = (1usize, 4usize, 32usize, 64usize);
+            let half = d / 2;
+            let x = Tensor::from_vec(det_vec(b * h * t * d, 31), (b, h, t, d), &Device::Cpu)?;
+            let angles = Tensor::from_vec(det_vec(t * half, 32), (t, half), &Device::Cpu)?;
+            let cos = angles.cos()?;
+            let sin = angles.sin()?;
+            let want = candle_nn::rotary_emb::rope_slow(&x, &cos, &sin)?;
+            let got = candle_nn::rotary_emb::rope(
+                &x.to_device(device)?,
+                &cos.to_device(device)?,
+                &sin.to_device(device)?,
+            )?;
+            rel_err_f32(&got, &want)
+        }
         AccelOp::FlashAttn => {
             let (bh, n, d) = (2usize, 16usize, 64usize);
             let q = Tensor::from_vec(det_vec(bh * n * d, 7), (1, bh, n, d), &Device::Cpu)?;
@@ -494,7 +510,50 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             let want = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
             let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale);
             let got = candle_nn::flash_attn::flash_attn_bhsd(&q.to_device(device)?, &k.to_device(device)?, &v.to_device(device)?, &cfg)?;
-            rel_err_f32(&got, &want)
+            let mut worst = rel_err_f32(&got, &want)?;
+            if device.is_cuda_or_rocm() {
+                // Verify causal prefill (32x32, d=128) + causal decode / split-KV (1x300, 1x4096, d=256)
+                // + paged flash_attn_blocks (used by Qwen3.5 full-attention layers).
+                let check_causal = |hq: usize, hkv: usize, sq: usize, sk: usize, hd: usize, seed: u64| -> Result<f32> {
+                    let q_c = Tensor::from_vec(det_vec(hq * sq * hd, seed), (1, hq, sq, hd), &Device::Cpu)?;
+                    let k_c = Tensor::from_vec(det_vec(hkv * sk * hd, seed + 1), (1, hkv, sk, hd), &Device::Cpu)?;
+                    let v_c = Tensor::from_vec(det_vec(hkv * sk * hd, seed + 2), (1, hkv, sk, hd), &Device::Cpu)?;
+                    let sc = 1.0f32 / (hd as f32).sqrt();
+                    let reps = hq / hkv;
+                    let kf = if reps > 1 {
+                        k_c.unsqueeze(2)?.expand((1, hkv, reps, sk, hd))?.contiguous()?.reshape((1, hq, sk, hd))?
+                    } else {
+                        k_c.clone()
+                    };
+                    let vf = if reps > 1 {
+                        v_c.unsqueeze(2)?.expand((1, hkv, reps, sk, hd))?.contiguous()?.reshape((1, hq, sk, hd))?
+                    } else {
+                        v_c.clone()
+                    };
+                    let mut scores = (q_c.matmul(&kf.transpose(2, 3)?.contiguous()?)? * sc as f64)?;
+                    if sq > 1 {
+                        let offset = sk - sq;
+                        let mask: Vec<f32> = (0..sq)
+                            .flat_map(|i| (0..sk).map(move |j| if j > i + offset { f32::NEG_INFINITY } else { 0.0 }))
+                            .collect();
+                        scores = scores.broadcast_add(&Tensor::from_vec(mask, (1, 1, sq, sk), &Device::Cpu)?)?;
+                    }
+                    let want_c = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&vf)?;
+                    let ccfg = candle_nn::flash_attn::FlashAttnConfig::new(sc).causal();
+                    let q_d = q_c.to_device(device)?;
+                    let k_d = k_c.to_device(device)?;
+                    let v_d = v_c.to_device(device)?;
+                    let got_c = candle_nn::flash_attn::flash_attn_bhsd(&q_d, &k_d, &v_d, &ccfg)?;
+                    let e1 = rel_err_f32(&got_c, &want_c)?;
+                    let blk = [candle_nn::flash_attn::KvBlockRef { k: &k_d, v: &v_d, rows: sk }];
+                    let got_b = candle_nn::flash_attn::flash_attn_blocks(&q_d, &blk, &ccfg)?;
+                    Ok(e1.max(rel_err_f32(&got_b, &want_c)?))
+                };
+                worst = worst.max(check_causal(4, 2, 32, 32, 128, 40)?);
+                worst = worst.max(check_causal(8, 2, 1, 300, 256, 50)?);
+                worst = worst.max(check_causal(8, 2, 1, 4096, 256, 60)?);
+            }
+            Ok(worst)
         }
         AccelOp::DecoderOps => {
             let x = Tensor::from_vec(det_vec(4 * 128, 10), (4, 128), &Device::Cpu)?;
@@ -622,7 +681,9 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
                     qd.forward(&a_dev)?
                 };
                 let err = rel_err_f32(&got, &want)?;
-                let tol = if device.is_cuda() || device.is_metal() || device.is_rocm() || device.is_vulkan() {
+                let tol = if device.is_cuda_or_rocm() || device.is_metal() {
+                    1e-3
+                } else if device.is_vulkan() {
                     1e-2
                 } else {
                     5e-2
@@ -684,11 +745,21 @@ mod tests {
             let dense = max_abs_diff(&cpu, &gpu)?;
 
             // 앱의 양자화 경로(quant.rs)가 쓰는 Q8_0 · Q4_0 · K-quant(Q4K/Q5K/Q6K).
-            // candle@708b2f2 는 ROCm w8a16 및 Vulkan GpuQuant 로 모든 형식을 GPU 에서 직접 계산한다.
+            // CUDA / ROCm / Metal 은 forward_exact (F32 활성값, ~1e-7 오차), Vulkan 은 네이티브 GpuQuant 를 사용한다.
             let mut max_ratio = 0f32;
             for dt in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
-                let cpu_q = QMatMul::from_qtensor(QTensor::quantize(&w, dt)?)?.forward(&a)?;
-                let gpu_q = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&dev)?, dt)?)?.forward(&a.to_device(&dev)?)?;
+                let q_cpu = QTensor::quantize(&w, dt)?;
+                let cpu_q = if dev.is_cuda_or_rocm() || dev.is_metal() {
+                    a.matmul(&q_cpu.dequantize(&Device::Cpu)?.t()?)?
+                } else {
+                    QMatMul::from_qtensor(q_cpu)?.forward(&a)?
+                };
+                let q_gpu = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&dev)?, dt)?)?;
+                let gpu_q = if dev.is_cuda_or_rocm() || dev.is_metal() {
+                    q_gpu.forward_exact(&a.to_device(&dev)?)?
+                } else {
+                    q_gpu.forward(&a.to_device(&dev)?)?
+                };
                 let scale = cpu_q.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
                 let diff = max_abs_diff(&cpu_q, &gpu_q)?;
                 max_ratio = max_ratio.max(diff / scale.max(1e-3));
@@ -706,7 +777,8 @@ mod tests {
         }
         release_gpu(&dev)?;
         assert!(dense < 1e-4, "softmax(matmul) 차이 {dense}");
-        assert!(quant <= 0.05 * scale.max(1e-3), "양자화 행렬곱 차이 {quant} (크기 {scale})");
+        let quant_tol = if dev.is_cuda_or_rocm() || dev.is_metal() { 1e-4 } else { 0.05 };
+        assert!(quant <= quant_tol * scale.max(1e-3), "양자화 행렬곱 차이 {quant} (크기 {scale}, 한도 {quant_tol})");
         Ok(())
     }
 
@@ -723,6 +795,7 @@ mod tests {
             AccelOp::Matmul,
             AccelOp::Softmax,
             AccelOp::LayerNorm,
+            AccelOp::Rope,
             AccelOp::FlashAttn,
             AccelOp::DecoderOps,
             AccelOp::LmHeadArgmax,
