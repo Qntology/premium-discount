@@ -12,7 +12,8 @@ import { fileURLToPath } from 'node:url'
 import { extname, join, normalize } from 'node:path'
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url))
-const BIN = process.env.PD_BIN ?? here('../../target/release/premium-discount-app')
+const EXE = process.platform === 'win32' ? '.exe' : ''
+const BIN = process.env.PD_BIN ?? here(`../../target/release/premium-discount-app${EXE}`)
 const PORT = Number(process.env.PORT ?? 5173)
 const DIST = here('dist')
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.map': 'application/json' }

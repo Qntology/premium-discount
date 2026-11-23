@@ -5,6 +5,7 @@
   "identifier": "discount.premium.app",
   "build": {
     "frontendDist": "../../web/desktop/dist",
+    "beforeDevCommand": "npm --prefix ../web/desktop install && npm --prefix ../web/desktop run build",
     "beforeBuildCommand": "npm --prefix ../web/desktop install && npm --prefix ../web/desktop run build"
   },
   "app": {
