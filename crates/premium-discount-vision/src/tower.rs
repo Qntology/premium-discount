@@ -275,25 +275,58 @@ fn gpu_flash_attn_ok(dev: &Device, hd: usize) -> bool {
     };
     let scale = (hd as f32).powf(-0.5);
     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> candle_core::Result<bool> {
-        let (bh, n) = (2usize, 8usize);
-        let q_cpu = Tensor::from_vec(det(bh * n * hd, 71), (1, bh, n, hd), &Device::Cpu)?;
-        let k_cpu = Tensor::from_vec(det(bh * n * hd, 72), (1, bh, n, hd), &Device::Cpu)?;
-        let v_cpu = Tensor::from_vec(det(bh * n * hd, 73), (1, bh, n, hd), &Device::Cpu)?;
-        let scores = (q_cpu.matmul(&k_cpu.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
-        let want = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v_cpu)?;
-        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale);
-        let got = candle_nn::flash_attn::flash_attn_bhsd(
-            &q_cpu.to_device(dev)?,
-            &k_cpu.to_device(dev)?,
-            &v_cpu.to_device(dev)?,
-            &cfg,
-        )?
-        .to_device(&Device::Cpu)?
-        .to_dtype(DType::F32)?;
-        let diff_sq = (&got - &want)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
-        let norm_sq = want.sqr()?.sum_all()?.to_scalar::<f32>()?;
-        let rel = (diff_sq / norm_sq.max(1e-30)).sqrt();
-        Ok(rel.is_finite() && rel <= 5e-3)
+        let check = |q_cpu: &Tensor, k_cpu: &Tensor, v_cpu: &Tensor| -> candle_core::Result<f32> {
+            let scores = (q_cpu.matmul(&k_cpu.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+            let want = candle_nn::ops::softmax_last_dim(&scores)?.matmul(v_cpu)?;
+            let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale);
+            let got = candle_nn::flash_attn::flash_attn_bhsd(
+                &q_cpu.to_device(dev)?,
+                &k_cpu.to_device(dev)?,
+                &v_cpu.to_device(dev)?,
+                &cfg,
+            )?
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?;
+            let diff_sq = (&got - &want)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+            let norm_sq = want.sqr()?.sum_all()?.to_scalar::<f32>()?;
+            Ok((diff_sq / norm_sq.max(1e-30)).sqrt())
+        };
+        let bh = 2usize;
+        // Self-attention (Block) + cross-attention nq=1 (MapHead)
+        let q1 = Tensor::from_vec(det(bh * 16 * hd, 71), (1, bh, 16, hd), &Device::Cpu)?;
+        let k1 = Tensor::from_vec(det(bh * 16 * hd, 72), (1, bh, 16, hd), &Device::Cpu)?;
+        let v1 = Tensor::from_vec(det(bh * 16 * hd, 73), (1, bh, 16, hd), &Device::Cpu)?;
+        let r1 = check(&q1, &k1, &v1)?;
+        let q2 = Tensor::from_vec(det(bh * 1 * hd, 74), (1, bh, 1, hd), &Device::Cpu)?;
+        let k2 = Tensor::from_vec(det(bh * 64 * hd, 75), (1, bh, 64, hd), &Device::Cpu)?;
+        let v2 = Tensor::from_vec(det(bh * 64 * hd, 76), (1, bh, 64, hd), &Device::Cpu)?;
+        let r2 = check(&q2, &k2, &v2)?;
+        let mut worst = r1.max(r2);
+        // Zero-copy 2-block attention (extend_sparse) on CUDA/ROCm
+        if dev.is_cuda() || dev.is_rocm() {
+            let k_a = k2.narrow(2, 0, 32)?.contiguous()?;
+            let k_b = k2.narrow(2, 32, 32)?.contiguous()?;
+            let v_a = v2.narrow(2, 0, 32)?.contiguous()?;
+            let v_b = v2.narrow(2, 32, 32)?.contiguous()?;
+            let scores = (q1.matmul(&k2.transpose(2, 3)?.contiguous()?)? * scale as f64)?;
+            let want = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v2)?;
+            let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale);
+            let ka_d = k_a.to_device(dev)?;
+            let va_d = v_a.to_device(dev)?;
+            let kb_d = k_b.to_device(dev)?;
+            let vb_d = v_b.to_device(dev)?;
+            let blocks = [
+                candle_nn::flash_attn::KvBlockRef { k: &ka_d, v: &va_d, rows: 32 },
+                candle_nn::flash_attn::KvBlockRef { k: &kb_d, v: &vb_d, rows: 32 },
+            ];
+            let got = candle_nn::flash_attn::flash_attn_blocks(&q1.to_device(dev)?, &blocks, &cfg)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?;
+            let diff_sq = (&got - &want)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
+            let norm_sq = want.sqr()?.sum_all()?.to_scalar::<f32>()?;
+            worst = worst.max((diff_sq / norm_sq.max(1e-30)).sqrt());
+        }
+        Ok(worst.is_finite() && worst <= 5e-3)
     }))
     .ok()
     .and_then(|r| r.ok())
@@ -388,11 +421,33 @@ impl Block {
             .reshape((b, n, 3, self.heads, self.hd))?
             .permute((2, 0, 3, 1, 4))?;
         let (q, k, v) = (qkv.get(0)?.contiguous()?, qkv.get(1)?.contiguous()?, qkv.get(2)?.contiguous()?);
-        let (ka, va) = match ctx {
-            Some(c) => (Tensor::cat(&[&c.k, &k], 2)?, Tensor::cat(&[&c.v, &v], 2)?),
-            None => (k.clone(), v.clone()),
+        let attended = match ctx {
+            Some(c)
+                if (q.device().is_cuda() || q.device().is_rocm())
+                    && gpu_flash_attn_ok(q.device(), self.hd) =>
+            {
+                let cfg = candle_nn::flash_attn::FlashAttnConfig::new((self.hd as f32).powf(-0.5));
+                let blocks = [
+                    candle_nn::flash_attn::KvBlockRef { k: &c.k, v: &c.v, rows: c.k.dim(2)? },
+                    candle_nn::flash_attn::KvBlockRef { k: &k, v: &v, rows: n },
+                ];
+                match candle_nn::flash_attn::flash_attn_blocks(&q, &blocks, &cfg) {
+                    Ok(o) => o,
+                    Err(_) => {
+                        let ka = Tensor::cat(&[&c.k, &k], 2)?;
+                        let va = Tensor::cat(&[&c.v, &v], 2)?;
+                        attend(&q, &ka, &va, self.hd)?
+                    }
+                }
+            }
+            Some(c) => {
+                let ka = Tensor::cat(&[&c.k, &k], 2)?;
+                let va = Tensor::cat(&[&c.v, &v], 2)?;
+                attend(&q, &ka, &va, self.hd)?
+            }
+            None => attend(&q, &k, &v, self.hd)?,
         };
-        let o = attend(&q, &ka, &va, self.hd)?.transpose(1, 2)?.reshape((b, n, d))?;
+        let o = attended.transpose(1, 2)?.reshape((b, n, d))?;
         let x = (x + self.proj.forward(&o)?)?;
         let m = self.fc2.forward(&self.fc1.forward(&self.norm2.forward(&x)?)?.gelu()?)?;
         Ok(((x + m)?, LayerKv { k, v }))
@@ -947,15 +1002,19 @@ mod tests {
         assert!(!gpu_flash_attn_ok(&Device::Cpu, 512));
 
         let dev = {
-            #[cfg(feature = "rocm")]
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(0).unwrap_or(Device::Cpu)
+            }
+            #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
             {
                 Device::new_rocm(0).unwrap_or(Device::Cpu)
             }
-            #[cfg(all(not(feature = "rocm"), feature = "vulkan"))]
+            #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "vulkan"))]
             {
                 Device::new_vulkan(0).unwrap_or(Device::Cpu)
             }
-            #[cfg(all(not(feature = "rocm"), not(feature = "vulkan")))]
+            #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), not(feature = "vulkan")))]
             {
                 Device::Cpu
             }
@@ -966,9 +1025,9 @@ mod tests {
         assert!(!gpu_flash_attn_ok(&dev, 512), "hd > 256 must be rejected");
         assert!(gpu_flash_attn_ok(&dev, 72), "hd = 72 must pass non-trivial flash-attn probe");
         let (bh, n, hd) = (4usize, 16usize, 72usize);
-        let mk = |seed: u64| -> Vec<f32> {
+        let mk = |len: usize, seed: u64| -> Vec<f32> {
             let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            (0..bh * n * hd)
+            (0..len)
                 .map(|_| {
                     s ^= s << 13;
                     s ^= s >> 7;
@@ -977,9 +1036,9 @@ mod tests {
                 })
                 .collect()
         };
-        let q = Tensor::from_vec(mk(1), (1, bh, n, hd), &Device::Cpu).unwrap();
-        let k = Tensor::from_vec(mk(2), (1, bh, n, hd), &Device::Cpu).unwrap();
-        let v = Tensor::from_vec(mk(3), (1, bh, n, hd), &Device::Cpu).unwrap();
+        let q = Tensor::from_vec(mk(bh * n * hd, 1), (1, bh, n, hd), &Device::Cpu).unwrap();
+        let k = Tensor::from_vec(mk(bh * n * hd, 2), (1, bh, n, hd), &Device::Cpu).unwrap();
+        let v = Tensor::from_vec(mk(bh * n * hd, 3), (1, bh, n, hd), &Device::Cpu).unwrap();
         let want = attend(&q, &k, &v, hd).unwrap();
         let got = attend(&q.to_device(&dev).unwrap(), &k.to_device(&dev).unwrap(), &v.to_device(&dev).unwrap(), hd)
             .unwrap()
@@ -987,6 +1046,38 @@ mod tests {
             .unwrap();
         let diff = (&want - &got).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
         assert!(diff < 1e-4, "GPU attend max diff {diff}");
+
+        // Cross-attention (MapHead: nq = 1, nkv = 64)
+        let qc = Tensor::from_vec(mk(bh * hd, 4), (1, bh, 1, hd), &Device::Cpu).unwrap();
+        let kc = Tensor::from_vec(mk(bh * 64 * hd, 5), (1, bh, 64, hd), &Device::Cpu).unwrap();
+        let vc = Tensor::from_vec(mk(bh * 64 * hd, 6), (1, bh, 64, hd), &Device::Cpu).unwrap();
+        let want_c = attend(&qc, &kc, &vc, hd).unwrap();
+        let got_c = attend(&qc.to_device(&dev).unwrap(), &kc.to_device(&dev).unwrap(), &vc.to_device(&dev).unwrap(), hd)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap();
+        let diff_c = (&want_c - &got_c).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+        assert!(diff_c < 1e-4, "GPU cross-attend max diff {diff_c}");
+
+        // Zero-copy 2-block attention (extend_sparse)
+        if dev.is_cuda() || dev.is_rocm() {
+            let cfg = candle_nn::flash_attn::FlashAttnConfig::new((hd as f32).powf(-0.5));
+            let ka = kc.narrow(2, 0, 32).unwrap().contiguous().unwrap().to_device(&dev).unwrap();
+            let va = vc.narrow(2, 0, 32).unwrap().contiguous().unwrap().to_device(&dev).unwrap();
+            let kb = kc.narrow(2, 32, 32).unwrap().contiguous().unwrap().to_device(&dev).unwrap();
+            let vb = vc.narrow(2, 32, 32).unwrap().contiguous().unwrap().to_device(&dev).unwrap();
+            let blocks = [
+                candle_nn::flash_attn::KvBlockRef { k: &ka, v: &va, rows: 32 },
+                candle_nn::flash_attn::KvBlockRef { k: &kb, v: &vb, rows: 32 },
+            ];
+            let want_b = attend(&q, &kc, &vc, hd).unwrap();
+            let got_b = candle_nn::flash_attn::flash_attn_blocks(&q.to_device(&dev).unwrap(), &blocks, &cfg)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap();
+            let diff_b = (&want_b - &got_b).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+            assert!(diff_b < 1e-4, "GPU 2-block flash_attn_blocks max diff {diff_b}");
+        }
         let _ = dev.synchronize_all();
         let _ = dev.trim_memory_pool(0);
     }

@@ -59,6 +59,15 @@ struct Mel {
 
 /// 아핀 변환 없는 RMS norm 또는 가중치가 있는 RMS norm. x / sqrt(mean(x^2) + eps) * w
 fn rms_norm(x: &Tensor, weight: Option<&Tensor>) -> Result<Tensor> {
+    if let Some(w) = weight {
+        if !x.device().is_cpu()
+            && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::DecoderOps)
+        {
+            if let Ok(y) = candle_core::decoder_ops::rmsnorm_fused(x, w, RMS_EPS as f32, false) {
+                return Ok(y);
+            }
+        }
+    }
     let ms = x.sqr()?.mean_keepdim(D::Minus1)?.affine(1.0, RMS_EPS)?;
     let y = x.broadcast_mul(&ms.powf(-0.5)?)?;
     match weight {
@@ -95,7 +104,7 @@ fn mask_time(x: &Tensor, valid: usize) -> Result<Tensor> {
 }
 
 fn sigmoid(x: &Tensor) -> Result<Tensor> {
-    x.neg()?.exp()?.affine(1.0, 1.0)?.recip()
+    candle_nn::ops::sigmoid(x)
 }
 
 fn clip_gradient(x: &Tensor) -> Result<Tensor> {
@@ -505,6 +514,7 @@ pub struct AudioTower {
     output_proj_w: Tensor,
     output_proj_b: Tensor,
     embed_proj: Tensor,
+    device: Device,
 }
 
 /// 상대 위치 sin/cos 표 [POS_LEN x HIDDEN]. 위치 p = 12 - e, 앞 절반은 sin, 뒤 절반은 cos
@@ -561,6 +571,7 @@ impl AudioTower {
             output_proj_w: at.pp("output_proj").get((PROJ_DIM, HIDDEN), "weight")?,
             output_proj_b: at.pp("output_proj").get(PROJ_DIM, "bias")?,
             embed_proj: vb.pp("embed_audio").pp("embedding_projection").get((OUTPUT_DIM, PROJ_DIM), "weight")?,
+            device: device.clone(),
         })
     }
 
@@ -594,7 +605,7 @@ impl AudioTower {
     pub fn encode_pcm(&self, samples: &[f32]) -> Result<Tensor> {
         let mel = compute_mel(samples);
         if mel.valid == 0 {
-            return Tensor::zeros((0, OUTPUT_DIM), DType::F32, &Device::Cpu);
+            return Tensor::zeros((0, OUTPUT_DIM), DType::F32, &self.device);
         }
         let tokens = mel.valid.div_ceil(FRAMES_PER_TOKEN);
 
@@ -610,7 +621,7 @@ impl AudioTower {
     /// 두 번의 2배 다운샘플링 합성곱 (프레임 4개 -> 1개) 후 입력 투영. 결과는 [ceil(frames / 4), 1024]
     fn subsample(&self, mel: &Mel) -> Result<Tensor> {
         // Python은 [B, F, 128]을 [B, 1, F(시간), 128(주파수)]로 본다
-        let x = Tensor::from_slice(&mel.data, (1, 1, mel.frames, NUM_MEL_BINS), &Device::Cpu)?;
+        let x = Tensor::from_slice(&mel.data, (1, 1, mel.frames, NUM_MEL_BINS), &self.device)?;
         let x = x.conv2d(&self.conv0, 1, 2, 1, 1)?;
         let x = channel_norm_relu(&x, &self.norm0)?;
         let x = mask_time(&x, mel.valid.div_ceil(2))?;

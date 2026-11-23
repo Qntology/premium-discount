@@ -238,3 +238,39 @@ fn dump_vectors() {
     write(&std::env::var("PD_DUMP_OUT_BATCH").expect("PD_DUMP_OUT_BATCH"), &batch);
     std::fs::write(format!("{out}.tokens.json"), serde_json::to_string(&tokens).unwrap()).unwrap();
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn embed_cuda_matches_hugging_face_and_batch() {
+    let Some(dir) = model_dir() else {
+        eprintln!("[granite-cuda] model folder not found; skipping");
+        return;
+    };
+    let Ok(dev) = Device::new_cuda(0) else {
+        eprintln!("[granite-cuda] CUDA device not available; skipping");
+        return;
+    };
+    let started = Instant::now();
+    let m = Granite::load(&dir, &dev).expect("load granite on CUDA");
+    eprintln!("[granite-cuda] loaded on cuda:0 in {:.2?}", started.elapsed());
+    let r = reference();
+    let texts: Vec<&str> = r.items.iter().map(|i| i.text.as_str()).collect();
+    let t_single = Instant::now();
+    let single: Vec<Vec<f32>> = texts.iter().map(|t| m.embed(t).expect("cuda embed")).collect();
+    let single_ms = t_single.elapsed().as_secs_f64() * 1e3;
+    let t_batch = Instant::now();
+    let batch = m.embed_batch(&texts).expect("cuda embed_batch");
+    let batch_ms = t_batch.elapsed().as_secs_f64() * 1e3;
+    let (mut min_ref, mut min_self, mut max_diff) = (f32::INFINITY, f32::INFINITY, 0f32);
+    for ((s, b), item) in single.iter().zip(&batch).zip(&r.items) {
+        min_ref = min_ref.min(cos(s, &item.embedding)).min(cos(b, &item.embedding));
+        min_self = min_self.min(cos(s, b));
+        max_diff = max_diff.max(max_abs_diff(s, &item.embedding));
+    }
+    eprintln!(
+        "[granite-cuda] {} texts: single {single_ms:.1} ms, batch {batch_ms:.1} ms | min cos vs HF {min_ref:.7}, batch vs single {min_self:.7}, max|Δ| {max_diff:.2e}",
+        texts.len()
+    );
+    assert!(min_ref >= MIN_COS, "CUDA granite vs HF cosine {min_ref} < {MIN_COS}");
+    assert!(min_self >= MIN_COS, "CUDA granite batch vs single cosine {min_self} < {MIN_COS}");
+}

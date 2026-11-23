@@ -6,7 +6,9 @@
 //! 체크포인트에는 `embed_tokens_per_layer`(토큰별 PLE 테이블)가 없다. 그래서 PLE는 문맥 투영만 쓴다
 //! (Gemma4TextModel의 `input_ids = None` 경로와 같다).
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 // 주의: candle의 Tensor 연산자(*, +)는 Result가 아니라 Tensor를 돌려준다. 실패 가능한 연산은 메서드로 쓴다.
@@ -53,16 +55,26 @@ impl RmsNorm {
     }
 }
 
-/// RoPE의 cos, sin 표 (seq x head_dim). 앞 절반과 뒤 절반이 같다 (transformers의 cat(freqs, freqs))
-fn rope_tables(theta: f64, head_dim: usize, seq: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
+/// RoPE의 cos, sin 표: 전체 `(seq, head_dim)` + 융합 커널용 절반 `(seq, head_dim / 2)`.
+struct RopeCacheEntry {
+    cos: Tensor,
+    sin: Tensor,
+    cos_half: Tensor,
+    sin_half: Tensor,
+}
+
+fn rope_tables(theta: f64, head_dim: usize, seq: usize, dev: &Device) -> Result<RopeCacheEntry> {
     let half = head_dim / 2;
     let inv: Vec<f32> = (0..half)
         .map(|i| (1.0 / theta.powf((2 * i) as f64 / head_dim as f64)) as f32)
         .collect();
     let mut cos = vec![0f32; seq * head_dim];
     let mut sin = vec![0f32; seq * head_dim];
+    let mut cos_h = vec![0f32; seq * half];
+    let mut sin_h = vec![0f32; seq * half];
     for t in 0..seq {
         let base = t * head_dim;
+        let hbase = t * half;
         let tf = t as f32;
         for (i, &f) in inv.iter().enumerate() {
             let (s, c) = (tf * f).sin_cos();
@@ -70,22 +82,32 @@ fn rope_tables(theta: f64, head_dim: usize, seq: usize, dev: &Device) -> Result<
             cos[base + half + i] = c;
             sin[base + i] = s;
             sin[base + half + i] = s;
+            cos_h[hbase + i] = c;
+            sin_h[hbase + i] = s;
         }
     }
-    Ok((
-        Tensor::from_vec(cos, (seq, head_dim), dev)?,
-        Tensor::from_vec(sin, (seq, head_dim), dev)?,
-    ))
+    Ok(RopeCacheEntry {
+        cos: Tensor::from_vec(cos, (seq, head_dim), dev)?,
+        sin: Tensor::from_vec(sin, (seq, head_dim), dev)?,
+        cos_half: Tensor::from_vec(cos_h, (seq, half), dev)?,
+        sin_half: Tensor::from_vec(sin_h, (seq, half), dev)?,
+    })
 }
 
 /// x: [b, t, h, d]. cos, sin: [t, d]. 마지막 차원을 절반씩 돌린다 (rotate_half)
-fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+fn apply_rope(x: &Tensor, rope: &RopeCacheEntry) -> Result<Tensor> {
+    if !x.device().is_cpu() && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::Rope) {
+        let bhtd = x.transpose(1, 2)?.contiguous()?;
+        if let Ok(y) = candle_nn::rotary_emb::rope(&bhtd, &rope.cos_half, &rope.sin_half) {
+            return y.transpose(1, 2);
+        }
+    }
     let d = x.dim(D::Minus1)?;
     let x1 = x.narrow(D::Minus1, 0, d / 2)?;
     let x2 = x.narrow(D::Minus1, d / 2, d / 2)?;
     let rotated = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
-    let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
-    let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
+    let cos = rope.cos.unsqueeze(0)?.unsqueeze(2)?;
+    let sin = rope.sin.unsqueeze(0)?.unsqueeze(2)?;
     x.broadcast_mul(&cos)?.broadcast_add(&rotated.broadcast_mul(&sin)?)
 }
 
@@ -140,13 +162,13 @@ struct SelfAttention {
 }
 
 impl SelfAttention {
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, rope: &RopeCacheEntry, mask: Option<&Tensor>) -> Result<Tensor> {
         let (b, t, _) = x.dims3()?;
         let q = self.q_proj.forward(x)?.reshape((b, t, self.heads, self.head_dim))?;
-        let q = apply_rope(&self.q_norm.forward(&q)?, cos, sin)?;
+        let q = apply_rope(&self.q_norm.forward(&q)?, rope)?;
 
         let k = self.k_proj.forward(x)?.reshape((b, t, self.kv_heads, self.head_dim))?;
-        let k = apply_rope(&self.k_norm.forward(&k)?, cos, sin)?;
+        let k = apply_rope(&self.k_norm.forward(&k)?, rope)?;
 
         let v = self.v_proj.forward(x)?.reshape((b, t, self.kv_heads, self.head_dim))?;
         let v = self.v_norm.forward(&v)?;
@@ -221,13 +243,39 @@ struct Layer {
 }
 
 impl Layer {
-    fn forward(&self, h: &Tensor, ple: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(&self, h: &Tensor, ple: &Tensor, rope: &RopeCacheEntry, mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.input_norm.forward(h)?;
-        let x = self.attn.forward(&x, cos, sin, mask)?;
+        let x = self.attn.forward(&x, rope, mask)?;
         let x = self.post_attn_norm.forward(&x)?;
-        let h = h.broadcast_add(&x)?;
+        let (h, x) = if let Some(ref w) = self.pre_ff_norm.weight {
+            if !h.device().is_cpu()
+                && crate::utils::accel_op_ok(h.device(), crate::utils::AccelOp::DecoderOps)
+            {
+                match candle_core::decoder_ops::residual_rmsnorm_inplace(
+                    h.clone(),
+                    Some(&x),
+                    w,
+                    RMS_EPS as f32,
+                    false,
+                ) {
+                    Ok((res, normed)) => (res, normed),
+                    Err(_) => {
+                        let h = h.broadcast_add(&x)?;
+                        let x = self.pre_ff_norm.forward(&h)?;
+                        (h, x)
+                    }
+                }
+            } else {
+                let h = h.broadcast_add(&x)?;
+                let x = self.pre_ff_norm.forward(&h)?;
+                (h, x)
+            }
+        } else {
+            let h = h.broadcast_add(&x)?;
+            let x = self.pre_ff_norm.forward(&h)?;
+            (h, x)
+        };
 
-        let x = self.pre_ff_norm.forward(&h)?;
         let x = self.gate.forward(&x)?.gelu()?.broadcast_mul(&self.up.forward(&x)?)?;
         let x = self.down.forward(&x)?;
         let x = self.post_ff_norm.forward(&x)?;
@@ -260,6 +308,8 @@ pub struct TextModel {
     /// 양방향 어텐션 여부. config.json에는 없다. 기본값은 양방향이다: Python 참조 구현(use_bidirectional_attention="all")과 일치하지만,
     /// 공식 embedding_gemma2 구현은 확인하지 못했다
     bidirectional: bool,
+    /// 길이별 슬라이딩/전역 RoPE 테이블 캐시 (매 호출 삼각함수 계산 및 H2D 복사 제거)
+    rope_cache: Mutex<HashMap<usize, (std::sync::Arc<RopeCacheEntry>, std::sync::Arc<RopeCacheEntry>)>>,
 }
 
 impl TextModel {
@@ -378,7 +428,22 @@ impl TextModel {
             projection,
             device: device.clone(),
             bidirectional,
+            rope_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn cached_ropes(&self, t: usize) -> Result<(std::sync::Arc<RopeCacheEntry>, std::sync::Arc<RopeCacheEntry>)> {
+        if let Some(pair) = self.rope_cache.lock().unwrap_or_else(|p| p.into_inner()).get(&t) {
+            return Ok(pair.clone());
+        }
+        let sliding = std::sync::Arc::new(rope_tables(ROPE_THETA_SLIDING, TEXT_HEAD_DIM, t, &self.device)?);
+        let full = std::sync::Arc::new(rope_tables(ROPE_THETA_FULL, TEXT_GLOBAL_HEAD_DIM, t, &self.device)?);
+        let mut cache = self.rope_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(t, (sliding.clone(), full.clone()));
+        Ok((sliding, full))
     }
 
     /// 토큰 id 목록 → 입력 임베딩 (t x 512). Gemma 규칙에 따라 sqrt(512)를 곱한다.
@@ -448,8 +513,7 @@ impl TextModel {
             .reshape((1, t, TEXT_NUM_LAYERS, PLE_DIM))?;
         let ple = self.ple_norm.forward(&ple)?;
 
-        let (cos_s, sin_s) = rope_tables(ROPE_THETA_SLIDING, TEXT_HEAD_DIM, t, dev)?;
-        let (cos_f, sin_f) = rope_tables(ROPE_THETA_FULL, TEXT_GLOBAL_HEAD_DIM, t, dev)?;
+        let (rope_s, rope_f) = self.cached_ropes(t)?;
         let mask_sliding = if self.bidirectional && t <= BIDIRECTIONAL_SLIDING_WINDOW + 1 {
             None
         } else {
@@ -464,8 +528,8 @@ impl TextModel {
         for (i, layer) in self.layers.iter().enumerate() {
             let ple_i = ple.i((.., .., i, ..))?;
             h = match layer.kind {
-                Attention::Full => layer.forward(&h, &ple_i, &cos_f, &sin_f, mask_full.as_ref())?,
-                Attention::Sliding => layer.forward(&h, &ple_i, &cos_s, &sin_s, mask_sliding.as_ref())?,
+                Attention::Full => layer.forward(&h, &ple_i, &rope_f, mask_full.as_ref())?,
+                Attention::Sliding => layer.forward(&h, &ple_i, &rope_s, mask_sliding.as_ref())?,
             };
         }
         self.norm.forward(&h)

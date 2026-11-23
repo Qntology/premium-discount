@@ -508,13 +508,34 @@ impl VisionTower {
             .broadcast_add(&x_emb)?
             .broadcast_add(&y_emb)?;
 
+        let fused_decoder = !dev.is_cpu()
+            && crate::utils::accel_op_ok(dev, crate::utils::AccelOp::DecoderOps);
         for block in &self.blocks {
             let x = rms_norm(&h, Some(&block.input_norm))?;
             let a = block.attention(&x, &cos, &sin)?;
             let a = rms_norm(&a, Some(&block.post_attn_norm))?;
-            h = h.broadcast_add(&a)?;
+            let x = if fused_decoder {
+                match candle_core::decoder_ops::residual_rmsnorm_inplace(
+                    h.clone(),
+                    Some(&a),
+                    &block.pre_ff_norm,
+                    RMS_EPS as f32,
+                    false,
+                ) {
+                    Ok((res, normed)) => {
+                        h = res;
+                        normed
+                    }
+                    Err(_) => {
+                        h = h.broadcast_add(&a)?;
+                        rms_norm(&h, Some(&block.pre_ff_norm))?
+                    }
+                }
+            } else {
+                h = h.broadcast_add(&a)?;
+                rms_norm(&h, Some(&block.pre_ff_norm))?
+            };
 
-            let x = rms_norm(&h, Some(&block.pre_ff_norm))?;
             let g = block.gate.forward(&x)?.gelu()?;
             let u = block.up.forward(&x)?;
             let m = block.down.forward(&g.broadcast_mul(&u)?)?;
