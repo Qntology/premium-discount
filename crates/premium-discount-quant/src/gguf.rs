@@ -102,6 +102,14 @@ impl GgmlType {
             GgmlType::Q6K => "Q6_K",
         }
     }
+    /// `kernels::dequant_row` / `dot_row` 가 계산할 수 있는 형식인가. 나머지(Q4_0 · Q4_1 · Q5_0 · Q5_1 · Q8_1 · Q2_K · Q3_K)는
+    /// 아티팩트를 다시 꾸릴 때 바이트를 그대로 옮기려고 파싱만 열어 둔 형식입니다.
+    pub fn has_cpu_kernel(self) -> bool {
+        matches!(
+            self,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I32 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -500,6 +508,9 @@ impl GgufFile {
 
     pub fn f32_values(&self, name: &str) -> Result<Vec<f32>> {
         let t = self.tensor(name)?;
+        if !t.ty.has_cpu_kernel() {
+            bail!("{name}: no CPU dequant kernel for {}", t.ty.name());
+        }
         let (r, c) = t.rows_cols();
         let mut out = vec![0f32; r * c];
         for i in 0..r {
@@ -750,6 +761,25 @@ mod tests {
                 &st_emb[old_id as usize * w_b..(old_id as usize + 1) * w_b]
             );
         }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// 파싱만 열어 둔 형식(Q4_0 등)은 `f32_values` 에서 패닉하지 않고 오류를 돌려준다.
+    #[test]
+    fn parse_only_type_is_an_error_not_a_panic() {
+        let tmp_dir = std::env::temp_dir().join(format!("pd_parse_only_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("q4_0.gguf");
+        let (rows, cols) = (2usize, 32usize);
+        let decls = vec![TensorDecl { name: "w".into(), ty: GgmlType::Q4_0, shape: vec![rows, cols] }];
+        let mut w = GgufWriter::create(&path, &[], decls).unwrap();
+        w.write(&vec![0u8; rows * GgmlType::Q4_0.row_bytes(cols)]).unwrap();
+        w.finish().unwrap();
+
+        let g = GgufFile::open(&path).unwrap();
+        assert!(!GgmlType::Q4_0.has_cpu_kernel());
+        assert!(GgmlType::Q8_0.has_cpu_kernel());
+        assert!(g.f32_values("w").is_err());
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
