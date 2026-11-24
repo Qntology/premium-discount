@@ -6956,6 +6956,8 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
+ "half",
+ "memmap2",
  "ndarray 0.15.6",
  "once_cell",
  "onnxruntime",
@@ -6989,9 +6991,13 @@ dependencies = [
  "half",
  "memmap2",
  "premium-discount-cpu-kernels",
+ "premium-discount-manifest",
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tokenizers",
+ "unicode-normalization",
 ]
 
 [[package]]

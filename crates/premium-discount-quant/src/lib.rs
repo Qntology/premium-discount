@@ -12,6 +12,7 @@
 //! * [`lmhead`]      – 잘라 낸 출력 투영에서도 전체 어휘와 같은 arg-max (잘린 행 묶음의 코시-슈바르츠 상한).
 //! * [`gguf`], [`safetensors`], [`imatrix`] – 파일 형식.
 
+pub mod artifact_trim;
 pub mod gguf;
 pub mod imatrix;
 pub mod kernels;
@@ -20,6 +21,9 @@ pub mod kernels;
 #[rustfmt::skip]
 pub mod kquant;
 pub mod lmhead;
+#[cfg(feature = "mine")]
+pub mod mine;
 pub mod safetensors;
 pub mod trim;
 pub mod vocab;
+pub mod vocab_plan;

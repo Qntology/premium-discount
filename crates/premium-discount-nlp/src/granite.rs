@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use candle_core::{DType, Device, Module, Tensor, D};
@@ -446,11 +446,18 @@ impl Mlp {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let wi = self.wi.forward(x)?;
         // transformers: `input, gate = Wi(x).chunk(2)`; `Wo(act(input) * gate)`
+        // CPU-only custom GLU kernel; GPU uses fused `silu_glu` (`decoder_ops::silu_mul`).
         let glu = match self.act {
-            Activation::Silu => match GLU_KERNEL.get() {
-                Some(kernel) => kernel(&wi)?,
-                None => silu_glu(&wi)?,
-            },
+            Activation::Silu => {
+                if wi.device().is_cpu() {
+                    match GLU_KERNEL.get() {
+                        Some(kernel) => kernel(&wi)?,
+                        None => silu_glu(&wi)?,
+                    }
+                } else {
+                    silu_glu(&wi)?
+                }
+            }
             Activation::Gelu => {
                 let i = wi.dim(D::Minus1)? / 2;
                 let input = wi.narrow(D::Minus1, 0, i)?.contiguous()?;
@@ -471,6 +478,248 @@ struct Layer {
     global: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappedDType {
+    BF16,
+    F16,
+    F32,
+}
+
+impl MappedDType {
+    fn elem_bytes(self) -> usize {
+        match self {
+            Self::BF16 | Self::F16 => 2,
+            Self::F32 => 4,
+        }
+    }
+}
+
+/// Memory-mapped token embedding table that reads only referenced rows per forward pass.
+/// Keeps GPU VRAM / host heap resident footprint of the 180,000 × 384 table at 0 bytes while
+/// staying bit-identical (E0) to dense loading on every backend.
+pub struct MappedTable {
+    map: Arc<memmap2::Mmap>,
+    offset: usize,
+    rows: usize,
+    cols: usize,
+    src_dtype: MappedDType,
+    target_dtype: DType,
+}
+
+impl MappedTable {
+    pub fn from_safetensors(
+        path: &Path,
+        tensor_name: &str,
+        target_dtype: DType,
+    ) -> candle_core::Result<Self> {
+        let file = std::fs::File::open(path).map_err(|e| {
+            candle_core::Error::Msg(format!("granite MappedTable open {}: {e}", path.display()))
+        })?;
+        // SAFETY: read-only memory map of an immutable model safetensors file.
+        let map = Arc::new(unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+            candle_core::Error::Msg(format!("granite MappedTable mmap {}: {e}", path.display()))
+        })?);
+        if map.len() < 8 {
+            candle_core::bail!("granite MappedTable: {} too small", path.display());
+        }
+        let header_len = u64::from_le_bytes(map[..8].try_into().unwrap()) as usize;
+        if header_len > 100 << 20 || 8 + header_len > map.len() {
+            candle_core::bail!(
+                "granite MappedTable: invalid header length {header_len} in {}",
+                path.display()
+            );
+        }
+        let header: serde_json::Value =
+            serde_json::from_slice(&map[8..8 + header_len]).map_err(|e| {
+                candle_core::Error::Msg(format!(
+                    "granite MappedTable parse header {}: {e}",
+                    path.display()
+                ))
+            })?;
+        let entry = header.get(tensor_name).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "granite MappedTable: missing tensor '{tensor_name}' in {}",
+                path.display()
+            ))
+        })?;
+        let src_dtype = match entry.get("dtype").and_then(|v| v.as_str()) {
+            Some("BF16") => MappedDType::BF16,
+            Some("F16") => MappedDType::F16,
+            Some("F32") => MappedDType::F32,
+            other => candle_core::bail!(
+                "granite MappedTable: unsupported dtype {other:?} for '{tensor_name}'"
+            ),
+        };
+        let shape = entry
+            .get("shape")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| candle_core::Error::Msg("granite MappedTable: missing shape".into()))?;
+        if shape.len() != 2 {
+            candle_core::bail!(
+                "granite MappedTable: expected 2D tensor for '{tensor_name}', got {}D",
+                shape.len()
+            );
+        }
+        let rows = shape[0].as_u64().unwrap_or(0) as usize;
+        let cols = shape[1].as_u64().unwrap_or(0) as usize;
+        let offsets = entry
+            .get("data_offsets")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                candle_core::Error::Msg("granite MappedTable: missing data_offsets".into())
+            })?;
+        let begin = offsets[0].as_u64().unwrap_or(0) as usize;
+        let end = offsets[1].as_u64().unwrap_or(0) as usize;
+        let expected_bytes = rows
+            .checked_mul(cols)
+            .and_then(|n| n.checked_mul(src_dtype.elem_bytes()))
+            .ok_or_else(|| candle_core::Error::Msg("granite MappedTable: byte size overflow".into()))?;
+        let data_start = 8 + header_len;
+        if end.saturating_sub(begin) != expected_bytes || data_start + end > map.len() {
+            candle_core::bail!(
+                "granite MappedTable: byte range [{begin}, {end}) mismatch for {rows}x{cols} ({expected_bytes} B)"
+            );
+        }
+        Ok(Self {
+            map,
+            offset: data_start + begin,
+            rows,
+            cols,
+            src_dtype,
+            target_dtype,
+        })
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn mapped_bytes(&self) -> usize {
+        self.rows * self.cols * self.src_dtype.elem_bytes()
+    }
+
+    /// Gather rows for `ids` onto `dev` with bit-identical conversion to `self.target_dtype`.
+    pub fn gather(&self, ids: &Tensor, dev: &Device) -> candle_core::Result<Tensor> {
+        let flat = ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+        if flat.is_empty() {
+            return Tensor::zeros((0, self.cols), self.target_dtype, dev);
+        }
+        let mut uniq = flat.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        if let Some(&max_id) = uniq.last() {
+            if (max_id as usize) >= self.rows {
+                candle_core::bail!(
+                    "granite MappedTable: token id {max_id} out of range (rows={})",
+                    self.rows
+                );
+            }
+        }
+        let row_bytes = self.cols * self.src_dtype.elem_bytes();
+        let sub = match self.src_dtype {
+            MappedDType::BF16 => {
+                if self.target_dtype == DType::F32 {
+                    let mut buf = Vec::with_capacity(uniq.len() * self.cols);
+                    for &id in &uniq {
+                        let s = self.offset + (id as usize) * row_bytes;
+                        buf.extend(
+                            self.map[s..s + row_bytes]
+                                .chunks_exact(2)
+                                .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32()),
+                        );
+                    }
+                    Tensor::from_vec(buf, (uniq.len(), self.cols), dev)?
+                } else {
+                    let mut buf = Vec::with_capacity(uniq.len() * self.cols);
+                    for &id in &uniq {
+                        let s = self.offset + (id as usize) * row_bytes;
+                        buf.extend(
+                            self.map[s..s + row_bytes]
+                                .chunks_exact(2)
+                                .map(|b| half::bf16::from_le_bytes([b[0], b[1]])),
+                        );
+                    }
+                    let t = Tensor::from_vec(buf, (uniq.len(), self.cols), dev)?;
+                    if self.target_dtype == DType::BF16 {
+                        t
+                    } else {
+                        t.to_dtype(self.target_dtype)?
+                    }
+                }
+            }
+            MappedDType::F16 => {
+                let mut buf = Vec::with_capacity(uniq.len() * self.cols);
+                for &id in &uniq {
+                    let s = self.offset + (id as usize) * row_bytes;
+                    buf.extend(
+                        self.map[s..s + row_bytes]
+                            .chunks_exact(2)
+                            .map(|b| half::f16::from_le_bytes([b[0], b[1]])),
+                    );
+                }
+                let t = Tensor::from_vec(buf, (uniq.len(), self.cols), dev)?;
+                if self.target_dtype == DType::F16 {
+                    t
+                } else {
+                    t.to_dtype(self.target_dtype)?
+                }
+            }
+            MappedDType::F32 => {
+                let mut buf = Vec::with_capacity(uniq.len() * self.cols);
+                for &id in &uniq {
+                    let s = self.offset + (id as usize) * row_bytes;
+                    buf.extend(
+                        self.map[s..s + row_bytes]
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                    );
+                }
+                let t = Tensor::from_vec(buf, (uniq.len(), self.cols), dev)?;
+                if self.target_dtype == DType::F32 {
+                    t
+                } else {
+                    t.to_dtype(self.target_dtype)?
+                }
+            }
+        };
+        let idx: Vec<u32> = flat
+            .iter()
+            .map(|id| uniq.binary_search(id).unwrap() as u32)
+            .collect();
+        let idx_t = Tensor::from_vec(idx, flat.len(), dev)?;
+        sub.index_select(&idx_t, 0)
+    }
+}
+
+enum TokEmbeddings {
+    Dense(Embedding),
+    Mapped { table: MappedTable, device: Device },
+}
+
+impl TokEmbeddings {
+    fn forward(&self, ids: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(emb) => emb.forward(ids),
+            Self::Mapped { table, device } => table.gather(ids, device),
+        }
+    }
+
+    fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped { .. })
+    }
+
+    fn mapped_bytes(&self) -> usize {
+        match self {
+            Self::Dense(_) => 0,
+            Self::Mapped { table, .. } => table.mapped_bytes(),
+        }
+    }
+}
+
 /// The ModernBERT encoder of granite-embedding-97m-multilingual-r2 — the one forward pass premium-discount, Raon Zena
 /// and logis-center share (logis-center's `ForwardMode::Exact`, op for op, so its vectors, text caches and per-text /
 /// batch bit identity stay as they were).
@@ -478,7 +727,7 @@ struct Layer {
 /// Weights come in the [`VarBuilder`]'s dtype (F32 on CPU; logis-center uses BF16 on CUDA / ROCm); LayerNorm and RoPE run
 /// in F32 either way.
 pub struct Encoder {
-    tok_embeddings: Embedding,
+    tok_embeddings: TokEmbeddings,
     embeddings_norm: LayerNorm,
     layers: Vec<Layer>,
     final_norm: LayerNorm,
@@ -491,6 +740,49 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn load(cfg: &EncoderConfig, vb: VarBuilder, device: &Device) -> candle_core::Result<Self> {
+        let tok_embeddings = TokEmbeddings::Dense(candle_nn::embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            vb.pp("embeddings.tok_embeddings"),
+        )?);
+        Self::load_with_tok_embeddings(cfg, vb, device, tok_embeddings)
+    }
+
+    /// Loads the encoder while keeping `embeddings.tok_embeddings.weight` memory-mapped on host disk
+    /// (0 bytes resident in GPU VRAM / host heap, bit-identical `E0` to [`Encoder::load`]).
+    pub fn load_mapped(
+        cfg: &EncoderConfig,
+        vb: VarBuilder,
+        safetensors_path: &Path,
+        device: &Device,
+    ) -> candle_core::Result<Self> {
+        let table = MappedTable::from_safetensors(
+            safetensors_path,
+            "embeddings.tok_embeddings.weight",
+            vb.dtype(),
+        )?;
+        if table.rows() != cfg.vocab_size || table.cols() != cfg.hidden_size {
+            candle_core::bail!(
+                "granite MappedTable shape {}x{} does not match config {}x{}",
+                table.rows(),
+                table.cols(),
+                cfg.vocab_size,
+                cfg.hidden_size
+            );
+        }
+        let tok_embeddings = TokEmbeddings::Mapped {
+            table,
+            device: device.clone(),
+        };
+        Self::load_with_tok_embeddings(cfg, vb, device, tok_embeddings)
+    }
+
+    fn load_with_tok_embeddings(
+        cfg: &EncoderConfig,
+        vb: VarBuilder,
+        device: &Device,
+        tok_embeddings: TokEmbeddings,
+    ) -> candle_core::Result<Self> {
         let (h, eps) = (cfg.hidden_size, cfg.norm_eps);
         let head_dim = h / cfg.num_attention_heads;
         let every_n = cfg.global_attn_every_n_layers.max(1);
@@ -510,7 +802,7 @@ impl Encoder {
             });
         }
         Ok(Self {
-            tok_embeddings: candle_nn::embedding(cfg.vocab_size, h, vb.pp("embeddings.tok_embeddings"))?,
+            tok_embeddings,
             embeddings_norm: LayerNorm::load(h, eps, vb.pp("embeddings.norm"))?,
             layers,
             final_norm: LayerNorm::load(h, eps, vb.pp("final_norm"))?,
@@ -520,6 +812,14 @@ impl Encoder {
             hidden_size: h,
             window_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        self.tok_embeddings.is_mapped()
+    }
+
+    pub fn mapped_table_bytes(&self) -> usize {
+        self.tok_embeddings.mapped_bytes()
     }
 
     pub fn hidden_size(&self) -> usize {

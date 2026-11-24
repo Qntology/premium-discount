@@ -172,7 +172,7 @@ impl Langs {
                     l.kana = true;
                     l.cjk = true;
                 }
-                "zh" | "zh-hans" | "zh-cn" | "chinese" => l.cjk = true,
+                "zh" | "zh-hans" | "zh-cn" | "zh-tw" | "zh-hk" | "zh-hant" | "chinese" => l.cjk = true,
                 "de" | "fr" | "es" | "it" | "pt" | "nl" | "cs" => l.latin = true,
                 "ar" | "arabic" => l.arabic = true,
                 "all" => l = l.union(Self::all()),
@@ -195,7 +195,7 @@ impl Langs {
         *self == Self::all()
     }
 
-    fn keeps_script(&self, k: Kind) -> bool {
+    pub fn keeps_script(&self, k: Kind) -> bool {
         match k {
             Kind::Script { hangul, kana, cjk, arabic, latin } => {
                 let allowed = (!hangul || self.hangul)
@@ -350,6 +350,297 @@ pub fn slice(kinds: &[Kind], domain: &BTreeSet<u32>, rule: TrimRule, langs: Lang
         cold,
         stats,
     }
+}
+
+/// Four tokenizer families supported by the vocabulary mining and artifact trimming pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenizerFlavor {
+    /// GPT-2 byte-level BPE (Qwen3, Qwen3.5): 256 byte fallback, `"a b"` merges.
+    Gpt2ByteBpe,
+    /// Granite/ModernBERT byte-level BPE (`granite-97m-r2`): 216 byte base, `["a","b"]` merges.
+    GraniteByteBpe,
+    /// SentencePiece-style BPE (`siglip2-so400m-patch16-naflex`): `▁` word prefix, `<0xXX>` byte fallback.
+    SentencePieceBpe,
+    /// SentencePiece Unigram model with log-probability scores.
+    SentencePieceUnigram,
+}
+
+impl TokenizerFlavor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gpt2ByteBpe => "gpt2_byte_bpe",
+            Self::GraniteByteBpe => "granite_byte_bpe",
+            Self::SentencePieceBpe => "sentencepiece_bpe",
+            Self::SentencePieceUnigram => "sentencepiece_unigram",
+        }
+    }
+}
+
+/// Detect the tokenizer flavor from a parsed Hugging Face `tokenizer.json`.
+pub fn detect_flavor_from_json(t: &serde_json::Value) -> TokenizerFlavor {
+    let mtype = t["model"]["type"].as_str().unwrap_or("");
+    if mtype.eq_ignore_ascii_case("Unigram") {
+        return TokenizerFlavor::SentencePieceUnigram;
+    }
+    let has_byte_fallback = t["model"]["byte_fallback"].as_bool().unwrap_or(false);
+    let vocab_obj = t["model"]["vocab"].as_object();
+    let has_sp_hex = vocab_obj.is_some_and(|v| v.contains_key("<0x00>") || v.contains_key("<0x20>"));
+    let has_metaspace = vocab_obj.is_some_and(|v| v.keys().any(|k| k.starts_with('\u{2581}')));
+    if has_byte_fallback || has_sp_hex || has_metaspace {
+        return TokenizerFlavor::SentencePieceBpe;
+    }
+    let has_array_merges = t["model"]["merges"]
+        .as_array()
+        .and_then(|a| a.first())
+        .is_some_and(|v| v.is_array());
+    let has_granite_reserved = t["added_tokens"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|x| x["content"].as_str().is_some_and(|s| s.starts_with("<|reserved_200"))));
+    let has_granite_cls = t["added_tokens"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|x| x["content"].as_str() == Some("<s>") || x["content"].as_str() == Some("<mask>")));
+    if has_granite_reserved || (has_array_merges && has_granite_cls) {
+        TokenizerFlavor::GraniteByteBpe
+    } else {
+        TokenizerFlavor::Gpt2ByteBpe
+    }
+}
+
+/// Decode a single vocabulary token string into raw bytes according to its tokenizer flavor.
+pub fn decode_piece_for_flavor(
+    tok: &str,
+    flavor: TokenizerFlavor,
+    byte_dec: &std::collections::HashMap<char, u8>,
+) -> Vec<u8> {
+    match flavor {
+        TokenizerFlavor::SentencePieceBpe | TokenizerFlavor::SentencePieceUnigram => {
+            if tok.len() == 6 && tok.starts_with("<0x") && tok.ends_with('>') {
+                if let Ok(b) = u8::from_str_radix(&tok[3..5], 16) {
+                    return vec![b];
+                }
+            }
+            if tok == "\t" {
+                return vec![b'\t'];
+            }
+            tok.replace('\u{2581}', " ").into_bytes()
+        }
+        TokenizerFlavor::Gpt2ByteBpe | TokenizerFlavor::GraniteByteBpe => {
+            let mut out = Vec::with_capacity(tok.len());
+            for c in tok.chars() {
+                match byte_dec.get(&c) {
+                    Some(&b) => out.push(b),
+                    None => return tok.as_bytes().to_vec(),
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Returns whether an added/special token is an unused placeholder (`<|reserved_N|>`, `<unusedN>`).
+pub fn is_placeholder_token(content: &str) -> bool {
+    (content.starts_with("<|reserved_") && content.ends_with("|>"))
+        || (content.starts_with("<unused") && content.ends_with('>') && content[7..content.len() - 1].chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Flavor-aware parser for `tokenizer.json`, also reporting whether each row is assigned and
+/// excluding placeholder tokens (`<|reserved_N|>`, `<unusedN>`).
+pub fn pieces_from_tokenizer_json_typed(
+    json: &str,
+    vocab_size: usize,
+) -> anyhow::Result<(TokenizerFlavor, Vec<Vec<u8>>, Vec<bool>, Vec<bool>)> {
+    use anyhow::Context;
+    let t: serde_json::Value = serde_json::from_str(json).context("tokenizer.json")?;
+    let flavor = detect_flavor_from_json(&t);
+    let dec = crate::vocab::byte_decoder();
+    let mut pieces: Vec<Vec<u8>> = vec![Vec::new(); vocab_size];
+    let mut added = vec![false; vocab_size];
+    let mut assigned = vec![false; vocab_size];
+
+    if flavor == TokenizerFlavor::SentencePieceUnigram {
+        if let Some(arr) = t["model"]["vocab"].as_array() {
+            for (id, entry) in arr.iter().enumerate() {
+                if id >= vocab_size {
+                    break;
+                }
+                if let Some(tok) = entry.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) {
+                    pieces[id] = decode_piece_for_flavor(tok, flavor, &dec);
+                    assigned[id] = !is_placeholder_token(tok);
+                }
+            }
+        }
+    } else if let Some(obj) = t["model"]["vocab"].as_object() {
+        for (tok, id) in obj {
+            let id = id.as_u64().context("vocab id")? as usize;
+            if id >= vocab_size {
+                continue;
+            }
+            pieces[id] = decode_piece_for_flavor(tok, flavor, &dec);
+            assigned[id] = !is_placeholder_token(tok);
+        }
+    }
+    if let Some(arr) = t["added_tokens"].as_array() {
+        for a in arr {
+            let id = a["id"].as_u64().context("added id")? as usize;
+            if id < vocab_size {
+                let content = a["content"].as_str().unwrap_or("");
+                pieces[id] = content.as_bytes().to_vec();
+                let placeholder = is_placeholder_token(content);
+                added[id] = !placeholder;
+                assigned[id] = !placeholder;
+            }
+        }
+    }
+    Ok((flavor, pieces, added, assigned))
+}
+
+/// Select rows within an optional `universe` (e.g. a statically trimmed artifact's active subset).
+pub fn select_from_universe(
+    kinds: &[Kind],
+    domain: &BTreeSet<u32>,
+    rule: TrimRule,
+    langs: Langs,
+    universe: Option<&[u32]>,
+) -> (Vec<u32>, Vec<(&'static str, usize)>) {
+    let Some(uni) = universe else {
+        return select_from(kinds, domain, rule, langs);
+    };
+    let mut in_uni = vec![false; kinds.len()];
+    for &id in uni {
+        if (id as usize) < kinds.len() {
+            in_uni[id as usize] = true;
+        }
+    }
+    if rule == TrimRule::Off {
+        let mut all_u: Vec<u32> = uni.iter().copied().filter(|&id| (id as usize) < kinds.len()).collect();
+        all_u.sort_unstable();
+        all_u.dedup();
+        let n = all_u.len();
+        return (all_u, vec![("off", n)]);
+    }
+    let (base, mut tiers) = select_from(kinds, domain, rule, langs);
+    let mut keep: BTreeSet<u32> = base.into_iter().filter(|&i| in_uni[i as usize]).collect();
+    let target = keep.len().next_multiple_of(ALIGN).min(uni.len());
+    let before_pad = keep.len();
+    for &i in uni {
+        if keep.len() >= target {
+            break;
+        }
+        if (i as usize) < kinds.len() {
+            keep.insert(i);
+        }
+    }
+    tiers.push(("universe_pad", keep.len().saturating_sub(before_pad)));
+    (keep.into_iter().collect(), tiers)
+}
+
+/// Compact 3-tier ASCII + frequency-ranked selection (Phase 1-1 D3 / Phase 2-1 D3).
+/// Breaks the 127,908-row ASCII floor by retaining:
+///   Tier 0: special, byte fallback, partial UTF-8, neutral, prompt tokens, domain lexicon, ASCII structural core
+///   Tier 1: active document scripts (Hangul/Kana/Arabic/Latin/CJK up to budget)
+///   Tier 2: frequency-ranked (or merge-order) ASCII & target-script tokens up to `target_k` (aligned to 64).
+pub fn select_compact_ranked(
+    kinds: &[Kind],
+    domain: &BTreeSet<u32>,
+    prompt_ids: &BTreeSet<u32>,
+    ascii_core: &BTreeSet<u32>,
+    langs: Langs,
+    target_k: usize,
+    freq_order: Option<&[u32]>,
+) -> (Vec<u32>, Vec<(&'static str, usize)>) {
+    let vocab = kinds.len();
+    let target_k = target_k.next_multiple_of(ALIGN).min(vocab);
+    let mut keep: BTreeSet<u32> = BTreeSet::new();
+    let mut tiers: Vec<(&'static str, usize)> = Vec::new();
+    let mut add = |name: &'static str, iter: &mut dyn Iterator<Item = u32>, keep: &mut BTreeSet<u32>, cap: Option<usize>| {
+        let before = keep.len();
+        for i in iter {
+            if cap.is_some_and(|c| keep.len() >= c) {
+                break;
+            }
+            if (i as usize) < vocab {
+                keep.insert(i);
+            }
+        }
+        tiers.push((name, keep.len() - before));
+    };
+
+    // Tier 0: mandatory special + byte + partial + prompt + domain + ascii_core
+    add(
+        "tier0_core",
+        &mut (0..vocab as u32).filter(|&i| matches!(kinds[i as usize], Kind::Special | Kind::Byte | Kind::Partial)),
+        &mut keep,
+        None,
+    );
+    add("tier0_prompt", &mut prompt_ids.iter().copied(), &mut keep, None);
+    let domain_cap = (keep.len() + (target_k / 4)).min(target_k);
+    add("tier0_domain", &mut domain.iter().copied(), &mut keep, Some(domain_cap));
+    add("tier0_ascii_core", &mut ascii_core.iter().copied(), &mut keep, None);
+
+    // Tier 1: non-CJK target scripts (Hangul ~6.8k, Kana ~3.6k, Arabic ~8.8k, Latin ext)
+    // For CJK-heavy langs (ja/zh), cap CJK at remaining budget minus English reserve.
+    let cjk_only = |k: Kind| matches!(k, Kind::Script { cjk: true, hangul: false, kana: false, arabic: false, latin: false });
+    let en_reserve = (target_k / 4).min(4096);
+    let script_cap = target_k.saturating_sub(en_reserve).max(keep.len());
+    if let Some(order) = freq_order {
+        add(
+            "tier1_script_non_cjk",
+            &mut order.iter().copied().filter(|&i| (i as usize) < vocab && langs.keeps_script(kinds[i as usize]) && !cjk_only(kinds[i as usize])),
+            &mut keep,
+            Some(script_cap),
+        );
+        if langs.cjk || langs.hanja {
+            let cjk_cap = if langs.cjk { script_cap } else { (keep.len() + CJK_COMMON).min(script_cap) };
+            add(
+                "tier1_cjk_ranked",
+                &mut order.iter().copied().filter(|&i| (i as usize) < vocab && cjk_only(kinds[i as usize])),
+                &mut keep,
+                Some(cjk_cap),
+            );
+        }
+        // Tier 2: frequency-ranked ASCII + Neutral + remaining target scripts up to target_k
+        add(
+            "tier2_ascii_ranked",
+            &mut order.iter().copied().filter(|&i| (i as usize) < vocab && matches!(kinds[i as usize], Kind::Ascii | Kind::Neutral)),
+            &mut keep,
+            Some(target_k),
+        );
+    } else {
+        add(
+            "tier1_script_non_cjk",
+            &mut (0..vocab as u32).filter(|&i| langs.keeps_script(kinds[i as usize]) && !cjk_only(kinds[i as usize])),
+            &mut keep,
+            Some(script_cap),
+        );
+        if langs.cjk || langs.hanja {
+            let cjk_cap = if langs.cjk { script_cap } else { (keep.len() + CJK_COMMON).min(script_cap) };
+            add(
+                "tier1_cjk_merge",
+                &mut (0..vocab as u32).filter(|&i| cjk_only(kinds[i as usize])),
+                &mut keep,
+                Some(cjk_cap),
+            );
+        }
+        // BPE token IDs are assigned in merge frequency order: lower ID = higher frequency!
+        add(
+            "tier2_ascii_merge",
+            &mut (0..vocab as u32).filter(|&i| matches!(kinds[i as usize], Kind::Ascii | Kind::Neutral)),
+            &mut keep,
+            Some(target_k),
+        );
+    }
+
+    let aligned = keep.len().next_multiple_of(ALIGN).min(vocab);
+    add(
+        "pad",
+        &mut (0..vocab as u32)
+            .filter(|&i| kinds[i as usize] == Kind::Ascii)
+            .chain(0..vocab as u32),
+        &mut keep,
+        Some(aligned),
+    );
+    (keep.into_iter().collect(), tiers)
 }
 
 /// Hugging Face `tokenizer.json`(바이트 수준 BPE)의 토큰마다 원래 바이트와 추가 토큰 여부. 어휘 크기(`vocab_size`, 임베딩 행 수)

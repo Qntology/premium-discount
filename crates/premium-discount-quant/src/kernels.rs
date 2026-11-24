@@ -108,6 +108,7 @@ pub fn dequant_row(ty: GgmlType, b: &[u8], out: &mut [f32]) {
                 }
             }
         }
+        other => unimplemented!("dequant_row for {other:?} is not implemented"),
     }
 }
 
@@ -227,6 +228,7 @@ pub fn dot_row(ty: GgmlType, b: &[u8], x: &[f32]) -> f32 {
             dequant_row(ty, b, &mut row);
             dot32(row.into_iter(), x)
         }
+        other => unimplemented!("dot_row for {other:?} is not implemented"),
     }
 }
 

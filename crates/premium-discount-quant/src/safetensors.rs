@@ -230,3 +230,149 @@ pub fn write_safetensors(path: &Path, tensors: &[(&str, Dtype, Vec<usize>, Vec<u
     }
     Ok(())
 }
+
+/// Streaming, crash-safe safetensors writer (Phase 2 – Part 2 D4).
+/// Preserves exact source `Dtype` (`BF16`/`F16`/`F32` — never promotes dtype) while copying
+/// non-vocab tensors directly from mmap and row-slicing vocab tensors via `IdRemap` with
+/// minimal RAM overhead (< 64 MiB).
+pub struct StreamingSafetensorsWriter {
+    w: std::io::BufWriter<File>,
+    part: PathBuf,
+    dest: PathBuf,
+    expected_bytes: usize,
+    written_bytes: usize,
+}
+
+impl StreamingSafetensorsWriter {
+    pub fn create(
+        dest: &Path,
+        decls: &[(String, Dtype, Vec<usize>)],
+        metadata: Option<&BTreeMap<String, String>>,
+    ) -> Result<Self> {
+        use std::io::Write;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut part_os = dest.as_os_str().to_os_string();
+        part_os.push(format!(".part.{}.{seq}", std::process::id()));
+        let part = PathBuf::from(part_os);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut header = serde_json::Map::new();
+        if let Some(meta) = metadata {
+            let mut m = serde_json::Map::new();
+            for (k, v) in meta {
+                m.insert(k.clone(), Value::String(v.clone()));
+            }
+            header.insert("__metadata__".into(), Value::Object(m));
+        }
+        let mut off = 0usize;
+        for (name, dt, shape) in decls {
+            let dts = match dt {
+                Dtype::F32 => "F32",
+                Dtype::F16 => "F16",
+                Dtype::BF16 => "BF16",
+            };
+            let numel: usize = shape.iter().product::<usize>().max(1);
+            let nbytes = numel * dt.size();
+            header.insert(
+                name.clone(),
+                serde_json::json!({"dtype": dts, "shape": shape, "data_offsets": [off, off + nbytes]}),
+            );
+            off += nbytes;
+        }
+        let mut h = serde_json::to_vec(&Value::Object(header))?;
+        while h.len() % 8 != 0 {
+            h.push(b' ');
+        }
+        let mut w = std::io::BufWriter::with_capacity(8 << 20, File::create(&part)?);
+        w.write_all(&(h.len() as u64).to_le_bytes())?;
+        w.write_all(&h)?;
+        Ok(Self {
+            w,
+            part,
+            dest: dest.to_path_buf(),
+            expected_bytes: off,
+            written_bytes: 0,
+        })
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        self.w.write_all(bytes)?;
+        self.written_bytes += bytes.len();
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<PathBuf> {
+        use std::io::Write;
+        if self.written_bytes != self.expected_bytes {
+            let _ = std::fs::remove_file(&self.part);
+            bail!(
+                "StreamingSafetensorsWriter: wrote {} bytes != expected {}",
+                self.written_bytes,
+                self.expected_bytes
+            );
+        }
+        self.w.flush()?;
+        self.w.get_ref().sync_all()?;
+        drop(self.w);
+        match std::fs::rename(&self.part, &self.dest) {
+            Ok(()) => {}
+            Err(_) if self.dest.exists() => {
+                let mut bak_os = self.dest.as_os_str().to_os_string();
+                bak_os.push(format!(".bak.{}", std::process::id()));
+                let bak = PathBuf::from(bak_os);
+                let _ = std::fs::remove_file(&bak);
+                std::fs::rename(&self.dest, &bak)?;
+                if let Err(e) = std::fs::rename(&self.part, &self.dest) {
+                    let _ = std::fs::rename(&bak, &self.dest);
+                    return Err(e.into());
+                }
+                let _ = std::fs::remove_file(&bak);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(self.dest)
+    }
+}
+
+/// Repack a safetensors model (single or sharded) into a single trimmed safetensors file,
+/// slicing each 2D tensor named in `vocab_tensors` along dim 0 via `remap.new_to_old` while
+/// byte-copying every other tensor untouched in its original `Dtype`.
+pub fn repack_safetensors_vocab(
+    src_dir: &Path,
+    dst_file: &Path,
+    vocab_tensors: &[&str],
+    remap: &crate::artifact_trim::IdRemap,
+) -> Result<()> {
+    let st = SafeTensors::open_model_dir(src_dir, &[])?;
+    let mut decls: Vec<(String, Dtype, Vec<usize>)> = Vec::with_capacity(st.tensors.len());
+    for (name, info) in &st.tensors {
+        let mut shape = info.shape.clone();
+        if vocab_tensors.iter().any(|&v| v == name.as_str()) {
+            if shape.len() != 2 || shape[0] != remap.orig_vocab {
+                bail!(
+                    "repack_safetensors_vocab: tensor {name} shape {:?} incompatible with orig_vocab {}",
+                    shape,
+                    remap.orig_vocab
+                );
+            }
+            shape[0] = remap.trimmed_vocab();
+        }
+        decls.push((name.clone(), info.dtype, shape));
+    }
+    let mut writer = StreamingSafetensorsWriter::create(dst_file, &decls, None)?;
+    for (name, _, _) in &decls {
+        if vocab_tensors.iter().any(|&v| v == name.as_str()) {
+            for &old_id in &remap.new_to_old {
+                writer.write_bytes(st.row_bytes(name, old_id as usize)?)?;
+            }
+        } else {
+            writer.write_bytes(st.bytes(name)?)?;
+        }
+    }
+    writer.finish()?;
+    Ok(())
+}

@@ -16,7 +16,14 @@ pub const ALIGN: usize = 32;
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
     Q8_0 = 8,
+    Q8_1 = 9,
+    Q2K = 10,
+    Q3K = 11,
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
@@ -29,7 +36,14 @@ impl GgmlType {
         Ok(match id {
             0 => GgmlType::F32,
             1 => GgmlType::F16,
+            2 => GgmlType::Q4_0,
+            3 => GgmlType::Q4_1,
+            6 => GgmlType::Q5_0,
+            7 => GgmlType::Q5_1,
             8 => GgmlType::Q8_0,
+            9 => GgmlType::Q8_1,
+            10 => GgmlType::Q2K,
+            11 => GgmlType::Q3K,
             12 => GgmlType::Q4K,
             13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
@@ -41,15 +55,22 @@ impl GgmlType {
     pub fn block_size(self) -> usize {
         match self {
             GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I32 => 1,
-            GgmlType::Q8_0 => 32,
-            GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => 256,
+            GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::Q8_1 => 32,
+            GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => 256,
         }
     }
     pub fn type_size(self) -> usize {
         match self {
             GgmlType::F32 | GgmlType::I32 => 4,
             GgmlType::F16 | GgmlType::BF16 => 2,
+            GgmlType::Q4_0 => 18,
+            GgmlType::Q4_1 => 20,
+            GgmlType::Q5_0 => 22,
+            GgmlType::Q5_1 => 24,
             GgmlType::Q8_0 => 34,
+            GgmlType::Q8_1 => 36,
+            GgmlType::Q2K => 84,
+            GgmlType::Q3K => 110,
             GgmlType::Q4K => 144,
             GgmlType::Q5K => 176,
             GgmlType::Q6K => 210,
@@ -68,11 +89,26 @@ impl GgmlType {
             GgmlType::F16 => "F16",
             GgmlType::BF16 => "BF16",
             GgmlType::I32 => "I32",
+            GgmlType::Q4_0 => "Q4_0",
+            GgmlType::Q4_1 => "Q4_1",
+            GgmlType::Q5_0 => "Q5_0",
+            GgmlType::Q5_1 => "Q5_1",
             GgmlType::Q8_0 => "Q8_0",
+            GgmlType::Q8_1 => "Q8_1",
+            GgmlType::Q2K => "Q2_K",
+            GgmlType::Q3K => "Q3_K",
             GgmlType::Q4K => "Q4_K",
             GgmlType::Q5K => "Q5_K",
             GgmlType::Q6K => "Q6_K",
         }
+    }
+    /// `kernels::dequant_row` / `dot_row` 가 계산할 수 있는 형식인가. 나머지(Q4_0 · Q4_1 · Q5_0 · Q5_1 · Q8_1 · Q2_K · Q3_K)는
+    /// 아티팩트를 다시 꾸릴 때 바이트를 그대로 옮기려고 파싱만 열어 둔 형식입니다.
+    pub fn has_cpu_kernel(self) -> bool {
+        matches!(
+            self,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I32 | GgmlType::Q8_0 | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K
+        )
     }
 }
 
@@ -86,7 +122,10 @@ pub enum Kv {
     Str(String),
     ArrStr(Vec<String>),
     ArrI32(Vec<i32>),
-    /// Any other array type, kept opaque.
+    ArrF32(Vec<f32>),
+    /// Any other scalar/array type preserved verbatim with its wire type tag and raw payload bytes.
+    Raw { ty: u32, payload: Vec<u8> },
+    /// Legacy opaque marker.
     Other,
 }
 
@@ -170,6 +209,16 @@ fn put_kv(w: &mut impl Write, key: &str, v: &Kv) -> std::io::Result<()> {
             w.write_all(&5u32.to_le_bytes())?;
             w.write_all(&(a.len() as u64).to_le_bytes())?;
             a.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
+        }
+        Kv::ArrF32(a) => {
+            w.write_all(&9u32.to_le_bytes())?;
+            w.write_all(&6u32.to_le_bytes())?;
+            w.write_all(&(a.len() as u64).to_le_bytes())?;
+            a.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
+        }
+        Kv::Raw { ty, payload } => {
+            w.write_all(&ty.to_le_bytes())?;
+            w.write_all(payload)
         }
         Kv::Other => unreachable!("Other is read-only"),
     }
@@ -349,22 +398,24 @@ impl<'a> Cur<'a> {
             8 => Kv::Str(self.string()?),
             10 => Kv::U64(self.u64()?),
             9 => {
+                let start = self.p;
                 let et = self.u32()?;
                 let n = self.u64()? as usize;
                 match et {
                     8 => Kv::ArrStr((0..n).map(|_| self.string()).collect::<Result<_>>()?),
                     5 => Kv::ArrI32((0..n).map(|_| self.u32().map(|v| v as i32)).collect::<Result<_>>()?),
+                    6 => Kv::ArrF32((0..n).map(|_| self.u32().map(f32::from_bits)).collect::<Result<_>>()?),
                     _ => {
                         let s = Self::scalar_size(et).context("nested array")?;
                         self.take(n * s)?;
-                        Kv::Other
+                        Kv::Raw { ty: 9, payload: self.b[start..self.p].to_vec() }
                     }
                 }
             }
-            _ => {
-                let s = Self::scalar_size(t).context("bad kv type")?;
-                self.take(s)?;
-                Kv::Other
+            other => {
+                let s = Self::scalar_size(other).context("bad kv type")?;
+                let bytes = self.take(s)?.to_vec();
+                Kv::Raw { ty: other, payload: bytes }
             }
         })
     }
@@ -457,6 +508,9 @@ impl GgufFile {
 
     pub fn f32_values(&self, name: &str) -> Result<Vec<f32>> {
         let t = self.tensor(name)?;
+        if !t.ty.has_cpu_kernel() {
+            bail!("{name}: no CPU dequant kernel for {}", t.ty.name());
+        }
         let (r, c) = t.rows_cols();
         let mut out = vec![0f32; r * c];
         for i in 0..r {
@@ -471,5 +525,261 @@ impl GgufFile {
 
     pub fn file_len(&self) -> usize {
         self.map.len()
+    }
+}
+
+/// Optional remapped tokenizer metadata overrides when repacking a GGUF file.
+#[derive(Debug, Clone, Default)]
+pub struct GgufVocabOverride {
+    pub tokens: Option<Vec<String>>,
+    pub token_types: Option<Vec<i32>>,
+    pub merges: Option<Vec<String>>,
+    pub extra_kvs: Vec<(String, Kv)>,
+}
+
+/// Zero-requantization GGUF vocabulary repacker (Phase 2 – Part 2 D4).
+///
+/// Copies every backbone tensor verbatim byte-for-byte from `src_path`, slices `token_embd.weight`
+/// (and `output.weight` if untied and matching `orig_vocab`) strictly by `remap.new_to_old`
+/// (`E0` bit-exact on kept rows), remaps embedded `tokenizer.ggml.*` and `qwen35.*_token_id`
+/// metadata, and records `logis.vocab.orig_ids` (`ArrI32`).
+pub fn repack_gguf_vocab(
+    src_path: &Path,
+    dst_path: &Path,
+    remap: &crate::artifact_trim::IdRemap,
+    overrides: &GgufVocabOverride,
+) -> Result<()> {
+    let src = GgufFile::open(src_path)?;
+    let k = remap.trimmed_vocab();
+    let orig_v = remap.orig_vocab;
+
+    let mut kv_map: BTreeMap<String, Kv> = BTreeMap::new();
+    let special_id_keys = [
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.padding_token_id",
+        "tokenizer.ggml.unknown_token_id",
+        "qwen35.vision_start_token_id",
+        "qwen35.vision_end_token_id",
+        "qwen35.image_token_id",
+        "qwen35.video_token_id",
+    ];
+    for (key, val) in &src.kvs {
+        if key == "general.alignment" {
+            continue;
+        }
+        if key == "tokenizer.ggml.tokens" {
+            if let Some(toks) = &overrides.tokens {
+                kv_map.insert(key.clone(), Kv::ArrStr(toks.clone()));
+            } else if let Kv::ArrStr(arr) = val {
+                let sliced: Vec<String> = remap
+                    .new_to_old
+                    .iter()
+                    .map(|&old| arr.get(old as usize).cloned().unwrap_or_default())
+                    .collect();
+                kv_map.insert(key.clone(), Kv::ArrStr(sliced));
+            }
+            continue;
+        }
+        if key == "tokenizer.ggml.token_type" {
+            if let Some(tt) = &overrides.token_types {
+                kv_map.insert(key.clone(), Kv::ArrI32(tt.clone()));
+            } else if let Kv::ArrI32(arr) = val {
+                let sliced: Vec<i32> = remap
+                    .new_to_old
+                    .iter()
+                    .map(|&old| arr.get(old as usize).copied().unwrap_or(1))
+                    .collect();
+                kv_map.insert(key.clone(), Kv::ArrI32(sliced));
+            }
+            continue;
+        }
+        if key == "tokenizer.ggml.scores" {
+            if let Kv::ArrF32(arr) = val {
+                let sliced: Vec<f32> = remap
+                    .new_to_old
+                    .iter()
+                    .map(|&old| arr.get(old as usize).copied().unwrap_or(0.0))
+                    .collect();
+                kv_map.insert(key.clone(), Kv::ArrF32(sliced));
+            }
+            continue;
+        }
+        if key == "tokenizer.ggml.merges" {
+            if let Some(m) = &overrides.merges {
+                kv_map.insert(key.clone(), Kv::ArrStr(m.clone()));
+            } else {
+                // Keep empty or filtered merges; if override not provided, filter using remapped tokens
+                kv_map.insert(key.clone(), Kv::ArrStr(Vec::new()));
+            }
+            continue;
+        }
+        if special_id_keys.contains(&key.as_str()) {
+            if let Some(old_u64) = val.as_u64() {
+                if let Some(new_id) = remap.map_old(old_u64 as u32) {
+                    kv_map.insert(key.clone(), Kv::U32(new_id));
+                } else {
+                    bail!("repack_gguf_vocab: GGUF special key {key}={old_u64} dropped from vocab");
+                }
+            }
+            continue;
+        }
+        if !matches!(val, Kv::Other) {
+            kv_map.insert(key.clone(), val.clone());
+        }
+    }
+    // Sync logis.v_head_order alongside alphaedge.v_head_order if present
+    if let Some(Kv::Str(v)) = kv_map.get("alphaedge.v_head_order").cloned() {
+        kv_map.entry("logis.v_head_order".into()).or_insert(Kv::Str(v));
+    }
+    kv_map.insert(
+        "logis.vocab.orig_ids".into(),
+        Kv::ArrI32(remap.new_to_old.iter().map(|&id| id as i32).collect()),
+    );
+    kv_map.insert("logis.vocab.orig_size".into(), Kv::U32(orig_v as u32));
+    kv_map.insert("logis.vocab.trimmed_size".into(), Kv::U32(k as u32));
+    for (ek, ev) in &overrides.extra_kvs {
+        kv_map.insert(ek.clone(), ev.clone());
+    }
+
+    let kvs: Vec<(String, Kv)> = kv_map.into_iter().collect();
+    let mut decls: Vec<TensorDecl> = Vec::with_capacity(src.order.len());
+    let mut sliced_names: Vec<String> = Vec::new();
+    for name in &src.order {
+        let t = src.tensor(name)?;
+        let mut shape = t.shape.clone();
+        let is_vocab_mat = (name == "token_embd.weight" || name == "output.weight")
+            && shape.len() == 2
+            && shape[0] == orig_v;
+        if is_vocab_mat {
+            shape[0] = k;
+            sliced_names.push(name.clone());
+        }
+        decls.push(TensorDecl {
+            name: name.clone(),
+            ty: t.ty,
+            shape,
+        });
+    }
+    if sliced_names.is_empty() {
+        bail!(
+            "repack_gguf_vocab: no token_embd.weight/output.weight with rows={orig_v} in {}",
+            src_path.display()
+        );
+    }
+
+    if let Some(parent) = dst_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut writer = GgufWriter::create(dst_path, &kvs, decls)?;
+    for name in &src.order {
+        if sliced_names.iter().any(|s| s == name) {
+            for &old_id in &remap.new_to_old {
+                writer.write(src.row_bytes(name, old_id as usize)?)?;
+            }
+        } else {
+            writer.write(src.tensor_bytes(name)?)?;
+        }
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact_trim::{IdRemap, NumberingMode};
+
+    #[test]
+    fn unit_gguf_and_safetensors_row_bit_exact() {
+        let tmp_dir = std::env::temp_dir().join(format!("pd_repack_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+
+        // 1. Mini Q8_0 GGUF: token_embd [128, 32] + norm [32]
+        let src_gguf = tmp_dir.join("src.gguf");
+        let dst_gguf = tmp_dir.join("dst.gguf");
+        let rows = 128usize;
+        let cols = 32usize;
+        let rb = GgmlType::Q8_0.row_bytes(cols);
+        let emb_bytes: Vec<u8> = (0..rows * rb).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        let norm_bytes: Vec<u8> = (0..cols * 4).map(|i| (i % 256) as u8).collect();
+        let kvs = vec![
+            ("general.architecture".into(), Kv::Str("qwen35".into())),
+            ("tokenizer.ggml.tokens".into(), Kv::ArrStr((0..rows).map(|i| format!("t{i}")).collect())),
+            ("tokenizer.ggml.token_type".into(), Kv::ArrI32(vec![1; rows])),
+            ("tokenizer.ggml.eos_token_id".into(), Kv::U32(10)),
+            ("qwen35.image_token_id".into(), Kv::U32(20)),
+        ];
+        let decls = vec![
+            TensorDecl { name: "token_embd.weight".into(), ty: GgmlType::Q8_0, shape: vec![rows, cols] },
+            TensorDecl { name: "output_norm.weight".into(), ty: GgmlType::F32, shape: vec![cols] },
+        ];
+        let mut w = GgufWriter::create(&src_gguf, &kvs, decls).unwrap();
+        w.write(&emb_bytes).unwrap();
+        w.write(&norm_bytes).unwrap();
+        w.finish().unwrap();
+
+        let kept: Vec<u32> = (0..64).map(|i| i * 2).collect();
+        let remap = IdRemap::from_kept_ids(rows, &kept, NumberingMode::Contiguous).unwrap();
+        repack_gguf_vocab(&src_gguf, &dst_gguf, &remap, &GgufVocabOverride::default()).unwrap();
+
+        let out = GgufFile::open(&dst_gguf).unwrap();
+        assert_eq!(out.tensor("token_embd.weight").unwrap().shape, vec![64, 32]);
+        assert_eq!(out.tensor_bytes("output_norm.weight").unwrap(), norm_bytes.as_slice());
+        for (new_id, &old_id) in kept.iter().enumerate() {
+            assert_eq!(
+                out.row_bytes("token_embd.weight", new_id).unwrap(),
+                &emb_bytes[old_id as usize * rb..(old_id as usize + 1) * rb],
+                "GGUF row {new_id} (old {old_id}) must be E0 bit-exact"
+            );
+        }
+        assert_eq!(out.kvs.get("tokenizer.ggml.eos_token_id"), Some(&Kv::U32(5)));
+        assert_eq!(out.kvs.get("qwen35.image_token_id"), Some(&Kv::U32(10)));
+
+        // 2. Mini BF16 safetensors repack bit-exact
+        let st_dir = tmp_dir.join("st_src");
+        let _ = std::fs::create_dir_all(&st_dir);
+        let st_src = st_dir.join("model.safetensors");
+        let st_dst = tmp_dir.join("st_dst.safetensors");
+        let st_emb: Vec<u8> = (0..rows * cols * 2).map(|i| ((i * 17 + 3) % 253) as u8).collect();
+        crate::safetensors::write_safetensors(
+            &st_src,
+            &[
+                ("embeddings.tok_embeddings.weight", crate::safetensors::Dtype::BF16, vec![rows, cols], st_emb.clone()),
+                ("final_norm.weight", crate::safetensors::Dtype::F32, vec![cols], norm_bytes.clone()),
+            ],
+        ).unwrap();
+        crate::safetensors::repack_safetensors_vocab(&st_dir, &st_dst, &["embeddings.tok_embeddings.weight"], &remap).unwrap();
+        let st_out = crate::safetensors::SafeTensors::open(&[st_dst.clone()]).unwrap();
+        assert_eq!(st_out.info("embeddings.tok_embeddings.weight").unwrap().dtype, crate::safetensors::Dtype::BF16);
+        assert_eq!(st_out.info("embeddings.tok_embeddings.weight").unwrap().shape, vec![64, 32]);
+        assert_eq!(st_out.bytes("final_norm.weight").unwrap(), norm_bytes.as_slice());
+        for (new_id, &old_id) in kept.iter().enumerate() {
+            let w_b = cols * 2;
+            assert_eq!(
+                st_out.row_bytes("embeddings.tok_embeddings.weight", new_id).unwrap(),
+                &st_emb[old_id as usize * w_b..(old_id as usize + 1) * w_b]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// 파싱만 열어 둔 형식(Q4_0 등)은 `f32_values` 에서 패닉하지 않고 오류를 돌려준다.
+    #[test]
+    fn parse_only_type_is_an_error_not_a_panic() {
+        let tmp_dir = std::env::temp_dir().join(format!("pd_parse_only_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("q4_0.gguf");
+        let (rows, cols) = (2usize, 32usize);
+        let decls = vec![TensorDecl { name: "w".into(), ty: GgmlType::Q4_0, shape: vec![rows, cols] }];
+        let mut w = GgufWriter::create(&path, &[], decls).unwrap();
+        w.write(&vec![0u8; rows * GgmlType::Q4_0.row_bytes(cols)]).unwrap();
+        w.finish().unwrap();
+
+        let g = GgufFile::open(&path).unwrap();
+        assert!(!GgmlType::Q4_0.has_cpu_kernel());
+        assert!(GgmlType::Q8_0.has_cpu_kernel());
+        assert!(g.f32_values("w").is_err());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
