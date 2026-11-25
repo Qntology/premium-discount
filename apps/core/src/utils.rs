@@ -322,6 +322,19 @@ pub fn rocm_exit_now_if_used(code: u32) {
     let _ = code;
 }
 
+/// 주어진 `device` 핸들에서 `(free, total)` VRAM 바이트를 직접 읽는다.
+/// CPU 이거나 조회에 실패하면 `None` 을 돌려주며, 다른 백엔드 컨텍스트를 새로 열지 않는다.
+pub fn device_mem_info_of(device: &Device) -> Option<(u64, u64)> {
+    if device.is_cpu() {
+        return None;
+    }
+    device
+        .mem_info()
+        .ok()
+        .flatten()
+        .map(|(f, t)| (f as u64, t as u64))
+}
+
 /// (free, total) 바이트. 지정한 `device_index` GPU의 실제 여유/전체 VRAM 을 돌려준다.
 /// 이미 열려 있는 GPU가 같은 순번이면 그 핸들을 재사용하고, 아니면 전역 `OPENED_GPU` 를
 /// 덮어쓰지 않고 해당 순번의 장치를 직접 질의한다.
@@ -478,10 +491,23 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             rel_err_f32(&got, &want)
         }
         AccelOp::LayerNorm => {
-            let x = Tensor::from_vec(det_vec(4 * 64, 4), (4, 64), &Device::Cpu)?;
+            // 후반 2행에 큰 DC 오프셋(+1000.0)을 더해 단패스 E[x²]-E[x]² 소거 오차(BUG(LN-1))를 탐지한다.
+            let mut raw = det_vec(4 * 64, 4);
+            for v in &mut raw[2 * 64..] {
+                *v += 1000.0;
+            }
+            let x = Tensor::from_vec(raw, (4, 64), &Device::Cpu)?;
             let w = Tensor::from_vec(det_vec(64, 5), 64, &Device::Cpu)?;
             let b = Tensor::from_vec(det_vec(64, 6), 64, &Device::Cpu)?;
-            let want = candle_nn::ops::layer_norm(&x, &w, &b, 1e-5)?;
+            let x64 = x.to_dtype(DType::F64)?;
+            let mean = x64.mean_keepdim(candle_core::D::Minus1)?;
+            let c = x64.broadcast_sub(&mean)?;
+            let var = c.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let want = c
+                .broadcast_div(&(var + 1e-5)?.sqrt()?)?
+                .to_dtype(DType::F32)?
+                .broadcast_mul(&w)?
+                .broadcast_add(&b)?;
             let got = candle_nn::ops::layer_norm(&x.to_device(device)?, &w.to_device(device)?, &b.to_device(device)?, 1e-5)?;
             rel_err_f32(&got, &want)
         }

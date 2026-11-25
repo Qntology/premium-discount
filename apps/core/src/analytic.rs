@@ -360,7 +360,29 @@ impl AnalyticStore {
             return Ok(BTreeMap::new());
         }
         let list = ids.iter().map(|i| sql_str(i)).collect::<Vec<_>>().join(", ");
-        Ok(self.query(format!("id IN ({list})"), false, None).await?.into_iter().map(|r| (r.id, r.updated_at)).collect())
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(format!("id IN ({list})"))
+            .select(Select::columns(&["id", "updated_at"]))
+            .execute()
+            .await
+            .map_err(storage)?
+            .try_collect()
+            .await
+            .map_err(storage)?;
+        let mut out = BTreeMap::new();
+        for b in &batches {
+            let id_col = string_col(b, "id")?;
+            let upd_col = b
+                .column_by_name("updated_at")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| AppError::Storage("events table is missing updated_at".into()))?;
+            for i in 0..b.num_rows() {
+                out.insert(id_col.value(i).to_string(), upd_col.value(i));
+            }
+        }
+        Ok(out)
     }
 
     /// 사이트의 시각 컷오프 묘비 (`cutoff:<host>` 행의 deleted_at): 이 시각 이하에 생긴 사건은 다시 들이지 않는다
@@ -468,11 +490,32 @@ impl AnalyticStore {
     /// 다음 받기의 커서: 이 사이트에서 받은 가장 늦은 (시각, id). 묘비만 남은 사건도 커서를 넘긴다.
     /// 시각 컷오프가 그보다 늦으면 컷오프부터 받는다 (지운 구간을 다시 내려받지 않는다)
     pub async fn cursor(&self, host: &str) -> Result<Cursor, AppError> {
-        let rows = self.query(host_filter(host), false, None).await?;
-        let seen = rows
-            .iter()
-            .map(|r| (r.created_at, r.id.clone()))
-            .max()
+        let batches: Vec<RecordBatch> = self
+            .table
+            .query()
+            .only_if(host_filter(host))
+            .select(Select::columns(&["id", "created_at"]))
+            .execute()
+            .await
+            .map_err(storage)?
+            .try_collect()
+            .await
+            .map_err(storage)?;
+        let mut best: Option<(i64, String)> = None;
+        for b in &batches {
+            let id_col = string_col(b, "id")?;
+            let ts_col = b
+                .column_by_name("created_at")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| AppError::Storage("events table is missing created_at".into()))?;
+            for i in 0..b.num_rows() {
+                let cand = (ts_col.value(i), id_col.value(i).to_string());
+                if best.as_ref().is_none_or(|cur| cand > *cur) {
+                    best = Some(cand);
+                }
+            }
+        }
+        let seen = best
             .map(|(since, after_id)| Cursor { since, after_id })
             .unwrap_or_default();
         Ok(match self.cutoff(host).await? {

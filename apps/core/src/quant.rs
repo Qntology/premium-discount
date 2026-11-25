@@ -341,6 +341,38 @@ impl Lin {
             Self::Quant(QMatMul::TensorF16(t)) => t.elem_count() * 2,
         }
     }
+
+    /// 단일 라운딩 융합 W8A16 SwiGLU (`silu(x @ selfᵀ) * (x @ upᵀ)`).
+    /// CUDA/ROCm 디코드(`M <= 8`)에서 두 가중치가 모두 Q8_0 `QTensor` 이면 `x` 를 1회만 읽고
+    /// 중간 `[M, I]` 버퍼 없이 단일 커널로 계산한다. 그 외는 기존 경로로 폴백한다.
+    pub fn fused_gate_up_silu(&self, up: &Self, x: &Tensor) -> Result<Tensor> {
+        if (x.device().is_cuda() || x.device().is_rocm())
+            && matches!(x.dtype(), candle_core::DType::F16 | candle_core::DType::BF16 | candle_core::DType::F32)
+        {
+            let k = *x.dims().last().unwrap_or(&0);
+            let m = if k > 0 { x.elem_count() / k } else { 0 };
+            if m > 0 && m <= 8 {
+                if let (Some(gq), Some(uq)) = (self.qtensor(), up.qtensor()) {
+                    if gq.dtype() == candle_core::quantized::GgmlDType::Q8_0
+                        && uq.dtype() == candle_core::quantized::GgmlDType::Q8_0
+                        && gq.device().same_device(x.device())
+                        && uq.device().same_device(x.device())
+                    {
+                        return gq.fused_gate_up_silu(uq, x);
+                    }
+                }
+            }
+        }
+        let gate = self.forward(x)?;
+        let up_v = up.forward(x)?;
+        if !gate.device().is_cpu()
+            && crate::utils::accel_op_ok(gate.device(), crate::utils::AccelOp::DecoderOps)
+        {
+            candle_core::decoder_ops::silu_mul(&gate, &up_v).or_else(|_| &gate.silu()? * &up_v)
+        } else {
+            &gate.silu()? * &up_v
+        }
+    }
 }
 
 impl Module for Lin {

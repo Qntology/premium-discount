@@ -135,13 +135,16 @@ fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Te
             }
         }
     }
-    if let Some(bias) = b {
-        if !x.device().is_cpu()
-            && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::LayerNorm)
-        {
-            if let Ok(y) = candle_nn::ops::layer_norm(x, w, bias, eps as f32) {
-                return Ok(y);
-            }
+    if !x.device().is_cpu()
+        && crate::utils::accel_op_ok(x.device(), crate::utils::AccelOp::LayerNorm)
+    {
+        let res = match b {
+            Some(bias) => candle_nn::ops::layer_norm(x, w, bias, eps as f32),
+            None => Tensor::zeros(w.shape(), x.dtype(), x.device())
+                .and_then(|zero_b| candle_nn::ops::layer_norm(x, w, &zero_b, eps as f32)),
+        };
+        if let Ok(y) = res {
+            return Ok(y);
         }
     }
     let mean = x.mean_keepdim(D::Minus1)?;
