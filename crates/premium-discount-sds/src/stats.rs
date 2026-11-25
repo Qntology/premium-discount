@@ -212,6 +212,7 @@ pub struct DecayStat {
     pub top_gap_ratio: Welford,
     pub tail_flatness: Welford,
     pub entropy_norm: Welford,
+    #[serde(default)]
     pub positive_ratio: Welford,
 }
 
@@ -290,6 +291,86 @@ impl RejectStat {
     }
 }
 
+/// Shrinkage pseudo-count `k` for [`CalibrationStat`] geometric mean regularization.
+pub const CALIBRATION_SHRINK_K: f64 = 5.0;
+
+/// Per-gate evaluation / block / sole-block efficiency telemetry (`GateStat`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GateStat {
+    pub evaluated: u64,
+    pub blocked: u64,
+    pub sole: u64,
+    #[serde(default)]
+    pub severity: Welford,
+}
+
+impl GateStat {
+    pub fn record(&mut self, severity: u8, blocked: bool, sole: bool, ring: usize) {
+        self.evaluated += 1;
+        if blocked {
+            self.blocked += 1;
+        }
+        if sole {
+            self.sole += 1;
+        }
+        self.severity.push(severity as f64, ring);
+    }
+
+    pub fn merge_from(&mut self, v: &GateStat, ring: usize) {
+        self.evaluated += v.evaluated;
+        self.blocked += v.blocked;
+        self.sole += v.sole;
+        self.severity.merge(&v.severity, ring);
+    }
+
+    pub fn blocked_rate(&self) -> f64 {
+        if self.evaluated == 0 {
+            0.0
+        } else {
+            self.blocked as f64 / self.evaluated as f64
+        }
+    }
+
+    pub fn sole_rate(&self) -> f64 {
+        if self.evaluated == 0 {
+            0.0
+        } else {
+            self.sole as f64 / self.evaluated as f64
+        }
+    }
+}
+
+/// Log-space multiplicative calibration accumulator that eliminates `exp(sigma^2 / 2)`
+/// arithmetic-mean bias via shrinkage toward unit scale: `exp(mean * n / (n + 5.0))`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CalibrationStat(pub Welford);
+
+impl CalibrationStat {
+    pub fn push_ratio(&mut self, ratio: f64, ring: usize) {
+        if ratio.is_finite() && ratio > 0.0 {
+            self.0.push(ratio.ln(), ring);
+        }
+    }
+
+    pub fn factor(&self) -> f64 {
+        let n = self.0.n as f64;
+        if n <= 0.0 {
+            1.0
+        } else {
+            (self.0.mean * (n / (n + CALIBRATION_SHRINK_K))).exp()
+        }
+    }
+
+    pub fn merge_from(&mut self, other: &CalibrationStat, ring: usize) {
+        self.0.merge(&other.0, ring);
+    }
+
+    pub fn trim_ring(&mut self, ring: usize) {
+        self.0.trim_ring(ring);
+    }
+}
+
 /// Everything recorded under one scope key.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScopeStat {
@@ -308,6 +389,12 @@ pub struct ScopeStat {
     /// Transition counts keyed `from>to`.
     #[serde(default)]
     pub transition: HashMap<String, u64>,
+    /// Gate telemetry keyed by gate ID.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub gates: HashMap<String, GateStat>,
+    /// Log-normal shrinkage scale calibrations keyed by axis.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub calibration: HashMap<String, CalibrationStat>,
     /// Last observation time (Unix ms).
     #[serde(default)]
     pub updated_ms: i64,
@@ -331,6 +418,12 @@ impl ScopeStat {
         for (k, v) in other.transition {
             *self.transition.entry(k).or_insert(0) += v;
         }
+        for (k, v) in other.gates {
+            self.gates.entry(k).or_default().merge_from(&v, ring);
+        }
+        for (k, v) in other.calibration {
+            self.calibration.entry(k).or_default().merge_from(&v, ring);
+        }
         self.updated_ms = self.updated_ms.max(other.updated_ms);
     }
 
@@ -340,6 +433,8 @@ impl ScopeStat {
             && self.confusion.is_empty()
             && self.reject.is_empty()
             && self.transition.is_empty()
+            && self.gates.is_empty()
+            && self.calibration.is_empty()
     }
 
     /// Observation count used to rank scopes when a ledger must shed some.
@@ -349,6 +444,8 @@ impl ScopeStat {
             + self.confusion.values().map(|c| c.ties).sum::<u64>()
             + self.reject.values().map(|r| r.seen.max(r.rejected)).sum::<u64>()
             + self.transition.values().sum::<u64>()
+            + self.gates.values().map(|g| g.evaluated).sum::<u64>()
+            + self.calibration.values().map(|c| c.0.n).sum::<u64>()
     }
 
     /// Re-applies a (changed) ring length to every ring in this scope.
@@ -361,6 +458,12 @@ impl ScopeStat {
         }
         for c in self.confusion.values_mut() {
             c.margin.trim_ring(ring);
+        }
+        for g in self.gates.values_mut() {
+            g.severity.trim_ring(ring);
+        }
+        for c in self.calibration.values_mut() {
+            c.trim_ring(ring);
         }
     }
 }

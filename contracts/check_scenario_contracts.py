@@ -19,6 +19,7 @@ sys.dont_write_bytecode = True
 
 HERE = Path(__file__).resolve().parent
 PD_ROOT = HERE.parent
+LV_ROOT = Path(os.environ.get("LOUIS_VISION_DIR", PD_ROOT.parent / "louis-vision"))
 RZ_ROOT = Path(os.environ.get("RAON_ZENA_DIR", PD_ROOT.parent / "raon-zena"))
 FILES = ["course_nav_v1", "proactive_friction_v1", "contextual_rag_v1", "feedback_credit_v1", "web_analytic_v1", "privacy_shield_v1"]
 
@@ -61,10 +62,18 @@ def main():
             if c.get("pending"):
                 pending.append(f"{c['id']}: {c['pending']}")
             for o in c["owners"]:
-                root = PD_ROOT if o["repo"] == "premium-discount" else RZ_ROOT
-                if o["repo"] == "raon-zena" and not RZ_ROOT.exists():
-                    skipped += 1
-                    continue
+                if o["repo"] == "louis-vision":
+                    if not (LV_ROOT / "crates" / "lv-screen").exists():
+                        skipped += 1
+                        continue
+                    root = LV_ROOT
+                elif o["repo"] == "raon-zena":
+                    if not RZ_ROOT.exists():
+                        skipped += 1
+                        continue
+                    root = RZ_ROOT
+                else:
+                    root = PD_ROOT
                 checked += 1
                 target = root / o["path"]
                 if not target.exists():
@@ -75,7 +84,7 @@ def main():
         print("PENDING", p)
     for p in problems:
         print("FAIL", p)
-    print(f"{checked} owner tests checked, {skipped} skipped (raon-zena not found at {RZ_ROOT})" if skipped else f"{checked} owner tests checked")
+    print(f"{checked} owner tests checked, {skipped} external owners skipped" if skipped else f"{checked} owner tests checked")
     sys.exit(1 if problems else 0)
 
 

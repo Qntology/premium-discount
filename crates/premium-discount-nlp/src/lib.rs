@@ -11,5 +11,7 @@
 #[cfg(feature = "granite")]
 pub mod granite;
 pub mod models;
+pub mod morphology;
+pub mod phonetic;
 #[cfg(feature = "stanza")]
 pub mod stanza;

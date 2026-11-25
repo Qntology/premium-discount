@@ -62,7 +62,8 @@ pub fn lang_code(language: &str) -> Option<&'static str> {
         "korean" | "ko" | "kor" => "ko",
         "english" | "en" | "eng" => "en",
         "japanese" | "ja" | "jpn" => "ja",
-        "chinese" | "zh" | "zh-hans" | "zh-cn" | "cmn" | "zh-hant" | "zh-tw" | "zh-hk" => "zh-hans",
+        "chinese" | "zh" | "zh-hans" | "zh-cn" | "cmn" | "zh-hant" | "zh-tw" | "zh-hk"
+        | "traditional chinese" | "simplified chinese" => "zh-hans",
         "french" | "fr" | "fra" => "fr",
         "german" | "de" | "deu" => "de",
         "spanish" | "es" | "spa" => "es",
@@ -2500,6 +2501,51 @@ pub fn analyze_query(query: &str, lang: &str) -> Result<QueryAnalysis> {
     })
 }
 
+/// Model-free fallback analysis when Stanza ONNX weights or ONNX Runtime DLL are absent:
+/// splits whitespace units, peels closed-class tails via [`crate::morphology::closed_tail_peel`],
+/// and assigns numeric-density pseudo-POS tags (`NUM` / `PUNCT` / `ADP` / `NOUN`).
+pub fn pseudo_analyze_query(query: &str, lang: &str) -> QueryAnalysis {
+    let code = lang_code(lang).unwrap_or("en");
+    let units = query
+        .split_whitespace()
+        .map(|raw| {
+            let upos = crate::morphology::pseudo_pos_tag(raw, code).to_string();
+            let stem = crate::morphology::closed_tail_peel(raw, code);
+            let functional = is_drop_tag(&upos);
+            let word = WordAnalysis {
+                text: raw.to_string(),
+                upos: upos.clone(),
+                xpos: String::new(),
+                feats: String::new(),
+                lemma: stem.clone(),
+                head: 0,
+                deprel: String::new(),
+            };
+            QueryUnit {
+                surface: raw.to_string(),
+                upos,
+                functional,
+                stem,
+                deprel: String::new(),
+                feats: String::new(),
+                words: vec![word],
+            }
+        })
+        .collect();
+    QueryAnalysis {
+        lang: code.to_string(),
+        units,
+        whitespace_units: true,
+        elapsed_ms: 0,
+    }
+}
+
+/// Runs Stanza ONNX if available, otherwise falls back cleanly to [`pseudo_analyze_query`].
+pub fn analyze_query_or_pseudo(query: &str, lang: &str) -> QueryAnalysis {
+    let code = lang_code(lang).unwrap_or("en");
+    analyze_query(query, code).unwrap_or_else(|_| pseudo_analyze_query(query, code))
+}
+
 /// Units logis-center drops from search queries when they hold no content morpheme
 /// (`commerce/src-tauri/src/utils/ai_utils.rs` `STANZA_DROP_TAGS`).
 pub const STANZA_DROP_TAGS: &[&str] = &["ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
@@ -2537,5 +2583,9 @@ mod tests {
         assert_eq!(detect_query_lang("上周取消的订单", "korean"), Some("zh-hans"));
         assert_eq!(detect_query_lang("الطلبات الملغاة", "korean"), Some("ar"));
         assert_eq!(detect_query_lang("pedidos con envío pequeño", "korean"), Some("es"));
+        assert_eq!(lang_code("Traditional Chinese"), Some("zh-hans"));
+        let pseudo = pseudo_analyze_query("말레니아를 2026", "ko");
+        assert_eq!(pseudo.units[0].stem, "말레니아");
+        assert_eq!(pseudo.units[1].upos, "NUM");
     }
 }

@@ -1007,6 +1007,26 @@ pub fn kinds(pieces: &[Vec<u8>], added: &[bool]) -> Vec<Kind> {
     pieces.iter().zip(added).map(|(p, a)| kind_of(p, *a)).collect()
 }
 
+/// Deterministic FNV-1a 64-bit tokenizer vocabulary fingerprint used as trim cache key.
+pub fn tok_fingerprint(pieces: &[Vec<u8>]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (idx, p) in pieces.iter().enumerate() {
+        for &b in &(idx as u32).to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for &b in &(p.len() as u32).to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for &b in p {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,5 +1190,40 @@ mod tests {
         let dom: BTreeSet<u32> = (pieces.len() as u32 - 40..pieces.len() as u32).collect();
         let (cr_ids, _) = select_compact_ranked(&k, &dom, &BTreeSet::new(), &BTreeSet::new(), Langs::of_doc_lang("ja"), 512, None);
         assert_eq!(cr_ids.len() % ALIGN, 0);
+        assert_ne!(tok_fingerprint(&pieces), 0);
+        assert_eq!(tok_fingerprint(&pieces), tok_fingerprint(&pieces));
+    }
+
+    #[test]
+    fn target_k_12288_preserves_hangul_without_truncation() {
+        let mut pieces: Vec<Vec<u8>> = vec![b"<s>".to_vec()];
+        for b in 0..=255u8 {
+            pieces.push(vec![b]);
+        }
+        for i in 0..8000usize {
+            pieces.push(format!("한글{i}").into_bytes());
+        }
+        for i in 0..8000usize {
+            pieces.push(format!("tok{i}").into_bytes());
+        }
+        let added: Vec<bool> = (0..pieces.len()).map(|i| i == 0).collect();
+        let k = kinds(&pieces, &added);
+        let (ids, _) = select_compact_ranked(
+            &k,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Langs::of_doc_lang("ko"),
+            12_288,
+            None,
+        );
+        assert_eq!(ids.len() % ALIGN, 0);
+        assert_eq!(ids.len(), 12_288);
+        let ko_kept = ids
+            .iter()
+            .filter(|&&id| matches!(k[id as usize], Kind::Script { hangul: true, .. }))
+            .count();
+        assert!(ko_kept > 5000, "target_k=12288 truncated Hangul too aggressively: {ko_kept}");
+        assert!(TrimRule::parse("compact").is_err());
     }
 }

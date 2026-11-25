@@ -69,6 +69,8 @@ const PROHIBIT_SURFACES: &[&str] = &["마", "마라", "마요", "말고", "말�
 const PROHIBIT_LEMMAS: &[&str] = &["마", "말"];
 /// Negating adverbs before a predicate.
 const NEG_ADVERBS: &[&str] = &["안", "못", "not", "never", "don't", "dont"];
+/// CJK negation markers that bind only to an adjacent predicate/object window.
+const NEG_CJK_ADJACENT: &[&str] = &["不", "没", "沒", "非", "無", "不是", "没有", "沒有", "ない", "ません", "ず"];
 /// Korean determiners before a noun ("이 보스", "그 패턴").
 const KO_DETERMINERS: &[&str] = &["이", "그", "저", "이런", "그런", "저런"];
 /// English function words (tokens Stanza would tag ADP / DET / PRON / PART).
@@ -215,14 +217,19 @@ pub fn negation_counts(words: &[Word]) -> Vec<u8> {
         let w = &words[i];
         let s = w.surface.as_str();
         if w.role == Role::Negation {
-            let adverb = NEG_ADVERBS.contains(&s) && w.upos != "AUX";
+            let cjk_adj = NEG_CJK_ADJACENT.contains(&s) && w.upos != "AUX";
+            let adverb = (NEG_ADVERBS.contains(&s) && w.upos != "AUX") || cjk_adj;
             if adverb {
-                // A negating adverb ("안 가") scopes forward over its predicate.
+                // Forward window: CJK negators bind strictly to the adjacent target token.
                 let b = (i + 1).min(n - 1);
                 let start = clause_start.max(adverb_end);
-                let a = if b > i && i > start && is_light_verb(&words[b]) && words[i - 1].is_content() { i - 1 } else { i };
+                let a = if !cjk_adj && b > i && i > start && is_light_verb(&words[b]) && words[i - 1].is_content() {
+                    i - 1
+                } else {
+                    i
+                };
                 cover(&mut counts, a, b);
-                last_adverb = Some((a, b));
+                last_adverb = if cjk_adj { None } else { Some((a, b)) };
                 adverb_end = b + 1;
             } else {
                 // A prohibition ("끄지 마") or a long negation ("나쁘지 않아") scopes backward over its clause.
@@ -422,7 +429,11 @@ impl RuleAnalyzer {
             let s = words[i].surface.as_str();
             let after_predicate = i > 0 && is_predicate_like(&words[i - 1]);
             let long_negation = i > 0 && is_long_negation(&words[i - 1], &words[i]);
-            words[i].role = if (PROHIBIT_SURFACES.contains(&s) && after_predicate) || long_negation || NEG_ADVERBS.contains(&s) {
+            words[i].role = if (PROHIBIT_SURFACES.contains(&s) && after_predicate)
+                || long_negation
+                || NEG_ADVERBS.contains(&s)
+                || NEG_CJK_ADJACENT.contains(&s)
+            {
                 Role::Negation
             } else if AUX_SURFACES.contains(&s) && after_predicate {
                 Role::Auxiliary
@@ -697,5 +708,16 @@ mod tests {
         let w = analyzed("보스 패턴");
         assert_eq!(read_span(&w, 5, 9).clause, 0);
         assert_eq!(Polarity::from_count(3), Polarity::Negated);
+    }
+
+    #[test]
+    fn cjk_negation_binds_to_adjacent_window_only() {
+        let w = analyzed("质量 好 但是 不 推荐 购买");
+        let counts = negation_counts(&w);
+        assert_eq!(counts[0], 0);
+        assert_eq!(counts[1], 0);
+        assert_eq!(counts[3], 1, "不");
+        assert_eq!(counts[4], 1, "推荐");
+        assert_eq!(counts[5], 0, "购买 stays outside adjacent CJK negation window: {counts:?}");
     }
 }

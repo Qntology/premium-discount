@@ -25,6 +25,10 @@ pub trait TextEmbedder: Send + Sync {
     fn space(&self) -> &str {
         "hash-ngram-v1"
     }
+    /// Owned vector space identifier used to isolate per-embedder SDS scopes.
+    fn space_tag(&self) -> String {
+        self.space().to_string()
+    }
 }
 
 /// One embedder shared by the router's bank and its semantic NMS, kept across dictionary reloads.
@@ -49,6 +53,9 @@ impl TextEmbedder for SharedEmbedder {
     }
     fn space(&self) -> &str {
         self.0.space()
+    }
+    fn space_tag(&self) -> String {
+        self.0.space_tag()
     }
 }
 

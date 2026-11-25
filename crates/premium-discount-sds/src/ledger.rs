@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{bail, Context, Result};
 
 use crate::persist::{self, BaseFile, Loaded, RunFile, BASE_CAP_BYTES};
-use crate::scope::{MinObs, Scope, UNSCOPED_KEY, UNSCOPED_RING};
-use crate::stats::{decay_shape, tie_verdict, ConfusionStat, DecayStat, ScopeStat, Welford};
+use crate::scope::{MinObs, RunRetire, Scope, WriteMode, UNSCOPED_KEY, UNSCOPED_RING};
+use crate::stats::{decay_shape, tie_verdict, ConfusionStat, DecayStat, GateStat, ScopeStat, Welford};
 use crate::RECIPE;
 
 /// Which backoff level answered a read.
@@ -70,15 +70,17 @@ impl Band {
 /// Plain data, `Send + Sync`: wrap it in a `Mutex` / `RwLock` to share. Dropping it without [`Ledger::close`] acts
 /// like a crash: the last flushed run file is folded by the next [`Ledger::open`], unflushed observations are lost.
 #[derive(Debug)]
-pub struct Ledger {
+pub struct Ledger<Ext = ()> {
     name: String,
     store: Option<Store>,
+    write_mode: WriteMode,
     min_obs: HashMap<String, MinObs>,
     base: HashMap<String, ScopeStat>,
     run: Run,
     recovered: usize,
     set_aside: Vec<PathBuf>,
     shed: usize,
+    ext: Ext,
 }
 
 #[derive(Debug)]
@@ -160,44 +162,80 @@ fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-impl Ledger {
-    fn new(name: &str, store: Option<Store>) -> Self {
-        Self {
-            name: name.to_string(),
-            store,
-            min_obs: HashMap::new(),
-            base: HashMap::new(),
-            run: Run::fresh(),
-            recovered: 0,
-            set_aside: Vec::new(),
-            shed: 0,
-        }
-    }
-
+impl Ledger<()> {
     /// In memory only (tests, no files).
-    pub fn in_memory(name: &str) -> Ledger {
-        Self::new(name, None)
+    pub fn in_memory(name: &str) -> Self {
+        Self::new_with_ext(name, None, ())
     }
 
     /// `<dir>/<name>.json` is the base; this run writes `<dir>/runs/<name>/<unique>.json` on flush. Leftover run files of
     /// crashed earlier runs are folded into the base on open (then deleted). Corrupt files are renamed `*.corrupt` and
     /// ignored, never panic.
-    pub fn open(dir: &Path, name: &str) -> Result<Ledger> {
+    pub fn open(dir: &Path, name: &str) -> Result<Self> {
         Self::open_with(dir, name, &[])
     }
 
     /// [`Ledger::open`] with track floors set first, so crashed runs are folded with the right ring lengths.
-    pub fn open_with(dir: &Path, name: &str, tracks: &[(&str, MinObs)]) -> Result<Ledger> {
+    pub fn open_with(dir: &Path, name: &str, tracks: &[(&str, MinObs)]) -> Result<Self> {
         check_name(name)?;
         fs::create_dir_all(dir).with_context(|| format!("creating SDS directory {}", dir.display()))?;
         let store = Store::new(dir, name);
-        let mut ledger = Self::new(name, None);
+        let mut ledger = Self::new_with_ext(name, None, ());
         for (track, m) in tracks {
             ledger.min_obs.insert(track.trim().to_string(), *m);
         }
         ledger.load_and_recover(&store)?;
         ledger.store = Some(store);
         Ok(ledger)
+    }
+}
+
+impl<Ext> Ledger<Ext> {
+    fn new_with_ext(name: &str, store: Option<Store>, ext: Ext) -> Self {
+        Self {
+            name: name.to_string(),
+            store,
+            write_mode: WriteMode::ExactKey,
+            min_obs: HashMap::new(),
+            base: HashMap::new(),
+            run: Run::fresh(),
+            recovered: 0,
+            set_aside: Vec::new(),
+            shed: 0,
+            ext,
+        }
+    }
+
+    /// Attaches domain-specific extension state (`Ext`) to this ledger instance.
+    pub fn with_ext<E>(self, ext: E) -> Ledger<E> {
+        Ledger {
+            name: self.name,
+            store: self.store,
+            write_mode: self.write_mode,
+            min_obs: self.min_obs,
+            base: self.base,
+            run: self.run,
+            recovered: self.recovered,
+            set_aside: self.set_aside,
+            shed: self.shed,
+            ext,
+        }
+    }
+
+    pub fn ext(&self) -> &Ext {
+        &self.ext
+    }
+
+    pub fn ext_mut(&mut self) -> &mut Ext {
+        &mut self.ext
+    }
+
+    pub fn write_mode(&self) -> WriteMode {
+        self.write_mode
+    }
+
+    pub fn set_write_mode(&mut self, mode: WriteMode) {
+        self.write_mode = mode;
     }
 
     /// Reads the base and folds dead run files into it, under the base lock.
@@ -331,13 +369,29 @@ impl Ledger {
         }
     }
 
-    fn with_scope_mut(&mut self, s: &Scope, f: impl FnOnce(&mut ScopeStat, usize)) {
-        let key = Self::key_for(s);
-        let ring = self.ring_for_key(&key);
+    fn target_keys(&self, s: &Scope) -> Vec<String> {
+        if s.is_empty() || self.write_mode == WriteMode::ExactKey {
+            return vec![Self::key_for(s)];
+        }
+        let mut keys = Vec::with_capacity(3);
+        for k in [s.key_secondary(), s.key_primary(), s.key_global()] {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        keys
+    }
+
+    fn with_scope_mut(&mut self, s: &Scope, mut f: impl FnMut(&mut ScopeStat, usize)) {
+        let keys = self.target_keys(s);
+        let now = now_ms();
         self.run.observations = self.run.observations.saturating_add(1);
-        let e = self.run.scopes.entry(key).or_default();
-        f(e, ring);
-        e.updated_ms = now_ms();
+        for key in keys {
+            let ring = self.ring_for_key(&key);
+            let e = self.run.scopes.entry(key).or_default();
+            f(e, ring);
+            e.updated_ms = now;
+        }
         self.run.dirty = true;
     }
 
@@ -371,7 +425,7 @@ impl Ledger {
             format!("{loser}|{winner}")
         };
         self.with_scope_mut(s, |st, ring| {
-            let e = st.confusion.entry(key).or_default();
+            let e = st.confusion.entry(key.clone()).or_default();
             e.ties += 1;
             if winner_is_a {
                 e.a_wins += 1;
@@ -391,7 +445,7 @@ impl Ledger {
         }
         let key = if a <= b { format!("{a}|{b}") } else { format!("{b}|{a}") };
         self.with_scope_mut(s, |st, ring| {
-            let e = st.confusion.entry(key).or_default();
+            let e = st.confusion.entry(key.clone()).or_default();
             e.ties += 1;
             if margin.is_finite() {
                 e.margin.push(margin as f64, ring);
@@ -429,7 +483,27 @@ impl Ledger {
             return;
         }
         let key = format!("{from}>{to}");
-        self.with_scope_mut(s, |st, _| *st.transition.entry(key).or_insert(0) += 1);
+        self.with_scope_mut(s, |st, _| *st.transition.entry(key.clone()).or_insert(0) += 1);
+    }
+
+    /// Records a gate outcome (`severity` in `0..=100`, `blocked`, `sole`) for `gate`.
+    pub fn record_gate(&mut self, s: &Scope, gate: &str, severity: u8, blocked: bool, sole: bool) {
+        if gate.is_empty() {
+            return;
+        }
+        self.with_scope_mut(s, |st, ring| {
+            st.gates.entry(gate.to_string()).or_default().record(severity, blocked, sole, ring);
+        });
+    }
+
+    /// Records a positive calibration multiplier observation into [`crate::CalibrationStat`].
+    pub fn record_calibration(&mut self, s: &Scope, axis: &str, ratio: f64) {
+        if axis.is_empty() || !ratio.is_finite() || ratio <= 0.0 {
+            return;
+        }
+        self.with_scope_mut(s, |st, ring| {
+            st.calibration.entry(axis.to_string()).or_default().push_ratio(ratio, ring);
+        });
     }
 
     // ── reads ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -569,6 +643,40 @@ impl Ledger {
         tie_verdict(history, self.learned_specificity(s, item), self.learned_specificity(s, rival))
     }
 
+    /// Like [`Ledger::confusion_winner`], but filters out winners rejected by [`Ledger::tie_break_allows`].
+    pub fn confusion_winner_checked(&self, s: &Scope, a: &str, b: &str) -> Option<(String, f32, u64)> {
+        let (winner, rate, ties) = self.confusion_winner(s, a, b)?;
+        let loser = if winner == a { b } else { a };
+        tie_verdict(
+            Some((true, rate)),
+            self.learned_specificity(s, &winner),
+            self.learned_specificity(s, loser),
+        )
+        .then_some((winner, rate, ties))
+    }
+
+    /// Merged gate efficiency stats along the backoff ladder.
+    pub fn gate_stat(&self, s: &Scope, gate: &str) -> Option<GateStat> {
+        self.resolve_entry(
+            s,
+            |st| st.gates.get(gate),
+            GateStat::merge_from,
+            |g| Some((g.clone(), g.evaluated)),
+        )
+        .map(|(g, _)| g)
+    }
+
+    /// Log-normal shrinkage calibration factor `exp(mean * n / (n + 5))` along the backoff ladder.
+    pub fn calibration_factor(&self, s: &Scope, axis: &str) -> Option<f64> {
+        self.resolve_entry(
+            s,
+            |st| st.calibration.get(axis),
+            crate::stats::CalibrationStat::merge_from,
+            |c| Some((c.factor(), c.0.n)),
+        )
+        .map(|(f, _)| f)
+    }
+
     /// Laplace-smoothed `P(to | from) = (hit + 1) / (total + k)`, `k` = distinct transitions in the scope. Secondary
     /// then primary level only; `None` while `from` has fewer departures than the level's floor.
     pub fn transition_prior(&self, s: &Scope, from: &str, to: &str) -> Option<f32> {
@@ -676,6 +784,16 @@ impl Ledger {
         let result = self.close_file(&store);
         self.store = Some(store);
         result
+    }
+
+    /// Atomically folds the active run into the base and returns a [`RunRetire`] summary.
+    pub fn retire_run(&mut self) -> Result<RunRetire> {
+        let summary = RunRetire {
+            folded_scopes: self.run.scopes.len(),
+            observations: self.run.observations,
+        };
+        self.close()?;
+        Ok(summary)
     }
 
     fn close_file(&mut self, store: &Store) -> Result<()> {
@@ -1008,5 +1126,54 @@ mod tests {
             r.contains("reject 1/1 seen") && r.contains("transition 1") && r.contains("run 8 obs") && r.contains("in memory"),
             "{r}"
         );
+    }
+
+    #[test]
+    fn hierarchical_write_mode_and_retire_run_work() {
+        let mut l = Ledger::in_memory("hier").with_ext(42u32);
+        assert_eq!(*l.ext(), 42);
+        l.set_write_mode(WriteMode::Hierarchical);
+        let s = sc("shop-a", "row-1");
+        for i in 0..4 {
+            l.record_baseline(&s, "score", i as f32 + 1.0);
+        }
+        l.record_gate(&s, "legibility", 80, true, true);
+        let summary = l.retire_run().unwrap();
+        assert_eq!(summary.folded_scopes, 3);
+        assert_eq!(summary.observations, 5);
+        // Primary level floor (3) satisfied automatically by hierarchical fan-out!
+        assert_eq!(l.baseline(&sc("shop-a", "row-99"), "score").unwrap().level, Level::Primary);
+        assert!(l.gate_stat(&s, "legibility").is_none(), "1 < floor");
+
+        // Legacy 4-axis DecayStat (without positive_ratio) and 5-axis JSON round-trip
+        let legacy_json = r#"{"margin":{"n":2,"mean":0.1,"m2":0.0},"top_gap_ratio":{"n":2,"mean":0.5,"m2":0.0},"tail_flatness":{"n":2,"mean":0.2,"m2":0.0},"entropy_norm":{"n":2,"mean":0.3,"m2":0.0}}"#;
+        let dec: DecayStat = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(dec.positive_ratio.n, 0);
+
+        // Log-normal shrinkage CalibrationStat eliminates arithmetic exp(sigma^2/2) bias
+        let mut cal = crate::CalibrationStat::default();
+        // Lognormal samples centered at log(1.5) with symmetric +/-0.5 log dispersion (arith mean = 1.5*cosh(0.5) ≈ 1.691)
+        for i in 0..1000 {
+            let log_err = if i % 2 == 0 { 0.5 } else { -0.5 };
+            cal.push_ratio((1.5f64.ln() + log_err).exp(), 0);
+        }
+        assert!((cal.factor() - 1.5).abs() < 0.01, "cal factor={}", cal.factor());
+
+        assert_eq!(crate::team_fate("a", "a", "loc"), crate::TeamFate::Keep);
+        assert_eq!(crate::team_fate("loc", "a", "loc"), crate::TeamFate::Migrate);
+        assert_eq!(crate::team_fate("a", "loc", "loc"), crate::TeamFate::Hold);
+        assert_eq!(crate::team_fate("a", "b", "loc"), crate::TeamFate::Discard);
+
+        // confusion_winner_checked enforces TIE_WIN_RATE
+        for _ in 0..6 {
+            l.record_confusion(&s, "alpha", "beta", 0.1);
+        }
+        assert_eq!(l.confusion_winner_checked(&s, "alpha", "beta").unwrap().0, "alpha");
+        let tie_s = sc("shop-a", "row-2");
+        for _ in 0..3 {
+            l.record_confusion(&tie_s, "alpha", "beta", 0.01);
+            l.record_confusion(&tie_s, "beta", "alpha", 0.01);
+        }
+        assert!(l.confusion_winner_checked(&tie_s, "alpha", "beta").is_none());
     }
 }

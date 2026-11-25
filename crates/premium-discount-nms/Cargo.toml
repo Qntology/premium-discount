@@ -10,7 +10,6 @@ premium-discount-cpu-kernels.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 premium-discount-sds.workspace = true
-premium-discount-sensor.workspace = true
 # 기능 `neural`: granite 임베딩, `stanza`: + Stanza 역할 분석 (ONNX Runtime)
 premium-discount-nlp = { workspace = true, optional = true }
 candle-core = { workspace = true, optional = true }

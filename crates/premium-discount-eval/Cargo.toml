@@ -1,0 +1,17 @@
+[package]
+name = "premium-discount-eval"
+description = "Model-free universal evaluation core: scenario rules, paired bootstrap E0-E3 gates, calibration and Platt prior fitting, gate A/B accounting, accelerator parity tolerances, and workspace hygiene checks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+hygiene = ["dep:sha2"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = { workspace = true, optional = true }

@@ -263,6 +263,44 @@ impl<M: Clone, E: TextEmbedder> DomainBank<M, E> {
         }
         self.score_words(words).into_iter().next()
     }
+
+    /// Exact tokens shared across two or more distinct domains in this bank (ambiguous vocabulary mask).
+    pub fn cross_domain_mask(&self) -> HashSet<String> {
+        let mut owner_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for e in &self.entries {
+            let mut per_entry: HashSet<String> = HashSet::new();
+            for (ex, _) in &e.exact {
+                per_entry.insert(ex.clone());
+            }
+            for tok in per_entry {
+                *owner_counts.entry(tok).or_insert(0) += 1;
+            }
+        }
+        owner_counts
+            .into_iter()
+            .filter_map(|(tok, cnt)| (cnt >= 2).then_some(tok))
+            .collect()
+    }
+
+    /// Bank-neutral score normalization: divides centered scores by overall standard deviation
+    /// (`net_sd`) and subtracts the Gumbel expected extreme-value maximum `sqrt(2 * ln(N))`.
+    pub fn bank_neutral_scores(raw: &[DomainScore]) -> Vec<f32> {
+        let n = raw.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 {
+            return vec![raw[0].score];
+        }
+        let nf = n as f64;
+        let mean = raw.iter().map(|r| r.score as f64).sum::<f64>() / nf;
+        let var = raw.iter().map(|r| (r.score as f64 - mean).powi(2)).sum::<f64>() / nf;
+        let net_sd = var.sqrt().max(1e-6);
+        let gumbel = (2.0 * nf.ln()).sqrt();
+        raw.iter()
+            .map(|r| (((r.score as f64 - mean) / net_sd) - gumbel) as f32)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -318,5 +356,32 @@ mod tests {
         let best = b.best(&normalize("종료해 줘").words).unwrap();
         assert_eq!(b.entry(best.index).payload, Act::Quit);
         assert_eq!(b.index_of("market.down"), Some(2));
+    }
+
+    #[test]
+    fn cross_domain_mask_and_bank_neutral_gumbel() {
+        let spec = |key: &str, payload: Act, exact: &[&str]| DomainSpec {
+            key: key.into(),
+            payload,
+            bias: vec![("shared".into(), 1.0)],
+            prejudice: vec![],
+            exact: exact.iter().map(|e| e.to_string()).collect(),
+        };
+        let b = DomainBank::from_specs(
+            vec![
+                spec("a", Act::Quit, &["shared", "alpha"]),
+                spec("b", Act::Cheer, &["shared", "beta"]),
+            ],
+            &[],
+            HashedNgramEmbedder::default(),
+        );
+        let mask = b.cross_domain_mask();
+        assert!(mask.contains("shared") && !mask.contains("alpha"));
+        let scores = vec![
+            DomainScore { index: 0, score: 0.9, bias: 0.9, prej: 0.0, hit: Hit::Vector },
+            DomainScore { index: 1, score: 0.3, bias: 0.3, prej: 0.0, hit: Hit::Vector },
+        ];
+        let z = DomainBank::<Act, HashedNgramEmbedder>::bank_neutral_scores(&scores);
+        assert!(z[0] > z[1] && z[0].is_finite() && z[1].is_finite());
     }
 }
