@@ -23,7 +23,7 @@ metal = ["premium-discount-app/metal"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-premium-discount-app.workspace = true
+premium-discount-app = { path = "../core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # macos-private-api: tauri.conf.json의 app.macOSPrivateApi(macOS 투명 창)와 짝이어야 한다. 다르면 tauri-build가 빌드를 멈춘다 (새 의존성은 없다)

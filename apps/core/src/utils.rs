@@ -428,12 +428,14 @@ fn det_vec(n: usize, seed: u64) -> Vec<f32> {
 }
 
 fn rel_err_f32(got: &Tensor, want: &Tensor) -> Result<f32> {
-    let g = got.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-    let w = want.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-    let d = (&g - &w)?.sqr()?.sum_all()?.to_scalar::<f32>()?;
-    let n = w.sqr()?.sum_all()?.to_scalar::<f32>()?;
-    let r = (d / n.max(1e-30)).sqrt();
-    Ok(if r.is_finite() { r } else { f32::INFINITY })
+    let g = got.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let w = want.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let rep = premium_discount_eval::accel_tol::verify_tensor_parity(
+        &w,
+        &g,
+        premium_discount_eval::accel_tol::ToleranceTier::F32Compute,
+    )?;
+    Ok(rep.rel_l2)
 }
 
 /// 장치별 연산 자가 검증: 최초 1회 CPU 기준값과 비교하고 `catch_unwind` 로 패닉을 격리한다.
@@ -608,7 +610,9 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             if want_ids != got_ids {
                 return Ok(f32::INFINITY);
             }
-            let e_mode_b = rel_err_f32(got.max_vals.as_ref().unwrap(), want.max_vals.as_ref().unwrap())?;
+            let got_mv = got.max_vals.as_ref().ok_or_else(|| anyhow::anyhow!("missing got max_vals"))?;
+            let want_mv = want.max_vals.as_ref().ok_or_else(|| anyhow::anyhow!("missing want max_vals"))?;
+            let e_mode_b = rel_err_f32(got_mv, want_mv)?;
             // Mode A (`fused_linear_argmax_cs`, Qwen35::next_token 경로): CUDA/ROCm/Vulkan 네이티브 커널 검증
             let h = Tensor::from_vec(det_vec(2 * 64, 16), (2, 64), &Device::Cpu)?;
             let w = Tensor::from_vec(det_vec(128 * 64, 17), (128, 64), &Device::Cpu)?;
@@ -625,7 +629,9 @@ fn probe_accel_op(device: &Device, op: AccelOp) -> Result<f32> {
             if want_a_ids != got_a_ids {
                 return Ok(f32::INFINITY);
             }
-            let e_mode_a = rel_err_f32(got_a.max_vals.as_ref().unwrap(), want_a.max_vals.as_ref().unwrap())?;
+            let got_a_mv = got_a.max_vals.as_ref().ok_or_else(|| anyhow::anyhow!("missing got_a max_vals"))?;
+            let want_a_mv = want_a.max_vals.as_ref().ok_or_else(|| anyhow::anyhow!("missing want_a max_vals"))?;
+            let e_mode_a = rel_err_f32(got_a_mv, want_a_mv)?;
             let mut worst = e_mode_b.max(e_mode_a);
             if device.is_cuda_or_rocm() {
                 use candle_core::quantized::{GgmlDType, QTensor};

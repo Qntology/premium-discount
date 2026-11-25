@@ -11,6 +11,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_CANDLE_REV = "f73415d4d149d7949e8a6a94911af670e4e10f7f"
+EXPECTED_PD_REV = "6e49b5ab81302c5895ac3b1e13ef3bad3eba0019"
+EXPECTED_LV_REV = "78b291995c469e0043d60021231e0b8d490221d2"
 FORBIDDEN_CANDLE_REVS = ("ebaf93d", "3abdfab7")
 
 
@@ -97,6 +99,8 @@ def check_cross_repo_pins(roots: list[Path], errs: list[str]) -> tuple[set[str],
             text = m.read_text(encoding="utf-8", errors="replace")
             for lineno, raw in enumerate(text.splitlines(), 1):
                 code = strip_comment(raw).strip()
+                if re.match(r"^repository\s*=", code):
+                    continue
                 if "Qntology/premium-discount" in code:
                     rm = re.search(r'\brev\s*=\s*"([0-9a-f]{7,40})"', code)
                     if rm:
@@ -111,6 +115,8 @@ def check_cross_repo_pins(roots: list[Path], errs: list[str]) -> tuple[set[str],
                         errs.append(f"{m}:{lineno}: unpinned Qntology/louis-vision ref")
     if len(pd_revs) > 1:
         errs.append(f"Mismatched Qntology/premium-discount revs across manifests: {sorted(pd_revs)}")
+    if pd_revs and pd_revs != {EXPECTED_PD_REV}:
+        errs.append(f"Qntology/premium-discount rev mismatch: found {sorted(pd_revs)}, expected {EXPECTED_PD_REV}")
     if len(lv_revs) > 1:
         errs.append(f"Mismatched Qntology/louis-vision revs across manifests: {sorted(lv_revs)}")
     return pd_revs, lv_revs
@@ -152,10 +158,15 @@ def main() -> int:
     elif candle_revs != {EXPECTED_CANDLE_REV}:
         errs.append(f"candle-rocm-vulkan rev mismatch: found {sorted(candle_revs)}, expected {EXPECTED_CANDLE_REV}")
 
-    pd_revs, lv_revs = check_cross_repo_pins(
-        [r for r in (pd_root, lv_root, lc_root, ns_root) if mode in ("1", "2a", "2b", "all")],
-        errs,
+    pin_roots = [r for r in (pd_root, lv_root) if r.exists()] if mode in ("2a", "2b") else (
+        [r for r in (pd_root, lv_root, lc_root, ns_root) if r.exists()] if mode == "all" else [pd_root]
     )
+    pd_revs, lv_revs = check_cross_repo_pins(pin_roots, errs)
+    if mode in ("2a", "2b", "all"):
+        if not lv_revs:
+            errs.append("No Qntology/louis-vision rev found")
+        elif lv_revs != {EXPECTED_LV_REV}:
+            errs.append(f"Qntology/louis-vision rev mismatch: found {sorted(lv_revs)}, expected {EXPECTED_LV_REV}")
 
     if errs:
         for e in errs:

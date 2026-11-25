@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use premium_discount_app::embeddinggemma::{with_prompt, Role};
-use premium_discount_app::embeddinggemma_vision::RgbImage;
+use premium_discount_app::gemma_vision::RgbImage;
 use premium_discount_app::{EmbeddingGemma, LoadOptions, Part, QuantSetting};
 use serde::Deserialize;
 

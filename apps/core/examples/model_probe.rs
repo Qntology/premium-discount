@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use sha2::Digest;
 
+use lv_core::gemma_vision::RgbImage;
 use premium_discount_app::embeddinggemma::{with_prompt, Role};
-use premium_discount_app::embeddinggemma_vision::RgbImage;
 use premium_discount_app::{Embedder, EmbeddingGemma, LoadOptions, Modalities, Part, QuantSetting};
 use serde::Deserialize;
 

@@ -1,0 +1,28 @@
+[package]
+name = "pd-vision-eval"
+description = "Cross-ecosystem vision evaluation runner evaluating louis-vision (lv-screen, lv-doc, lv-spatial) with premium-discount-eval"
+workspace = "../../apps"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+default = []
+cuda    = ["lv-core/cuda", "lv-screen/cuda", "lv-spatial/cuda"]
+rocm    = ["lv-core/rocm", "lv-screen/rocm", "lv-spatial/rocm"]
+vulkan  = ["lv-core/vulkan", "lv-screen/vulkan", "lv-spatial/vulkan"]
+metal   = ["lv-core/metal", "lv-screen/metal", "lv-spatial/metal"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+candle-core.workspace = true
+premium-discount-eval = { workspace = true, features = ["hygiene"] }
+premium-discount-sds.workspace = true
+premium-discount-nav.workspace = true
+lv-core.workspace = true
+lv-screen.workspace = true
+lv-doc.workspace = true
+lv-spatial.workspace = true

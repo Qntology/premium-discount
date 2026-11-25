@@ -19,13 +19,20 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 [dependencies]
 # 공용 crate (crates/): 명령 계약, 사전 욕설 필터, 내려받기 검증 규칙
 premium-discount-cpu-kernels.workspace = true
+premium-discount-eval.workspace = true
+premium-discount-sds.workspace = true
+premium-discount-quant.workspace = true
 premium-discount-schema.workspace = true
 premium-discount-filter.workspace = true
 premium-discount-manifest.workspace = true
+premium-discount-window.workspace = true
 # 웹 행동 분석 코어 (수집 사건 · PUG · 질의 · 시간 · 퍼널)와 웹 체크포인트 해시
 premium-discount-analytic.workspace = true
 premium-discount-nav.workspace = true
-anyhow = "1"
+premium-discount-verdict.workspace = true
+lv-core.workspace = true
+lv-screen.workspace = true
+anyhow.workspace = true
 async-trait = "0.1"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
