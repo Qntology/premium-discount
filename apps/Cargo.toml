@@ -36,12 +36,12 @@ premium-discount-relay       = { path = "../crates/premium-discount-relay" }
 premium-discount-analytic    = { path = "../crates/premium-discount-analytic" }
 
 # Tier 1 (Qntology/louis-vision) pinned to sealed <LV_LIB_PIN_REV>
-lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
-lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
-lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
-lv-screen  = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
-lv-doc     = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2", default-features = false }
-lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-screen  = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-doc     = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6", default-features = false }
+lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
 
 # Shared runtime & ML dependencies
 anyhow      = "1"
