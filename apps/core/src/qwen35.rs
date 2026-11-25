@@ -953,6 +953,25 @@ pub fn plan_vocab(tokenizer: &Tokenizer, corpus: &[&str], size: usize) -> std::r
     Ok(VocabPlan { required: keep.into_iter().collect(), fill, size })
 }
 
+/// CPU Q8_0 무버퍼 내적 SIMD 커널 연결 (`premium-discount-cpu-kernels::q8`)
+pub fn dot_q8_f32(raw_q8: &[u8], act: &[f32]) -> f32 {
+    premium_discount_cpu_kernels::q8::dot_q8_0_f32_simd(raw_q8, act)
+}
+
+/// 12개 언어 및 도메인 텍스트 기준 3계층 어휘 슬라이스 생성 (`premium-discount-quant::trim`)
+pub fn trim_slice_for_kinds(
+    kinds: &[premium_discount_quant::trim::Kind],
+    domain: &std::collections::BTreeSet<u32>,
+    extra_texts: &[&str],
+) -> premium_discount_quant::vocab::VocabSlice {
+    use premium_discount_quant::trim::{Langs, TrimRule};
+    let mut langs = Langs::all();
+    for text in extra_texts {
+        langs = langs.union(Langs::present(text));
+    }
+    premium_discount_quant::trim::slice(kinds, domain, TrimRule::Full, langs)
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests {
     use super::*;
@@ -1088,5 +1107,32 @@ mod cuda_tests {
         }
         let _ = crate::utils::release_gpu(&dev);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod quant_trim_tests {
+    use super::*;
+    use premium_discount_quant::lmhead::MeanCenteredCsGuard;
+    use premium_discount_quant::trim::{kind_of, Kind};
+
+    #[test]
+    fn quant_trim_and_q8_simd_kernels_wire_cleanly() {
+        let mut kinds = vec![Kind::Byte; 64];
+        kinds.push(kind_of("가격".as_bytes(), false));
+        kinds.push(kind_of("price".as_bytes(), false));
+        let slice = trim_slice_for_kinds(&kinds, &std::collections::BTreeSet::new(), &["할인 가격"]);
+        assert!(!slice.kept.is_empty());
+
+        let row0 = vec![0.2f32; 32];
+        let guard = MeanCenteredCsGuard::from_rows(&row0, &[10], None, 32);
+        assert_eq!(guard.ids, vec![10]);
+
+        // Q8_0 block (2B f16 scale + 32B i8 quants = 34B) with scale=1.0, q=1 => dot with 1.0 == 32.0
+        let mut raw = vec![0u8; 34];
+        raw[..2].copy_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+        raw[2..].fill(1);
+        let act = vec![1.0f32; 32];
+        assert!((dot_q8_f32(&raw, &act) - 32.0).abs() < 1e-3);
     }
 }

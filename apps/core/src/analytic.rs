@@ -752,6 +752,22 @@ pub fn now_ms() -> i64 {
     time::now_ms()
 }
 
+/// Damped-Holt 시계열 게이트 (`premium-discount-sds::temporal`): 단순 트래픽 요동과 실질 UI 마찰 급변(`Held`)을 구분한다.
+pub fn evaluate_conversion_temporal_gate(
+    history: &[f64],
+    observed: f64,
+    sds_sd: Option<f64>,
+) -> premium_discount_sds::temporal::TemporalVerdict {
+    premium_discount_sds::temporal::temporal_gate(
+        history,
+        observed,
+        sds_sd,
+        &[],
+        &[],
+        &premium_discount_sds::temporal::GateConfig::default(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,5 +947,13 @@ mod tests {
         assert!(report.choices.iter().any(|c| c.label == "간편결제" && c.mark == "premium"), "{:?}", report.choices);
         assert!(report.lines.iter().any(|l| l.contains("10/40")), "{:?}", report.lines);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temporal_gate_holds_sudden_conversion_drop_spike() {
+        let hist: Vec<f64> = (0..18).map(|i| 0.20 + 0.01 * ((i % 3) as f64 - 1.0)).collect();
+        let spike = evaluate_conversion_temporal_gate(&hist, 0.72, Some(0.02));
+        assert_eq!(spike.outcome, premium_discount_sds::temporal::TemporalOutcome::Held);
+        assert!(!spike.passes());
     }
 }

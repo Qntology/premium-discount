@@ -1,0 +1,121 @@
+# Tier 2-A workspace: cross-ecosystem vision evaluator (crates/pd-vision-eval) + headless core (apps/core)
+# Pins Tier 1 (Qntology/louis-vision) and patches transitive Tier 0 crates back to local ../crates/*.
+
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "../crates/pd-vision-eval",
+]
+exclude = [
+    "desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/premium-discount"
+
+[workspace.dependencies]
+# Local Tier 0 evaluation / stats / course / window crates
+premium-discount-identity    = { path = "../crates/premium-discount-identity" }
+premium-discount-cpu-kernels = { path = "../crates/premium-discount-cpu-kernels" }
+premium-discount-eval        = { path = "../crates/premium-discount-eval" }
+premium-discount-sds         = { path = "../crates/premium-discount-sds", features = ["audit"] }
+premium-discount-verdict     = { path = "../crates/premium-discount-verdict" }
+premium-discount-nav         = { path = "../crates/premium-discount-nav" }
+premium-discount-schema      = { path = "../crates/premium-discount-schema" }
+premium-discount-filter      = { path = "../crates/premium-discount-filter" }
+premium-discount-manifest    = { path = "../crates/premium-discount-manifest" }
+premium-discount-nlp         = { path = "../crates/premium-discount-nlp", default-features = false }
+premium-discount-window      = { path = "../crates/premium-discount-window" }
+premium-discount-nms         = { path = "../crates/premium-discount-nms" }
+premium-discount-quant       = { path = "../crates/premium-discount-quant" }
+premium-discount-relay       = { path = "../crates/premium-discount-relay" }
+premium-discount-analytic    = { path = "../crates/premium-discount-analytic" }
+
+# Tier 1 (Qntology/louis-vision) pinned to sealed <LV_LIB_PIN_REV>
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
+lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
+lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
+lv-screen  = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
+lv-doc     = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2", default-features = false }
+lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "78b291995c469e0043d60021231e0b8d490221d2" }
+
+# Shared runtime & ML dependencies
+anyhow      = "1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1", features = ["float_roundtrip"] }
+sha2        = "0.10"
+zeroize     = { version = "1", features = ["derive"] }
+half        = "2.4"
+memmap2     = "0.9"
+rayon       = "1.10"
+safetensors = "0.8"
+image       = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+tokenizers  = { version = "0.22", default-features = false, features = ["onig"] }
+candle-core = "0.11.0"
+candle-nn   = "0.11.0"
+lancedb     = { version = "0.41", default-features = false }
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std", "time"] }
+
+# Force single instance between Tier 1's pinned <PD_LIB_PIN_REV> and local ../crates/*
+[patch."https://github.com/Qntology/premium-discount"]
+premium-discount-cpu-kernels = { path = "../crates/premium-discount-cpu-kernels" }
+premium-discount-eval        = { path = "../crates/premium-discount-eval" }
+premium-discount-sds         = { path = "../crates/premium-discount-sds" }
+premium-discount-quant       = { path = "../crates/premium-discount-quant" }
+premium-discount-nlp         = { path = "../crates/premium-discount-nlp" }
+premium-discount-nms         = { path = "../crates/premium-discount-nms" }
+premium-discount-verdict     = { path = "../crates/premium-discount-verdict" }
+
+[patch.crates-io]
+candle-core       = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
+candle-nn         = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
+candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.premium-discount-cpu-kernels]
+opt-level = 3
+[profile.dev.package.premium-discount-quant]
+opt-level = 3
+[profile.dev.package.lv-kernels]
+opt-level = 3
+[profile.dev.package.lv-spatial]
+opt-level = 3
+[profile.dev.package.lv-core]
+opt-level = 2
+[profile.dev.package.lv-screen]
+opt-level = 2
+[profile.dev.package.lv-doc]
+opt-level = 2
+[profile.dev.package.rayon]
+opt-level = 3
+[profile.dev.package.gemm]
+opt-level = 3
+[profile.dev.package.gemm-common]
+opt-level = 3
+[profile.dev.package.gemm-f16]
+opt-level = 3
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.tiny-keccak]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

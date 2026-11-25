@@ -12,9 +12,10 @@ use std::time::Instant;
 
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
-use premium_discount_app::embeddinggemma_vision::{
+use lv_core::gemma_vision::{
     preprocess, resize_bicubic, target_size, RgbImage, VisionTower, SOFT_TOKEN_DIM,
 };
+use lv_core::quant::{Bits as LvBits, TowerQuant};
 use serde::Deserialize;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/vision_reference.json");
@@ -65,16 +66,16 @@ fn load_tower(dir: &Path) -> VisionTower {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &Device::Cpu).expect("가중치 매핑") };
     // PD_QUANT=q8_0이면 인코더 층을 양자화한 채로 같은 참조와 비교한다 (앱 설정 quant와 같은 값)
     let quant = premium_discount_app::QuantSetting::parse(&std::env::var("PD_QUANT").unwrap_or_else(|_| "off".into())).expect("PD_QUANT");
-    let bits = quant.tower_bits("desktop");
+    let bits = quant.tower_bits("desktop").and_then(|b| LvBits::parse(b.name()));
     println!("tower quant: {bits:?}");
     // 실측용: PD_TOWER_KEEP=0,1,14 (그 층은 F32), PD_TOWER_ONLY=5 (그 층만 양자화)
     let layers = |k: &str| std::env::var(k).ok().map(|v| v.split(',').filter(|s| !s.is_empty()).map(|s| s.parse::<usize>().unwrap()).collect::<Vec<_>>());
     let keep_f32 = match (layers("PD_TOWER_ONLY"), layers("PD_TOWER_KEEP")) {
         (Some(only), _) => (0..32).filter(|i| !only.contains(i)).collect(),
         (None, Some(keep)) => keep,
-        (None, None) => premium_discount_app::quant::TowerQuant::default_keep(TOWER),
+        (None, None) => TowerQuant::default_keep(TOWER),
     };
-    let q = premium_discount_app::quant::TowerQuant { bits, kernel: Default::default(), cache: None, keep_f32 };
+    let q = TowerQuant { bits, kernel: Default::default(), cache: None, keep_f32 };
     let tower = VisionTower::load_with(&vb, &Device::Cpu, q).expect("비전 타워 로드");
     println!("linear MB: {:.1}", tower.linear_bytes() as f64 / 1e6);
     tower

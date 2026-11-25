@@ -2,7 +2,7 @@
 //! 텍스트, 이미지, 오디오, 비디오를 같은 768차원 공간에 넣는 모델이다. MRL 절삭 없이 원본 768을 쓴다.
 //!
 //! 입력은 `Part` 목록으로 받는다. 조각마다 512차원 임베딩 열을 만들고 이어 붙인 뒤 텍스트 백본에 넣는다.
-//! 이미지·비디오는 비전 타워(embeddinggemma_vision.rs), 오디오는 오디오 타워(embeddinggemma_audio.rs)를 거친다.
+//! 이미지·비디오는 `lv_core::gemma_vision`, 오디오는 오디오 타워(embeddinggemma_audio.rs)를 거친다.
 //! 평균 풀링과 L2 정규화는 모든 입력이 같다.
 
 use std::path::{Path, PathBuf};
@@ -11,13 +11,13 @@ use std::sync::Arc;
 use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use lv_core::gemma_vision::{RgbImage, VisionTower};
 use tokenizers::Tokenizer;
 
 use crate::embedding::Embedder;
 use crate::embeddinggemma_audio::AudioTower;
 use crate::embeddinggemma_text::TextModel;
 use crate::embeddinggemma_tokens::TokenTable;
-use crate::embeddinggemma_vision::{RgbImage, VisionTower};
 use crate::error::AppError;
 use crate::qcache::{cache_path, Fingerprint, QCache};
 use crate::quant::{Bits, Kernel, QuantRecipe, TowerQuant};
@@ -322,8 +322,40 @@ impl EmbeddingGemma {
 
     fn vision(&self) -> Result<Arc<VisionTower>, AppError> {
         self.towers
-            .vision(|| self.load_tower("vision", |vb, q| VisionTower::load_with(vb, &self.device, q), VisionTower::quantized_tensors))
+            .vision(|| self.load_vision_tower())
             .map_err(tower_error)
+    }
+
+    fn load_vision_tower(&self) -> Result<VisionTower, String> {
+        let vb = self.tower_vb()?;
+        let lv_bits = self.tower_bits.and_then(|b| lv_core::quant::Bits::parse(b.name()));
+        let lv_kernel = match self.kernel {
+            Kernel::Dequant => lv_core::quant::Kernel::Dequant,
+            Kernel::Native => lv_core::quant::Kernel::Native,
+        };
+        let fp = lv_bits.and_then(|b| {
+            lv_core::qcache::Fingerprint::of(&self.weights, "vision", &format!("eg2_vision_{}_v1", b.name())).ok()
+        });
+        let mut cache = fp
+            .as_ref()
+            .and_then(|fp| lv_core::qcache::QCache::load(&lv_core::qcache::cache_path(&self.weights, fp), fp, &self.device));
+        let cached = cache.as_ref().map_or(0, |c| c.len());
+        let quant = lv_core::quant::TowerQuant {
+            bits: lv_bits,
+            kernel: lv_kernel,
+            cache: cache.as_mut(),
+            keep_f32: lv_core::quant::TowerQuant::default_keep("vision"),
+        };
+        let tower = VisionTower::load_with(&vb, &self.device, quant).map_err(|e| e.to_string())?;
+        if let Some(fp) = &fp {
+            let t = tower.quantized_tensors();
+            if cached == 0 || cached != t.len() {
+                if let Err(e) = lv_core::qcache::QCache::save(&lv_core::qcache::cache_path(&self.weights, fp), fp, &t) {
+                    eprintln!("vision 양자화 캐시를 쓰지 못했습니다 (계속 진행): {e}");
+                }
+            }
+        }
+        Ok(tower)
     }
 
     fn audio(&self) -> Result<Arc<AudioTower>, AppError> {

@@ -27,8 +27,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
-/** 사이드카 이름 (tauri.sidecar.conf.json 의 externalBin 은 `binaries/<이름>`) */
+/** 사이드카 이름 (`premium-discount-app`은 `apps/Cargo.toml`, `premium-discount-mcp`는 루트 `Cargo.toml`) */
 export const SIDECARS = ['premium-discount-app', 'premium-discount-mcp']
+
+/** 각 사이드카가 속한 매니페스트 경로 */
+export function manifestForSidecar(name, workspaceDir) {
+  return name === 'premium-discount-app'
+    ? join(workspaceDir, 'apps', 'Cargo.toml')
+    : join(workspaceDir, 'Cargo.toml')
+}
 
 /** rustc 의 host 삼중항 */
 export function hostTriple() {
@@ -64,13 +71,13 @@ export function stage({
     execFileSync('cargo', ['build', '--release', '--manifest-path', manifest, '-p', pkg, '--bin', bin, ...extra], { stdio: 'inherit' }),
   log = (m) => console.log(m),
 }) {
-  const manifest = join(workspaceDir, 'Cargo.toml')
   mkdirSync(out, { recursive: true })
   const staged = []
   for (const name of SIDECARS) {
+    const manifest = manifestForSidecar(name, workspaceDir)
     const extra = cross ? ['--target', target] : []
     if (!noBuild) {
-      log(`[sidecars] cargo build --release -p ${name} --bin ${name} ${extra.join(' ')}`)
+      log(`[sidecars] cargo build --release --manifest-path ${manifest} -p ${name} --bin ${name} ${extra.join(' ')}`)
       build(manifest, name, name, extra)
     }
     const built = join(workspaceDir, 'target', ...(cross ? [target] : []), 'release', name + exeSuffix(target))

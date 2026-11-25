@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { SIDECARS, exeSuffix, stage, stagedName } from './sidecars.mjs'
+import { SIDECARS, exeSuffix, manifestForSidecar, stage, stagedName } from './sidecars.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const readJson = (name) => JSON.parse(readFileSync(join(here, name), 'utf8'))
@@ -46,10 +46,10 @@ test('빌드한 두 실행 파일을 <이름>-<삼중항>[.exe] 로 옮긴다 (W
     for (const name of SIDECARS) {
       assert.equal(readFileSync(join(dirs.out, stagedName(name, target)), 'utf8'), `${name} for ${target}`)
     }
-    // cargo build --release --manifest-path <작업 공간>/Cargo.toml -p <이름> --bin <이름> (교차면 --target)
+    // cargo build --release --manifest-path <매니페스트> -p <이름> --bin <이름> (교차면 --target)
     assert.deepEqual(
       built.map(([manifest, pkg, bin, extra]) => [manifest, pkg, bin, extra]),
-      SIDECARS.map((n) => [join(dirs.workspaceDir, 'Cargo.toml'), n, n, cross ? ['--target', target] : []])
+      SIDECARS.map((n) => [manifestForSidecar(n, dirs.workspaceDir), n, n, cross ? ['--target', target] : []])
     )
   }
   assert.equal(stagedName('premium-discount-app', 'x86_64-pc-windows-msvc'), 'premium-discount-app-x86_64-pc-windows-msvc.exe')
