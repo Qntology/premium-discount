@@ -162,17 +162,18 @@ pub fn fit_symmetric(x: &[f32], w: &[f32], nmax: i32, qmin: i32) -> f32 {
         return 0.0;
     }
     let (lo, hi) = (qmin as f32, nmax as f32);
-    let (mut best_err, mut best_d) = (f32::INFINITY, 0f32);
+    let (mut best_err, mut best_d) = (f64::INFINITY, 0f64);
     // [raon-zena] Σw(dq − x)² = Σwx² − d·Σwxq at the LS optimum d = Σwxq / Σwq²: one pass per
-    // candidate instead of two (same candidates, same solution).
-    let sum_wx2: f32 = x.iter().zip(w).map(|(&xi, &wi)| wi * xi * xi).sum();
+    // candidate instead of two (accumulated in f64 to avoid catastrophic cancellation in Q8_0).
+    let sum_wx2: f64 = x.iter().zip(w).map(|(&xi, &wi)| (wi as f64) * (xi as f64) * (xi as f64)).sum();
     for s in -9..=9 {
         let inv = (nmax as f32 + 0.1 * s as f32) / amax;
-        let (mut num, mut den) = (0f32, 0f32);
+        let (mut num, mut den) = (0f64, 0f64);
         for (&xi, &wi) in x.iter().zip(w) {
-            let q = (xi * inv).round_ties_even().clamp(lo, hi);
-            num += wi * xi * q;
-            den += wi * q * q;
+            let q = (xi * inv).round_ties_even().clamp(lo, hi) as f64;
+            let (xf, wf) = (xi as f64, wi as f64);
+            num += wf * xf * q;
+            den += wf * q * q;
         }
         let d = if den > 0.0 { num / den } else { 0.0 };
         let err = sum_wx2 - d * num;
@@ -181,7 +182,7 @@ pub fn fit_symmetric(x: &[f32], w: &[f32], nmax: i32, qmin: i32) -> f32 {
             best_d = d;
         }
     }
-    best_d
+    best_d as f32
 }
 
 /// `x ≈ d q − m` (q ∈ [0, `nmax`], m ≥ 0) 의 (d, m)
@@ -191,19 +192,20 @@ pub fn fit_asymmetric(x: &[f32], w: &[f32], nmax: i32) -> (f32, f32) {
     let hi = x.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
     let range = hi - lo;
     let safe = if range > 0.0 { range } else { 1.0 };
-    let sum_w: f32 = w.iter().sum();
-    let sum_x: f32 = w.iter().zip(x).map(|(a, b)| a * b).sum();
-    let sum_x2: f32 = w.iter().zip(x).map(|(a, b)| a * b * b).sum();
+    let sum_w: f64 = w.iter().map(|&wi| wi as f64).sum();
+    let sum_x: f64 = w.iter().zip(x).map(|(&wi, &xi)| (wi as f64) * (xi as f64)).sum();
+    let sum_x2: f64 = w.iter().zip(x).map(|(&wi, &xi)| (wi as f64) * (xi as f64) * (xi as f64)).sum();
     let top = nmax as f32;
-    let (mut best_err, mut best_d, mut best_m) = (f32::INFINITY, 0f32, 0f32);
+    let (mut best_err, mut best_d, mut best_m) = (f64::INFINITY, 0f64, 0f64);
     for s in 0..=20 {
         let inv = (top - 1.0 + 0.1 * s as f32) / safe;
-        let (mut sl, mut sl2, mut sxl) = (0f32, 0f32, 0f32);
+        let (mut sl, mut sl2, mut sxl) = (0f64, 0f64, 0f64);
         for (&xi, &wi) in x.iter().zip(w) {
-            let q = ((xi - lo) * inv).round_ties_even().clamp(0.0, top);
-            sl += wi * q;
-            sl2 += wi * q * q;
-            sxl += wi * xi * q;
+            let q = ((xi - lo) * inv).round_ties_even().clamp(0.0, top) as f64;
+            let (xf, wf) = (xi as f64, wi as f64);
+            sl += wf * q;
+            sl2 += wf * q * q;
+            sxl += wf * xf * q;
         }
         let det = sum_w * sl2 - sl * sl;
         let scale_only = || if sl2 > 0.0 { sxl / sl2 } else { 0.0 };
@@ -219,7 +221,8 @@ pub fn fit_asymmetric(x: &[f32], w: &[f32], nmax: i32) -> (f32, f32) {
             d = scale_only();
             off = 0.0;
         }
-        // [raon-zena] Σw(dq + off − x)² expanded over the sums of this pass (no second pass).
+        // [raon-zena] Σw(dq + off − x)² expanded over the sums of this pass (no second pass),
+        // accumulated in f64 to avoid catastrophic cancellation against Σwx².
         let err = d * d * sl2 + 2.0 * d * off * sl + off * off * sum_w - 2.0 * d * sxl - 2.0 * off * sum_x + sum_x2;
         if err < best_err {
             best_err = err;
@@ -227,7 +230,7 @@ pub fn fit_asymmetric(x: &[f32], w: &[f32], nmax: i32) -> (f32, f32) {
             best_m = -off;
         }
     }
-    (best_d.max(0.0), best_m.max(0.0))
+    (best_d.max(0.0) as f32, best_m.max(0.0) as f32)
 }
 
 /// 하위 척도(≥ 0)를 F16 슈퍼 척도와 `levels` 단계 정수로. F16 반올림이 내려가면 한 칸 올립니다(1 ULP).
@@ -414,5 +417,29 @@ impl Format {
             Format::Q5K => GgmlType::Q5K,
             Format::Q4K => GgmlType::Q4K,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_fits_match_quant_py() {
+        let x: Vec<f32> = (0..32)
+            .map(|i| (i as f32 * 1.3).sin() * 0.05 + if i % 7 == 0 { 0.2 } else { 0.0 })
+            .collect();
+        let mut w = [0f32; 32];
+        importance(&x, None, &mut w);
+        let close = |got: f32, want: f32| (got - want).abs() <= want.abs() * 2e-5;
+        let (d, m) = fit_asymmetric(&x, &w, 15);
+        assert!(close(d, 1.925078221e-02) && close(m, 4.800733924e-02), "q4 {d} {m}");
+        let (d, m) = fit_asymmetric(&x, &w, 31);
+        assert!(close(d, 9.597460739e-03) && close(m, 4.951747879e-02), "q5 {d} {m}");
+        let x16: Vec<f32> = x[..16].iter().map(|v| v - 0.01).collect();
+        let mut w16 = [0f32; 16];
+        importance(&x16, None, &mut w16);
+        assert!(close(fit_symmetric(&x16, &w16, 31, -32), 6.606251933e-03), "q6");
+        assert!(close(fit_symmetric(&x, &w, 127, -128), 1.904964098e-03), "q8");
     }
 }
