@@ -734,4 +734,38 @@ mod tests {
         assert_eq!(unit_heads(&[vec![9], vec![0]]), vec![None, None]);
         assert!(unit_heads(&[]).is_empty());
     }
+
+    #[test]
+    fn sds_tie_breaker_refuses_flat_and_uses_confusion_winner() {
+        let mut ledger = premium_discount_sds::Ledger::in_memory("tie");
+        let scope = premium_discount_sds::Scope::new("nms", "app://test", "slot");
+        let keys = vec!["coach.dodge".to_string(), "coach.patch".to_string()];
+        for _ in 0..6 {
+            ledger.record_confusion(&scope, &keys[0], &keys[1], 0.12);
+        }
+        let tb = sds_tie_breaker(&ledger, &scope, &keys);
+        assert!(tb(0, 1, premium_discount_sds::TieKind::PairConfusion));
+        assert!(!tb(0, 1, premium_discount_sds::TieKind::Flat));
+        assert!(!tb(1, 0, premium_discount_sds::TieKind::PairConfusion));
+    }
+}
+
+/// Adapter binding `DomainBank` pair ties to `Ledger::confusion_winner_checked` while
+/// refusing `TieKind::Flat` ties unconditionally.
+pub fn sds_tie_breaker<'a>(
+    ledger: &'a premium_discount_sds::Ledger,
+    scope: &'a premium_discount_sds::Scope,
+    keys: &'a [String],
+) -> impl Fn(usize, usize, premium_discount_sds::TieKind) -> bool + 'a {
+    move |a, b, kind| {
+        if kind == premium_discount_sds::TieKind::Flat {
+            return false;
+        }
+        let (Some(ka), Some(kb)) = (keys.get(a), keys.get(b)) else {
+            return false;
+        };
+        ledger
+            .confusion_winner_checked(scope, ka, kb)
+            .is_some_and(|(w, _, _)| w == *ka)
+    }
 }

@@ -86,8 +86,8 @@
       ],
       "owners": [
         {
-          "repo": "premium-discount",
-          "path": "crates/premium-discount-vision/src",
+          "repo": "louis-vision",
+          "path": "crates/lv-screen/src",
           "test": "ps04_"
         }
       ]
@@ -103,8 +103,8 @@
       ],
       "owners": [
         {
-          "repo": "premium-discount",
-          "path": "crates/premium-discount-vision/src",
+          "repo": "louis-vision",
+          "path": "crates/lv-screen/src",
           "test": "ps05_"
         }
       ]
@@ -120,8 +120,8 @@
       ],
       "owners": [
         {
-          "repo": "premium-discount",
-          "path": "crates/premium-discount-sensor/src",
+          "repo": "louis-vision",
+          "path": "crates/lv-screen/src",
           "test": "ps06_"
         }
       ]
@@ -137,8 +137,8 @@
       ],
       "owners": [
         {
-          "repo": "premium-discount",
-          "path": "crates/premium-discount-vision/src",
+          "repo": "louis-vision",
+          "path": "crates/lv-screen/src",
           "test": "ps07_"
         }
       ]

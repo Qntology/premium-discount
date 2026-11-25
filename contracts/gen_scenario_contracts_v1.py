@@ -26,6 +26,7 @@ sys.dont_write_bytecode = True
 
 HERE = Path(__file__).resolve().parent
 PD = "premium-discount"
+LV = "louis-vision"
 RZ = "raon-zena"
 
 NAV = "crates/premium-discount-nav/src"
@@ -34,8 +35,7 @@ CORE = "apps/core/src"
 ANA = "crates/premium-discount-analytic"
 NMS = "crates/premium-discount-nms/src"
 RELAY = "crates/premium-discount-relay"
-SENSOR = "crates/premium-discount-sensor/src"
-VISION = "crates/premium-discount-vision/src"
+LV_SCREEN = "crates/lv-screen/src"
 WINDOW = "crates/premium-discount-window/src"
 IDENTITY = "crates/premium-discount-identity/src"
 TRACKER = "web/www/static/js"
@@ -422,19 +422,19 @@ def privacy_shield():
         case("PS-04", 1, "천공 패스 소형 모달 Privacy 시드 보존",
              "체커보드 PerforatedCfg + 구석 4% 소형 로그인 모달",
              ["국소 휘도 깨움 + VisionKind::Privacy 시드로 구멍을 넓혀 잡는다"],
-             [t(PD, VISION, "PS-04")]),
+             [t(LV, LV_SCREEN, "PS-04")]),
         case("PS-05", 1, "알림 토스트 패치 정렬 국소 마스킹",
              "보스전 오른쪽 아래 알림 토스트(PartialRedaction) 를 패치로 나눔",
              ["옆 패치로 번지지 않는다", "토스트에 겹친 후보만 버리고 본 화면 코칭은 그대로"],
-             [t(PD, VISION, "PS-05")]),
+             [t(LV, LV_SCREEN, "PS-05")]),
         case("PS-06", 2, "prev_log 소거 & 무역상 복귀",
              "민감 화면 1프레임 뒤 purge_privacy_residue() → 일반 화면",
              ["prev_log · ROI 트랙 0", "복귀 첫 프레임 타일 차분 이벤트 0건"],
-             [t(PD, SENSOR, "PS-06")]),
+             [t(LV, LV_SCREEN, "PS-06")]),
         case("PS-07", 2, "진행 중 비전 블록 조기 중단",
              "인코딩 도중 privacy_epoch 증가",
              ["다음 블록 경계에서 멈춘다", "PatchGrid · 32×18 썸네일을 지우고 넘기지 않는다"],
-             [t(PD, VISION, "PS-07")]),
+             [t(LV, LV_SCREEN, "PS-07")]),
         case("PS-08", 2, "미완결 에피소드 5초 소급 절단 & record false",
              "키패드 감지 직전 3초 동안의 클릭 · 수정 사건이 LiveEpisodeWindow 에 있다",
              ["최근 5초 사건 폐기", "FrictionBaselines · Outbox · 장부 기록 0건"],

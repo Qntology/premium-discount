@@ -25,14 +25,14 @@ raon-zena 가 맡는 것:
 ## 구조
 
 ```text
-raon-zena ──McpClient (stdio JSON-RPC 2.0)──▶ premium-discount-mcp ──serve_lines (stdio JSON 한 줄씩)──▶ premium-discount-app
-  SyncLoop (병합 · 남은 일이 있으면 10초)        pd_* 도구 9개, cc · hashId,           LanceDB 보관함(원문) · 투표 · 판정 캐시,
-  zena-verdict (로컬 판정)                       GET /graph*                           embeddinggemma-2(768), QR 로그인
+raon-zena ──McpClient (stdio JSON-RPC 2.0)──▶ premium-discount-mcp ──serve_lines (stdio JSON lines)──▶ premium-discount-app
+  SyncLoop (병합 · 남은 일이 있으면 10초)        11 pd_* tools, cc · hashId,           LanceDB 0.41 보관함 · 투표 · 판정 캐시,
+  zena-verdict (로컬 판정)                       GET /graph*                           lv-screen / embeddinggemma-2, QR 로그인
                                                         │                                    │
                                                         └──────────── HTTPS ─────────────────┴──▶ premium.discount
 ```
 
-premium-discount-app 을 **라이브러리로 링크하지 않고 프로세스로 둡니다.** 그 크레이트는 LanceDB 0.31 · lance 8 · candle 0.9 · tokenizers 0.21 에 고정되어 있고, 이 작업 공간은 LanceDB 0.41 · lance 14 · candle 0.11 포크 · tokenizers 0.22 입니다. 링크하면 LanceDB(+ datafusion)와 candle 트리가 두 벌 빌드됩니다. 앱에는 이미 모든 명령을 여는 줄 단위 프로토콜(`serve_lines`)이 있으므로, 기획서 2.1절 그대로 그것을 `premium-discount-mcp-protocol`(raon-zena 의 `zena_avatar_mcp::protocol` 이 다시 내보내는 것과 같은 코드)의 MCP 틀로 감쌌습니다.
+`premium-discount-mcp` 는 Tier 0 순수 라이브러리 워크스페이스에 속하며, `premium-discount-app` (`apps/`, Tier 2-A 분리) 을 링크하지 않고 줄 단위 프로토콜(`serve_lines`) 자식 프로세스로 띄웁니다. 이를 통해 Tier 0 순수 평가 · 통계 · 내비게이션 코어가 LanceDB 0.41 · tokio · Tauri · louis-vision 비전 의존성 없이 독립 빌드됩니다.
 
 ### 자식 프로세스 (`bridge.rs`)
 

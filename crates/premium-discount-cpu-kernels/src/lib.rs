@@ -13,8 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod attn;
 pub mod image;
+pub mod q8;
 pub use attn::{stream_attention_f32, stream_attention_f32_masked, CpuStreamAttnCfg};
 pub use image::patchify_norm_hwc_u8_f32;
+pub use q8::{
+    dot_and_norm_sq_f32_simd, dot_f16_f32_simd, dot_q8_0_f32_simd, score_f16_prejudice_simd,
+    score_q8_0_prejudice_simd,
+};
 
 static FORCE_SCALAR: AtomicBool = AtomicBool::new(false);
 

@@ -10,7 +10,7 @@
 
 use crate::embed::cosine;
 use serde::Serialize;
-use premium_discount_sensor::geometry::{BBox, Polar};
+use premium_discount_sds::geometry::{BBox, Polar};
 
 pub const SNAP_IOU: f32 = 0.85;
 pub const TWIN_IOU: f32 = 0.90;

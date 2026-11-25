@@ -80,6 +80,50 @@ impl Default for MinObs {
     }
 }
 
+/// Controls whether observations update only the exact scope key or fan out across
+/// secondary, primary, and global keys simultaneously.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    #[default]
+    ExactKey,
+    Hierarchical,
+}
+
+/// How persisted team-scoped state should be handled for the active session team.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamFate {
+    /// Same team or unknown identity: keep as-is.
+    Keep,
+    /// Accumulated under local pre-login team: migrate to current logged-in team.
+    Migrate,
+    /// Stored belongs to a real team while current session is pre-login local: hold without overwriting.
+    Hold,
+    /// Belongs to a different logged-in team: isolate and discard.
+    Discard,
+}
+
+/// Evaluates [`TeamFate`] for persisted `stored` team vs `current` session team and `local` default ID.
+pub fn team_fate(stored: &str, current: &str, local: &str) -> TeamFate {
+    if current.is_empty() || stored.is_empty() || stored == current {
+        TeamFate::Keep
+    } else if stored == local {
+        TeamFate::Migrate
+    } else if current == local {
+        TeamFate::Hold
+    } else {
+        TeamFate::Discard
+    }
+}
+
+/// Summary returned when retiring an in-flight run cleanly into the ledger base.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRetire {
+    pub folded_scopes: usize,
+    pub observations: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

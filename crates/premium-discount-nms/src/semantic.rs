@@ -17,7 +17,7 @@ use crate::embed::cosine;
 use crate::normalize::normalize;
 use serde::Serialize;
 use std::collections::VecDeque;
-use premium_discount_sensor::geometry::{angle_delta_deg, Polar};
+use premium_discount_sds::geometry::{angle_delta_deg, Polar};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Source {

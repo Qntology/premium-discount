@@ -15,10 +15,10 @@
 //! premium-discount crates, `ureq` and `serde`: Raon Zena links it by git revision, the desktop installer ships its
 //! binary next to premium-discount-app (`bundle.externalBin`).
 //!
-//! premium-discount-app is used as a process, not linked: it pins LanceDB 0.31 / candle 0.9 while raon-zena is on
-//! LanceDB 0.41 / the candle 0.11 fork, so linking it would build both trees. Its line protocol (`serve_lines`)
-//! already exposes every command; this crate wraps it in the MCP framing of [`premium_discount_mcp_protocol`]
-//! (also Raon Zena's `zena_avatar_mcp::protocol`).
+//! This Tier 0 library crate spawns `premium-discount-app` (Tier 2-A `apps/`, excluded from root) as a
+//! subprocess over its line protocol (`serve_lines`) rather than linking it directly, keeping Tier 0 free
+//! of LanceDB 0.41 / tokio / Tauri / `louis-vision` dependencies. This crate wraps those commands in the
+//! MCP framing of [`premium_discount_mcp_protocol`] (also Raon Zena's `zena_avatar_mcp::protocol`).
 //!
 //! * [`server`] — the tools ([`server::PdSyncServer`])
 //! * [`bridge`] — the premium-discount-app process (lazy start, restart, idle stop)

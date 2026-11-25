@@ -16,21 +16,26 @@
 //! 전역 상태가 없다: [`Ledger`] 는 평범한 값(`Send + Sync`)이고, 함께 쓰려면 `Mutex` / `RwLock` 뒤에 둔다.
 //! 표본이 모자라면 판정하지 않는다 — 단계가 [`MinObs`] 를 채우기 전에는 읽기가 모두 `None` 이다.
 
+#[cfg(feature = "audit")]
+pub mod audit;
+pub mod geometry;
 pub mod ledger;
 pub mod matrix;
 pub mod moments;
 pub mod scope;
 pub mod stats;
+pub mod temporal;
 
 mod persist;
 
 pub use ledger::{Band, Ledger, Level};
 pub use matrix::{AssignDiag, TieKind};
 pub use moments::{backoff, Moments};
-pub use scope::{MinObs, Scope};
+pub use scope::{team_fate, MinObs, RunRetire, Scope, TeamFate, WriteMode};
 pub use stats::{
-    adaptive_half_life_ms, decay_shape, tie_verdict, ConfusionStat, DecayShape, DecayStat, RejectStat, ScopeStat,
-    Welford, DRIFT_HALF_LIFE_GAMMA, DRIFT_HALF_LIFE_TRIGGER_Z, DRIFT_MIN_HALF_LIFE_MS,
+    adaptive_half_life_ms, decay_shape, tie_verdict, CalibrationStat, ConfusionStat, DecayShape,
+    DecayStat, GateStat, RejectStat, ScopeStat, Welford, CALIBRATION_SHRINK_K,
+    DRIFT_HALF_LIFE_GAMMA, DRIFT_HALF_LIFE_TRIGGER_Z, DRIFT_MIN_HALF_LIFE_MS,
 };
 
 /// 장부 · 실행 파일에 적는 세대 표시. 다른 recipe 의 파일은 합치지 않고 비켜 둔다. 기기에 쌓인 장부를 그대로 읽도록

@@ -17,29 +17,26 @@ resolver = "2"
 members = [
     "crates/premium-discount-identity",
     "crates/premium-discount-cpu-kernels",
+    "crates/premium-discount-eval",
+    "crates/premium-discount-sds",
     "crates/premium-discount-verdict",
     "crates/premium-discount-nav",
     "crates/premium-discount-schema",
     "crates/premium-discount-filter",
     "crates/premium-discount-mcp-protocol",
     "crates/premium-discount-mcp",
-    "crates/premium-discount-sds",
     "crates/premium-discount-manifest",
-    "crates/premium-discount-sensor",
     "crates/premium-discount-nlp",
     "crates/premium-discount-window",
     "crates/premium-discount-nms",
     "crates/premium-discount-quant",
-    "crates/premium-discount-vision",
     "crates/premium-discount-relay",
     "crates/premium-discount-analytic",
     "crates/onnxruntime-sys",
     "crates/onnxruntime",
-    "apps/core",
-    "apps/desktop",
 ]
-# workers/ 는 자기 작업 공간이다 (wasm32, workers/Cargo.toml). 루트가 삼키지 않게 뺀다
-exclude = ["workers"]
+# workers/ (wasm32) 및 Tier 2-A 상위 워크스페이스(apps, pd-vision-eval)는 루트가 삼키지 않게 뺀다
+exclude = ["workers", "apps", "crates/pd-vision-eval"]
 
 [workspace.package]
 version = "0.1.0"
@@ -50,8 +47,9 @@ repository = "https://github.com/Qntology/premium-discount"
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 unicode-normalization = "0.1"
 ureq = "2"
 half = "2"
@@ -65,6 +63,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # 내부 crate (crates/)
 premium-discount-cpu-kernels = { path = "crates/premium-discount-cpu-kernels" }
 premium-discount-identity = { path = "crates/premium-discount-identity" }
+premium-discount-eval = { path = "crates/premium-discount-eval" }
 premium-discount-verdict = { path = "crates/premium-discount-verdict" }
 premium-discount-nav = { path = "crates/premium-discount-nav" }
 premium-discount-schema = { path = "crates/premium-discount-schema" }
@@ -72,23 +71,18 @@ premium-discount-filter = { path = "crates/premium-discount-filter" }
 premium-discount-mcp-protocol = { path = "crates/premium-discount-mcp-protocol" }
 premium-discount-sds = { path = "crates/premium-discount-sds" }
 premium-discount-manifest = { path = "crates/premium-discount-manifest" }
-premium-discount-sensor = { path = "crates/premium-discount-sensor" }
 premium-discount-nlp = { path = "crates/premium-discount-nlp", default-features = false }
 premium-discount-window = { path = "crates/premium-discount-window" }
 premium-discount-nms = { path = "crates/premium-discount-nms" }
 premium-discount-quant = { path = "crates/premium-discount-quant" }
-premium-discount-vision = { path = "crates/premium-discount-vision" }
 premium-discount-relay = { path = "crates/premium-discount-relay" }
 premium-discount-analytic = { path = "crates/premium-discount-analytic" }
-# 헤드리스 코어 (apps/core). Tauri 셸(apps/desktop)이 쓴다
-premium-discount-app = { path = "apps/core" }
 
-# candle → Qntology/candle-rocm-vulkan 포크 (CUDA · ROCm-HIP · Vulkan · Metal). raon-zena · logis-center 와 같은 커밋.
-# 예전 세 매니페스트(crates/ · app/ · app/src-tauri)에 같은 줄이 있던 것을 여기 하나로 합쳤다.
-# [patch] 는 빌드하는 쪽 루트의 것만 적용되므로, 이 crate 들을 링크하는 다른 작업 공간도 같은 줄을 둔다.
+# candle → Qntology/candle-rocm-vulkan 포크 (CUDA · ROCm-HIP · Vulkan · Metal). 전 생태계 단일 커밋 고정.
 [patch.crates-io]
 candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
 candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
+candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
 
 # 디버그 정보는 끈다 (예전 app/ · app/src-tauri 의 값). 모바일 빌드(staticlib·cdylib)는 의존성 전부를 한 파일로 묶는데,
 # 디버그 정보가 있으면 파일 하나가 수 GB가 된다. 이제 작업 공간이 하나라 crates/ 의 디버그 빌드에도 적용된다.
@@ -109,10 +103,6 @@ opt-level = 3
 [profile.dev.package.premium-discount-cpu-kernels]
 opt-level = 3
 [profile.dev.package.premium-discount-quant]
-opt-level = 3
-[profile.dev.package.premium-discount-sensor]
-opt-level = 3
-[profile.dev.package.premium-discount-vision]
 opt-level = 3
 [profile.dev.package.gemm]
 opt-level = 3
