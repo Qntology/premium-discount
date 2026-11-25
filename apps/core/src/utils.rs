@@ -440,7 +440,7 @@ pub fn accel_op_ok(device: &Device, op: AccelOp) -> bool {
             .copied()
             .unwrap_or(false)
         {
-            panic!("injected accel fault for {op:?}");
+            anyhow::bail!("injected accel fault for {op:?}");
         }
         probe_accel_op(device, op)
     })) {

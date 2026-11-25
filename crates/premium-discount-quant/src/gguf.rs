@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -554,6 +554,17 @@ pub fn repack_gguf_vocab(
     let orig_v = remap.orig_vocab;
 
     let mut kv_map: BTreeMap<String, Kv> = BTreeMap::new();
+    let kept_tok_set: HashSet<String> = if let Some(toks) = &overrides.tokens {
+        toks.iter().cloned().collect()
+    } else if let Some(Kv::ArrStr(arr)) = src.kvs.get("tokenizer.ggml.tokens") {
+        remap
+            .new_to_old
+            .iter()
+            .filter_map(|&old| arr.get(old as usize).cloned())
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let special_id_keys = [
         "tokenizer.ggml.bos_token_id",
         "tokenizer.ggml.eos_token_id",
@@ -608,8 +619,23 @@ pub fn repack_gguf_vocab(
         if key == "tokenizer.ggml.merges" {
             if let Some(m) = &overrides.merges {
                 kv_map.insert(key.clone(), Kv::ArrStr(m.clone()));
+            } else if let Kv::ArrStr(arr) = val {
+                let filtered: Vec<String> = arr
+                    .iter()
+                    .filter(|entry| {
+                        let Some((a, b)) = entry.split_once(' ') else { return false };
+                        if !kept_tok_set.contains(a) || !kept_tok_set.contains(b) {
+                            return false;
+                        }
+                        let mut ab = String::with_capacity(a.len() + b.len());
+                        ab.push_str(a);
+                        ab.push_str(b);
+                        kept_tok_set.contains(&ab)
+                    })
+                    .cloned()
+                    .collect();
+                kv_map.insert(key.clone(), Kv::ArrStr(filtered));
             } else {
-                // Keep empty or filtered merges; if override not provided, filter using remapped tokens
                 kv_map.insert(key.clone(), Kv::ArrStr(Vec::new()));
             }
             continue;
@@ -646,6 +672,9 @@ pub fn repack_gguf_vocab(
     let mut decls: Vec<TensorDecl> = Vec::with_capacity(src.order.len());
     let mut sliced_names: Vec<String> = Vec::new();
     for name in &src.order {
+        if name.starts_with("mtp.") {
+            continue;
+        }
         let t = src.tensor(name)?;
         let mut shape = t.shape.clone();
         let is_vocab_mat = (name == "token_embd.weight" || name == "output.weight")
@@ -673,6 +702,9 @@ pub fn repack_gguf_vocab(
     }
     let mut writer = GgufWriter::create(dst_path, &kvs, decls)?;
     for name in &src.order {
+        if name.starts_with("mtp.") {
+            continue;
+        }
         if sliced_names.iter().any(|s| s == name) {
             for &old_id in &remap.new_to_old {
                 writer.write(src.row_bytes(name, old_id as usize)?)?;
@@ -780,6 +812,51 @@ mod tests {
         assert!(!GgmlType::Q4_0.has_cpu_kernel());
         assert!(GgmlType::Q8_0.has_cpu_kernel());
         assert!(g.f32_values("w").is_err());
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn repack_gguf_vocab_preserves_merges_and_strips_mtp() {
+        let tmp_dir = std::env::temp_dir().join(format!("pd_repack_merge_mtp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let src_gguf = tmp_dir.join("src.gguf");
+        let dst_gguf = tmp_dir.join("dst.gguf");
+        let (rows, cols) = (8usize, 32usize);
+        let rb = GgmlType::Q8_0.row_bytes(cols);
+        let emb_bytes = vec![1u8; rows * rb];
+        let mtp_bytes = vec![2u8; rows * rb];
+        let norm_bytes = vec![0u8; cols * 4];
+        let tokens: Vec<String> = vec!["a", "b", "ab", "c", "d", "cd", "e", "f"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let kvs = vec![
+            ("general.architecture".into(), Kv::Str("qwen35".into())),
+            ("tokenizer.ggml.tokens".into(), Kv::ArrStr(tokens)),
+            ("tokenizer.ggml.merges".into(), Kv::ArrStr(vec!["a b".into(), "c d".into(), "e f".into()])),
+            ("tokenizer.ggml.eos_token_id".into(), Kv::U32(0)),
+        ];
+        let decls = vec![
+            TensorDecl { name: "token_embd.weight".into(), ty: GgmlType::Q8_0, shape: vec![rows, cols] },
+            TensorDecl { name: "mtp.head.weight".into(), ty: GgmlType::Q8_0, shape: vec![rows, cols] },
+            TensorDecl { name: "output_norm.weight".into(), ty: GgmlType::F32, shape: vec![cols] },
+        ];
+        let mut w = GgufWriter::create(&src_gguf, &kvs, decls).unwrap();
+        w.write(&emb_bytes).unwrap();
+        w.write(&mtp_bytes).unwrap();
+        w.write(&norm_bytes).unwrap();
+        w.finish().unwrap();
+
+        // Keep only ids [0("a"), 1("b"), 2("ab"), 3("c")] -> "a b" survives, "c d" and "e f" dropped, mtp.* stripped
+        let remap = IdRemap::from_kept_ids(rows, &[0, 1, 2, 3], NumberingMode::Contiguous).unwrap();
+        repack_gguf_vocab(&src_gguf, &dst_gguf, &remap, &GgufVocabOverride::default()).unwrap();
+
+        let out = GgufFile::open(&dst_gguf).unwrap();
+        assert_eq!(out.kvs.get("tokenizer.ggml.merges"), Some(&Kv::ArrStr(vec!["a b".into()])));
+        assert!(!out.order.iter().any(|n| n.starts_with("mtp.")));
+        assert_eq!(out.tensor("token_embd.weight").unwrap().shape, vec![4, 32]);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
