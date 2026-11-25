@@ -57,6 +57,34 @@ impl IdRemap {
         Ok(remap)
     }
 
+    /// Construct a bijective `IdRemap` preserving the exact caller-supplied token ID ordering
+    /// (for priority-bucketed artifacts where lower IDs sit inside runtime `K <= 12,288`).
+    pub fn from_ordered_ids(orig_vocab: usize, ordered_ids: &[u32], mode: NumberingMode) -> Result<Self> {
+        ensure!(orig_vocab > 0, "orig_vocab must be > 0");
+        ensure!(!ordered_ids.is_empty(), "ordered_ids must not be empty");
+        ensure!(ordered_ids.len() <= orig_vocab, "ordered_ids > orig_vocab");
+        let mut old_to_new = vec![-1i32; orig_vocab];
+        for (new_id, &old_id) in ordered_ids.iter().enumerate() {
+            ensure!(
+                (old_id as usize) < orig_vocab,
+                "IdRemap old_id {old_id} >= orig_vocab {orig_vocab}"
+            );
+            ensure!(
+                old_to_new[old_id as usize] == -1,
+                "IdRemap duplicate old_id {old_id}"
+            );
+            old_to_new[old_id as usize] = new_id as i32;
+        }
+        let remap = Self {
+            mode,
+            orig_vocab,
+            new_to_old: ordered_ids.to_vec(),
+            old_to_new,
+        };
+        remap.verify_bijection()?;
+        Ok(remap)
+    }
+
     pub fn trimmed_vocab(&self) -> usize {
         self.new_to_old.len()
     }
@@ -106,8 +134,95 @@ impl IdRemap {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        Self::from_kept_ids(orig_vocab, &kept, NumberingMode::Contiguous)
+        Self::from_ordered_ids(orig_vocab, &kept, NumberingMode::Contiguous)
     }
+}
+
+/// Returns `true` for ASCII multi-byte programming-code syntax, multi-space indentation,
+/// or camelCase tokens placed into Tier 3 so runtime `K <= 12,288` keeps natural-language prose.
+pub fn is_code_syntax_noise(piece: &[u8]) -> bool {
+    if piece.len() <= 1 {
+        return false;
+    }
+    let Ok(s) = std::str::from_utf8(piece) else {
+        return false;
+    };
+    if !s.is_ascii() {
+        return false;
+    }
+    const ALLOW: &[&str] = &[
+        "{\"", "\":", ": ", ", ", "\"}", "\"\n", "\"}\n", "\"},\n", "\"},", "{\n", "}\n", "\n\n",
+        "[{", "}]", "```", "  ", " \"", "\",", "\"", "\": \"", "\", \"", " {\n", " }\n", ":\n",
+        ".\n", ",\n", ". ", "- ", " -", " /", "/ ", "\" ", " '", "'s", "'t", "'re", "'ve",
+        "'ll", "'d", "'m",
+    ];
+    if ALLOW.contains(&s) {
+        return false;
+    }
+    if s.contains('\t')
+        || s.contains('\r')
+        || s.contains('\n')
+        || (s.trim().is_empty() && s.len() >= 3)
+    {
+        return true;
+    }
+    if s.bytes().any(|b| {
+        matches!(
+            b,
+            b';' | b'{'
+                | b'}'
+                | b'['
+                | b']'
+                | b'('
+                | b')'
+                | b'<'
+                | b'>'
+                | b'\\'
+                | b'|'
+                | b'~'
+                | b'^'
+                | b'`'
+                | b'_'
+                | b'='
+                | b'*'
+                | b'!'
+                | b'@'
+                | b'#'
+                | b'$'
+                | b'&'
+                | b'+'
+                | b'?'
+        )
+    }) {
+        return true;
+    }
+    if s.contains("//")
+        || s.contains("--")
+        || s.contains("..")
+        || s.contains("::")
+        || s.contains("''")
+        || s.contains("\"\"")
+    {
+        return true;
+    }
+    let core = s.strip_prefix(' ').unwrap_or(s);
+    if core.is_empty() {
+        return false;
+    }
+    if core.bytes().all(|b| b.is_ascii_alphabetic()) {
+        if core
+            .as_bytes()
+            .windows(2)
+            .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+        {
+            return true;
+        }
+        return false;
+    }
+    if core.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    true
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -162,6 +277,36 @@ pub fn trim_tokenizer_json(
     orig_vocab: usize,
     kept_ids: &[u32],
     ancestor_max: usize,
+) -> Result<(String, IdRemap, TrimTokenizerStats)> {
+    trim_tokenizer_json_impl(raw_json, orig_vocab, kept_ids, ancestor_max, None)
+}
+
+/// Priority-ordered variant of [`trim_tokenizer_json`] placing single bytes (`Tier 0`),
+/// structural JSON/doc tokens (`Tier 1`), natural-language prose & Core-12 scripts (`Tier 2`),
+/// programming-code syntax noise (`Tier 3`), and added special tokens (`Tier 4`) in contiguous bands
+/// while preserving original merge order and `orphan_multi == 0`.
+pub fn trim_tokenizer_json_prioritized(
+    raw_json: &str,
+    orig_vocab: usize,
+    kept_ids: &[u32],
+    ancestor_max: usize,
+    struct_priority_ids: &BTreeSet<u32>,
+) -> Result<(String, IdRemap, TrimTokenizerStats)> {
+    trim_tokenizer_json_impl(
+        raw_json,
+        orig_vocab,
+        kept_ids,
+        ancestor_max,
+        Some(struct_priority_ids),
+    )
+}
+
+fn trim_tokenizer_json_impl(
+    raw_json: &str,
+    orig_vocab: usize,
+    kept_ids: &[u32],
+    ancestor_max: usize,
+    struct_priority_ids: Option<&BTreeSet<u32>>,
 ) -> Result<(String, IdRemap, TrimTokenizerStats)> {
     let mut doc: Value = serde_json::from_str(raw_json).context("parse tokenizer.json")?;
     let flavor = detect_flavor_from_json(&doc);
@@ -405,8 +550,45 @@ pub fn trim_tokenizer_json(
         }
     }
 
-    let final_ids: Vec<u32> = kept_set.iter().copied().collect();
-    let remap = IdRemap::from_kept_ids(orig_vocab, &final_ids, NumberingMode::Contiguous)?;
+    let final_ids: Vec<u32> = if let Some(prio) = struct_priority_ids {
+        let byte_dec = crate::vocab::byte_decoder();
+        let mut tier0 = Vec::new();
+        let mut tier1 = Vec::new();
+        let mut tier2 = Vec::new();
+        let mut tier3 = Vec::new();
+        let mut tier4 = Vec::new();
+        for &id in &kept_set {
+            if added_ids.contains(&id) {
+                tier4.push(id);
+            } else if base_tokens.contains(&id) {
+                tier0.push(id);
+            } else if prio.contains(&id) {
+                tier1.push(id);
+            } else {
+                let piece = id_to_tok
+                    .get(&id)
+                    .map(|t| crate::trim::decode_piece_for_flavor(t, flavor, &byte_dec))
+                    .unwrap_or_default();
+                if is_code_syntax_noise(&piece) {
+                    tier3.push(id);
+                } else {
+                    tier2.push(id);
+                }
+            }
+        }
+        tier0.extend(tier1);
+        tier0.extend(tier2);
+        tier0.extend(tier3);
+        tier0.extend(tier4);
+        tier0
+    } else {
+        kept_set.iter().copied().collect()
+    };
+    let remap = if struct_priority_ids.is_some() {
+        IdRemap::from_ordered_ids(orig_vocab, &final_ids, NumberingMode::Contiguous)?
+    } else {
+        IdRemap::from_kept_ids(orig_vocab, &final_ids, NumberingMode::Contiguous)?
+    };
 
     // Rebuild model.vocab preserving original ID order (0..K-1)
     let mut new_vocab = serde_json::Map::with_capacity(final_ids.len());
@@ -741,5 +923,137 @@ mod tests {
         let (_trimmed, _remap, stats) =
             trim_tokenizer_json(&tok_json.to_string(), 67, &kept, 4).unwrap();
         assert_eq!(stats.orphan_multi, 0);
+    }
+
+    #[test]
+    fn unit_prioritized_trim_tiers_bijection_and_roundtrip() {
+        assert!(is_code_syntax_noise(b"////////"));
+        assert!(is_code_syntax_noise(b"));\n"));
+        assert!(is_code_syntax_noise(b"myVar"));
+        assert!(is_code_syntax_noise(b"    "));
+        assert!(!is_code_syntax_noise(b"\"}\n"));
+        assert!(!is_code_syntax_noise(b"```"));
+        assert!(!is_code_syntax_noise(b" industrial"));
+        assert!(!is_code_syntax_noise(b"micro"));
+
+        // Minimal valid GPT-2 byte-BPE tokenizer across Tier 0..4
+        let b2c: HashMap<u8, char> = crate::vocab::byte_decoder()
+            .into_iter()
+            .map(|(c, b)| (b, c))
+            .collect();
+        let enc = |bs: &[u8]| -> String { bs.iter().map(|b| b2c[b]).collect() };
+
+        let mut vocab = serde_json::Map::new();
+        for b in 0..=255u8 {
+            vocab.insert(b2c[&b].to_string(), Value::from(b as u64));
+        }
+        let mut merges = Vec::new();
+        let mut next_id = 256u64;
+        let mut push_merge = |a: String, b: String, vocab: &mut serde_json::Map<String, Value>| -> u32 {
+            let id = next_id as u32;
+            next_id += 1;
+            merges.push(format!("{a} {b}"));
+            vocab.insert(format!("{a}{b}"), Value::from(id as u64));
+            id
+        };
+
+        // Mix Tier 3 noise BEFORE Tier 2 word and Tier 1 struct in original IDs
+        let id_noise_paren = push_merge(b2c[&b')'].to_string(), b2c[&b';'].to_string(), &mut vocab); // 256 Tier 3 ");"
+        let id_noise = push_merge(enc(b");"), b2c[&b'\n'].to_string(), &mut vocab); // 257 Tier 3 ");\n"
+        let id_wo = push_merge(b2c[&b'w'].to_string(), b2c[&b'o'].to_string(), &mut vocab); // 258 Tier 2 "wo"
+        let id_rd = push_merge(b2c[&b'r'].to_string(), b2c[&b'd'].to_string(), &mut vocab); // 259 Tier 2 "rd"
+        let id_word = push_merge(enc(b"wo"), enc(b"rd"), &mut vocab); // 260 Tier 2 "word"
+        let id_close = push_merge(b2c[&b'"'].to_string(), b2c[&b'}'].to_string(), &mut vocab); // 261 Tier 1 "\"}"
+        let id_close_nl = push_merge(enc(b"\"}"), b2c[&b'\n'].to_string(), &mut vocab); // 262 Tier 1 "\"}\n"
+        let id_special = 263u32;
+
+        // Pad up to 320 (multiple of 64) with reachable clean filler tokens
+        let mut pad_ids = Vec::new();
+        for pfx in [b'x', b'y'] {
+            for ch in (b'0'..=b'9').chain(b'a'..=b'z') {
+                if vocab.len() + 1 >= 320 {
+                    break;
+                }
+                let pid = push_merge(b2c[&pfx].to_string(), b2c[&ch].to_string(), &mut vocab);
+                pad_ids.push(pid);
+            }
+        }
+        // Shift special token to end id_special = 263 wasn't in vocab, put special cleanly at next_id
+        let special_id = next_id as u32;
+        let _ = id_special;
+        let tok_json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [{
+                "id": special_id,
+                "content": "<|im_end|>",
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+                "special": true
+            }],
+            "pre_tokenizer": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": true,
+                "use_regex": false
+            },
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": true,
+                "trim_offsets": true,
+                "use_regex": true
+            },
+            "model": {
+                "type": "BPE",
+                "vocab": vocab,
+                "merges": merges
+            }
+        })
+        .to_string();
+        let orig_vocab = special_id as usize + 1;
+        let mut kept: Vec<u32> = (0..256).collect();
+        kept.extend([id_noise_paren, id_noise, id_wo, id_rd, id_word, id_close, id_close_nl, special_id]);
+        // Fill cleanly to multiple of 64 (320)
+        for pid in pad_ids {
+            if kept.len() >= 320 {
+                break;
+            }
+            kept.push(pid);
+        }
+        kept.sort_unstable();
+        kept.dedup();
+        assert_eq!(kept.len() % ALIGN, 0);
+
+        let struct_prio: BTreeSet<u32> = [id_close, id_close_nl].into_iter().collect();
+        let (trimmed_json, remap, stats) =
+            trim_tokenizer_json_prioritized(&tok_json, orig_vocab, &kept, 4, &struct_prio).unwrap();
+        assert_eq!(stats.orphan_multi, 0);
+        remap.verify_bijection().unwrap();
+
+        let new_byte = remap.map_old(b'a' as u32).unwrap();
+        let new_struct = remap.map_old(id_close_nl).unwrap();
+        let new_word = remap.map_old(id_word).unwrap();
+        let new_noise = remap.map_old(id_noise).unwrap();
+        let new_special = remap.map_old(special_id).unwrap();
+
+        // Strict band order: Tier 0 (byte) < Tier 1 (struct) < Tier 2 (word) < Tier 3 (noise) < Tier 4 (special)
+        assert!(new_byte < new_struct, "tier0 {new_byte} < tier1 {new_struct}");
+        assert!(new_struct < new_word, "tier1 {new_struct} < tier2 {new_word}");
+        assert!(new_word < new_noise, "tier2 {new_word} < tier3 {new_noise}");
+        assert!(new_noise < new_special, "tier3 {new_noise} < tier4 {new_special}");
+        assert_eq!(new_special as usize, remap.trimmed_vocab() - 1);
+
+        #[cfg(feature = "mine")]
+        {
+            let rt_tok = tokenizers::Tokenizer::from_bytes(trimmed_json.as_bytes()).unwrap();
+            let sample = "word\"}\n";
+            let enc_ids = rt_tok.encode(sample, false).unwrap();
+            let dec = rt_tok.decode(enc_ids.get_ids(), false).unwrap();
+            assert_eq!(dec, sample);
+            assert!(enc_ids.get_ids().contains(&new_word));
+            assert!(enc_ids.get_ids().contains(&new_struct));
+        }
+        let _ = trimmed_json;
     }
 }

@@ -166,15 +166,15 @@ impl Langs {
         let mut l = Self::none();
         for code in codes {
             match code.as_ref().trim().to_ascii_lowercase().as_str() {
-                "ko" | "korean" => l.hangul = true,
-                "en" | "english" | "" => {}
-                "ja" | "japanese" => {
+                "ko" | "kor" | "korean" => l.hangul = true,
+                "en" | "eng" | "english" | "" => {}
+                "ja" | "jpn" | "japanese" => {
                     l.kana = true;
                     l.cjk = true;
                 }
-                "zh" | "zh-hans" | "zh-cn" | "zh-tw" | "zh-hk" | "zh-hant" | "chinese" => l.cjk = true,
-                "de" | "fr" | "es" | "it" | "pt" | "nl" | "cs" => l.latin = true,
-                "ar" | "arabic" => l.arabic = true,
+                "zh" | "zh-hans" | "zh-cn" | "zh-tw" | "zh-hk" | "zh-hant" | "zho" | "cmn" | "chinese" => l.cjk = true,
+                "de" | "deu" | "fr" | "fra" | "fre" | "es" | "spa" | "it" | "ita" | "pt" | "por" | "nl" | "nld" | "dut" | "cs" | "ces" | "cze" => l.latin = true,
+                "ar" | "ara" | "arabic" => l.arabic = true,
                 "all" => l = l.union(Self::all()),
                 "any" => l = l.union(Self::any()),
                 _ => {
@@ -536,10 +536,7 @@ pub fn select_from_universe(
 }
 
 /// Compact 3-tier ASCII + frequency-ranked selection (Phase 1-1 D3 / Phase 2-1 D3).
-/// Breaks the 127,908-row ASCII floor by retaining:
-///   Tier 0: special, byte fallback, partial UTF-8, neutral, prompt tokens, domain lexicon, ASCII structural core
-///   Tier 1: active document scripts (Hangul/Kana/Arabic/Latin/CJK up to budget)
-///   Tier 2: frequency-ranked (or merge-order) ASCII & target-script tokens up to `target_k` (aligned to 64).
+/// Starvation-free proportional 3-tier allocation preventing zeroed domain, CJK, or ASCII quotas.
 pub fn select_compact_ranked(
     kinds: &[Kind],
     domain: &BTreeSet<u32>,
@@ -550,7 +547,10 @@ pub fn select_compact_ranked(
     freq_order: Option<&[u32]>,
 ) -> (Vec<u32>, Vec<(&'static str, usize)>) {
     let vocab = kinds.len();
-    let target_k = target_k.next_multiple_of(ALIGN).min(vocab);
+    if vocab == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let target_k = target_k.max(ALIGN).next_multiple_of(ALIGN).min(vocab);
     let mut keep: BTreeSet<u32> = BTreeSet::new();
     let mut tiers: Vec<(&'static str, usize)> = Vec::new();
     let mut add = |name: &'static str, iter: &mut dyn Iterator<Item = u32>, keep: &mut BTreeSet<u32>, cap: Option<usize>| {
@@ -566,80 +566,412 @@ pub fn select_compact_ranked(
         tiers.push((name, keep.len() - before));
     };
 
-    // Tier 0: mandatory special + byte + partial + prompt + domain + ascii_core
+    let cjk_only = |k: Kind| matches!(k, Kind::Script { cjk: true, hangul: false, kana: false, arabic: false, latin: false });
+    let has_core12_non_cjk = |k: Kind| match k {
+        Kind::Script { hangul, kana, arabic, latin, .. } => {
+            (langs.hangul && hangul) || (langs.kana && kana) || (langs.arabic && arabic) || (langs.latin && latin)
+        }
+        _ => false,
+    };
+
+    // Tier 1: Special + Byte(256) + Partial + prompt_ids + ascii_core + active non-CJK script rows
     add(
-        "tier0_core",
+        "tier1_core",
         &mut (0..vocab as u32).filter(|&i| matches!(kinds[i as usize], Kind::Special | Kind::Byte | Kind::Partial)),
         &mut keep,
         None,
     );
-    add("tier0_prompt", &mut prompt_ids.iter().copied(), &mut keep, None);
-    let domain_cap = (keep.len() + (target_k / 4)).min(target_k);
-    add("tier0_domain", &mut domain.iter().copied(), &mut keep, Some(domain_cap));
-    add("tier0_ascii_core", &mut ascii_core.iter().copied(), &mut keep, None);
+    add("tier1_prompt", &mut prompt_ids.iter().copied(), &mut keep, None);
+    add("tier1_ascii_core", &mut ascii_core.iter().copied(), &mut keep, None);
+    add(
+        "tier1_script_non_cjk",
+        &mut (0..vocab as u32).filter(|&i| {
+            let k = kinds[i as usize];
+            if langs.other {
+                has_core12_non_cjk(k)
+            } else {
+                langs.keeps_script(k) && !cjk_only(k)
+            }
+        }),
+        &mut keep,
+        None,
+    );
 
-    // Tier 1: non-CJK target scripts (Hangul ~6.8k, Kana ~3.6k, Arabic ~8.8k, Latin ext)
-    // For CJK-heavy langs (ja/zh), cap CJK at remaining budget minus English reserve.
-    let cjk_only = |k: Kind| matches!(k, Kind::Script { cjk: true, hangul: false, kana: false, arabic: false, latin: false });
-    let en_reserve = (target_k / 4).min(4096);
-    let script_cap = target_k.saturating_sub(en_reserve).max(keep.len());
-    if let Some(order) = freq_order {
-        add(
-            "tier1_script_non_cjk",
-            &mut order.iter().copied().filter(|&i| (i as usize) < vocab && langs.keeps_script(kinds[i as usize]) && !cjk_only(kinds[i as usize])),
-            &mut keep,
-            Some(script_cap),
-        );
-        if langs.cjk || langs.hanja {
-            let cjk_cap = if langs.cjk { script_cap } else { (keep.len() + CJK_COMMON).min(script_cap) };
+    let effective_target = target_k.max(keep.len()).next_multiple_of(ALIGN).min(vocab);
+    let headroom = effective_target.saturating_sub(keep.len());
+    let desired_en = if langs.cjk { 8_192 } else { 6_144 }.min(effective_target / 4);
+    let en_reserve = desired_en.min(headroom * 2 / 5);
+    let tier2_cap = effective_target.saturating_sub(en_reserve);
+    let tier2_room = tier2_cap.saturating_sub(keep.len());
+
+    // Tier 2: Proportional Domain + CJK guarantee (zero starvation even at K=12,288)
+    let cjk_min_reserve = if langs.cjk {
+        tier2_room / 2
+    } else if langs.hanja {
+        CJK_COMMON.min(tier2_room / 3)
+    } else {
+        0
+    };
+    let domain_first_cap = tier2_cap.saturating_sub(cjk_min_reserve);
+    add("tier2_domain", &mut domain.iter().copied(), &mut keep, Some(domain_first_cap));
+    if langs.cjk || langs.hanja {
+        let cjk_cap = if langs.cjk {
+            tier2_cap
+        } else {
+            (keep.len() + CJK_COMMON).min(tier2_cap)
+        };
+        if let Some(order) = freq_order {
             add(
-                "tier1_cjk_ranked",
+                "tier2_cjk_ranked",
                 &mut order.iter().copied().filter(|&i| (i as usize) < vocab && cjk_only(kinds[i as usize])),
                 &mut keep,
                 Some(cjk_cap),
             );
-        }
-        // Tier 2: frequency-ranked ASCII + Neutral + remaining target scripts up to target_k
-        add(
-            "tier2_ascii_ranked",
-            &mut order.iter().copied().filter(|&i| (i as usize) < vocab && matches!(kinds[i as usize], Kind::Ascii | Kind::Neutral)),
-            &mut keep,
-            Some(target_k),
-        );
-    } else {
-        add(
-            "tier1_script_non_cjk",
-            &mut (0..vocab as u32).filter(|&i| langs.keeps_script(kinds[i as usize]) && !cjk_only(kinds[i as usize])),
-            &mut keep,
-            Some(script_cap),
-        );
-        if langs.cjk || langs.hanja {
-            let cjk_cap = if langs.cjk { script_cap } else { (keep.len() + CJK_COMMON).min(script_cap) };
+        } else {
             add(
-                "tier1_cjk_merge",
+                "tier2_cjk_merge",
                 &mut (0..vocab as u32).filter(|&i| cjk_only(kinds[i as usize])),
                 &mut keep,
                 Some(cjk_cap),
             );
         }
-        // BPE token IDs are assigned in merge frequency order: lower ID = higher frequency!
+    }
+    if keep.len() < tier2_cap {
+        add("tier2_domain_spill", &mut domain.iter().copied(), &mut keep, Some(tier2_cap));
+    }
+
+    // Tier 3: Remaining Ascii + Neutral + fallback scripts up to effective_target
+    if let Some(order) = freq_order {
         add(
-            "tier2_ascii_merge",
-            &mut (0..vocab as u32).filter(|&i| matches!(kinds[i as usize], Kind::Ascii | Kind::Neutral)),
+            "tier3_ascii_ranked",
+            &mut order.iter().copied().filter(|&i| {
+                (i as usize) < vocab && (matches!(kinds[i as usize], Kind::Ascii | Kind::Neutral) || langs.keeps_script(kinds[i as usize]))
+            }),
             &mut keep,
-            Some(target_k),
+            Some(effective_target),
+        );
+    } else {
+        add(
+            "tier3_ascii_merge",
+            &mut (0..vocab as u32).filter(|&i| matches!(kinds[i as usize], Kind::Ascii | Kind::Neutral) || langs.keeps_script(kinds[i as usize])),
+            &mut keep,
+            Some(effective_target),
         );
     }
 
     let aligned = keep.len().next_multiple_of(ALIGN).min(vocab);
     add(
         "pad",
-        &mut (0..vocab as u32)
-            .filter(|&i| kinds[i as usize] == Kind::Ascii)
-            .chain(0..vocab as u32),
+        &mut (0..vocab as u32).filter(|&i| kinds[i as usize] == Kind::Ascii).chain(0..vocab as u32),
         &mut keep,
         Some(aligned),
     );
+    (keep.into_iter().collect(), tiers)
+}
+
+fn partial_matches_langs(piece: &[u8], langs: Langs) -> bool {
+    if langs.other || (langs.hangul && langs.kana && langs.cjk && langs.arabic && langs.latin) {
+        return true;
+    }
+    let is_cont_pair = piece.len() <= 2 && piece.iter().all(|&b| (0x80..=0xBF).contains(&b));
+    if (langs.hangul || langs.cjk || langs.kana || langs.hanja) && is_cont_pair {
+        return true;
+    }
+    if langs.hangul && piece.iter().any(|&b| (0xEA..=0xED).contains(&b)) {
+        return true;
+    }
+    if (langs.cjk || langs.kana || langs.hanja) && piece.iter().any(|&b| (0xE3..=0xE9).contains(&b) || b == 0xEF) {
+        return true;
+    }
+    if langs.arabic && piece.iter().any(|&b| (0xD8..=0xDB).contains(&b)) {
+        return true;
+    }
+    if langs.latin && piece.iter().any(|&b| (0xC2..=0xC6).contains(&b)) {
+        return true;
+    }
+    false
+}
+
+fn latin_diacritics_for(doc_lang: Option<&str>) -> Option<&'static str> {
+    match doc_lang?.trim().to_ascii_lowercase().as_str() {
+        "de" | "deu" | "german" => Some("ÄÖÜäöüß"),
+        "fr" | "fra" | "fre" | "french" => Some("ÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸàâæçéèêëîïôœùûüÿ"),
+        "es" | "spa" | "spanish" => Some("ÁÉÍÓÚÜÑáéíóúüñ¡¿"),
+        "it" | "ita" | "italian" => Some("ÀÈÉÌÍÎÒÓÙÚàèéìíîòóùú"),
+        "pt" | "por" | "portuguese" | "pt-br" => Some("ÁÂÃÀÇÉÊÍÓÔÕÚáâãàçéêíóôõú"),
+        "nl" | "nld" | "dut" | "dutch" => Some("ÄËÏÖÜÉÈÊÍÓÚäëïöüéèêíóú"),
+        "cs" | "ces" | "cze" | "czech" => Some("ÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýž"),
+        _ => None,
+    }
+}
+
+fn is_doc_latin_token(piece: &[u8], kind: Kind, allowed: &str) -> bool {
+    if !matches!(kind, Kind::Script { latin: true, hangul: false, kana: false, cjk: false, arabic: false }) {
+        return false;
+    }
+    let Ok(s) = std::str::from_utf8(piece) else { return false };
+    let mut has_non_ascii = false;
+    for c in s.chars() {
+        if !c.is_ascii() {
+            has_non_ascii = true;
+            if !allowed.contains(c) {
+                return false;
+            }
+        }
+    }
+    has_non_ascii
+}
+
+fn push_quota<F>(
+    name: &'static str,
+    vocab: usize,
+    freq_order: Option<&[u32]>,
+    pred: F,
+    keep: &mut BTreeSet<u32>,
+    tiers: &mut Vec<(&'static str, usize)>,
+    add_limit: usize,
+    global_cap: usize,
+) where
+    F: Fn(u32) -> bool,
+{
+    let target = keep.len().saturating_add(add_limit).min(global_cap);
+    let before = keep.len();
+    if let Some(order) = freq_order {
+        for &id in order {
+            if keep.len() >= target {
+                break;
+            }
+            if (id as usize) < vocab && pred(id) {
+                keep.insert(id);
+            }
+        }
+    } else {
+        for id in 0..vocab as u32 {
+            if keep.len() >= target {
+                break;
+            }
+            if pred(id) {
+                keep.insert(id);
+            }
+        }
+    }
+    tiers.push((name, keep.len() - before));
+}
+
+/// Track M precision-preserving compact selector targeting K=10,240..12,288 (< 16,384)
+/// with script-filtered partials, diacritic-specific Latin isolation, capped domain priority,
+/// and proportional script+ASCII quotas in BPE merge/frequency order.
+pub fn select_compact_track_m(
+    kinds: &[Kind],
+    pieces: &[Vec<u8>],
+    domain: &BTreeSet<u32>,
+    prompt_ids: &BTreeSet<u32>,
+    ascii_core: &BTreeSet<u32>,
+    langs: Langs,
+    doc_lang: Option<&str>,
+    target_k: usize,
+    freq_order: Option<&[u32]>,
+) -> (Vec<u32>, Vec<(&'static str, usize)>) {
+    let vocab = kinds.len();
+    if vocab == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let target_k = target_k.max(ALIGN).next_multiple_of(ALIGN).min(vocab);
+    let mut keep: BTreeSet<u32> = BTreeSet::new();
+    let mut tiers: Vec<(&'static str, usize)> = Vec::new();
+
+    // Tier 0: Special + Byte(256) + script-filtered Partial + context prompt + 5-variant structural ASCII
+    push_quota(
+        "tm_tier0_core",
+        vocab,
+        None,
+        |i| {
+            matches!(kinds[i as usize], Kind::Special | Kind::Byte)
+                || (kinds[i as usize] == Kind::Partial && pieces.get(i as usize).is_some_and(|p| partial_matches_langs(p, langs)))
+        },
+        &mut keep,
+        &mut tiers,
+        vocab,
+        vocab,
+    );
+    let before_pr = keep.len();
+    for &id in prompt_ids {
+        if (id as usize) < vocab {
+            keep.insert(id);
+        }
+    }
+    tiers.push(("tm_tier0_prompt", keep.len() - before_pr));
+    let before_ac = keep.len();
+    for &id in ascii_core {
+        if (id as usize) < vocab {
+            keep.insert(id);
+        }
+    }
+    tiers.push(("tm_tier0_ascii_core", keep.len() - before_ac));
+
+    // Reserve head cap: at least `target_k` (never truncate Tier 0) aligned to 64
+    let eff_k = target_k.max(keep.len()).next_multiple_of(ALIGN).min(vocab);
+    let rem0 = eff_k.saturating_sub(keep.len());
+    let domain_cap = (rem0 / 16).clamp(384, 768).min(rem0);
+    push_quota(
+        "tm_domain_prio",
+        vocab,
+        freq_order,
+        |i| {
+            domain.contains(&i)
+                && (matches!(kinds[i as usize], Kind::Ascii | Kind::Neutral | Kind::Special | Kind::Byte | Kind::Partial)
+                    || langs.keeps_script(kinds[i as usize]))
+        },
+        &mut keep,
+        &mut tiers,
+        domain_cap,
+        eff_k,
+    );
+
+    let rem = eff_k.saturating_sub(keep.len());
+    let cjk_only = |k: Kind| matches!(k, Kind::Script { cjk: true, hangul: false, kana: false, arabic: false, latin: false });
+    let is_ascii_neutral = |i: u32| matches!(kinds[i as usize], Kind::Ascii | Kind::Neutral);
+
+    if !langs.hangul && !langs.kana && !langs.cjk && !langs.arabic && !langs.latin && !langs.other {
+        // English / pure ASCII
+        push_quota("tm_en_ascii", vocab, freq_order, is_ascii_neutral, &mut keep, &mut tiers, rem, eff_k);
+    } else if langs.latin && !langs.hangul && !langs.kana && !langs.cjk && !langs.arabic && !langs.other {
+        let lat_cap = rem * 25 / 100;
+        if let Some(allowed_ch) = latin_diacritics_for(doc_lang) {
+            push_quota(
+                "tm_latin_specific",
+                vocab,
+                freq_order,
+                |i| pieces.get(i as usize).is_some_and(|p| is_doc_latin_token(p, kinds[i as usize], allowed_ch)),
+                &mut keep,
+                &mut tiers,
+                lat_cap,
+                eff_k,
+            );
+        } else {
+            push_quota(
+                "tm_latin_all",
+                vocab,
+                freq_order,
+                |i| matches!(kinds[i as usize], Kind::Script { latin: true, hangul: false, kana: false, cjk: false, arabic: false }),
+                &mut keep,
+                &mut tiers,
+                lat_cap,
+                eff_k,
+            );
+        }
+        push_quota("tm_latin_ascii", vocab, freq_order, is_ascii_neutral, &mut keep, &mut tiers, eff_k, eff_k);
+    } else if langs.kana && langs.cjk && !langs.hangul && !langs.arabic && !langs.other {
+        // Japanese: 25% Kana/mixed, 40% pure CJK, >=35% ASCII
+        push_quota(
+            "tm_ja_kana",
+            vocab,
+            freq_order,
+            |i| matches!(kinds[i as usize], Kind::Script { kana: true, hangul: false, arabic: false, latin: false, .. }),
+            &mut keep,
+            &mut tiers,
+            rem * 25 / 100,
+            eff_k,
+        );
+        push_quota(
+            "tm_ja_cjk",
+            vocab,
+            freq_order,
+            |i| cjk_only(kinds[i as usize]),
+            &mut keep,
+            &mut tiers,
+            rem * 40 / 100,
+            eff_k,
+        );
+        push_quota("tm_ja_ascii", vocab, freq_order, is_ascii_neutral, &mut keep, &mut tiers, eff_k, eff_k);
+    } else if langs.cjk && !langs.kana && !langs.hangul && !langs.arabic && !langs.other {
+        // Chinese (zh / zh-tw): 60% CJK, 40% ASCII
+        push_quota("tm_zh_cjk", vocab, freq_order, |i| cjk_only(kinds[i as usize]), &mut keep, &mut tiers, rem * 60 / 100, eff_k);
+        push_quota("tm_zh_ascii", vocab, freq_order, is_ascii_neutral, &mut keep, &mut tiers, eff_k, eff_k);
+    } else if langs.hangul && !langs.cjk && !langs.kana && !langs.arabic && !langs.other {
+        // Korean: 55% Hangul, small Hanja slice if active, 40-45% ASCII
+        push_quota(
+            "tm_ko_hangul",
+            vocab,
+            freq_order,
+            |i| matches!(kinds[i as usize], Kind::Script { hangul: true, kana: false, arabic: false, latin: false, .. }),
+            &mut keep,
+            &mut tiers,
+            rem * 55 / 100,
+            eff_k,
+        );
+        if langs.hanja {
+            push_quota("tm_ko_hanja", vocab, freq_order, |i| cjk_only(kinds[i as usize]), &mut keep, &mut tiers, 512.min(rem / 12), eff_k);
+        }
+        push_quota("tm_ko_ascii", vocab, freq_order, is_ascii_neutral, &mut keep, &mut tiers, eff_k, eff_k);
+    } else if langs.arabic && !langs.hangul && !langs.kana && !langs.cjk && !langs.other {
+        // Arabic: 55% Arabic, 45% ASCII
+        push_quota(
+            "tm_ar_arabic",
+            vocab,
+            freq_order,
+            |i| matches!(kinds[i as usize], Kind::Script { arabic: true, .. }),
+            &mut keep,
+            &mut tiers,
+            rem * 55 / 100,
+            eff_k,
+        );
+        push_quota("tm_ar_ascii", vocab, freq_order, is_ascii_neutral, &mut keep, &mut tiers, eff_k, eff_k);
+    } else {
+        // Multi-script / all12 / any fallback: reserve >=35% ASCII, split rest fairly across active Core-12 scripts
+        let script_total = rem * 65 / 100;
+        let active_n = [langs.hangul, langs.kana, langs.cjk || langs.hanja, langs.arabic, langs.latin]
+            .into_iter()
+            .filter(|&b| b)
+            .count()
+            .max(1);
+        let per_script = script_total / active_n;
+        if langs.hangul {
+            push_quota("tm_multi_ko", vocab, freq_order, |i| matches!(kinds[i as usize], Kind::Script { hangul: true, .. }), &mut keep, &mut tiers, per_script, eff_k);
+        }
+        if langs.kana {
+            push_quota("tm_multi_ja", vocab, freq_order, |i| matches!(kinds[i as usize], Kind::Script { kana: true, .. }), &mut keep, &mut tiers, per_script, eff_k);
+        }
+        if langs.cjk || langs.hanja {
+            let cjk_q = if langs.cjk { per_script } else { per_script.min(CJK_COMMON) };
+            push_quota("tm_multi_cjk", vocab, freq_order, |i| cjk_only(kinds[i as usize]), &mut keep, &mut tiers, cjk_q, eff_k);
+        }
+        if langs.arabic {
+            push_quota("tm_multi_ar", vocab, freq_order, |i| matches!(kinds[i as usize], Kind::Script { arabic: true, .. }), &mut keep, &mut tiers, per_script, eff_k);
+        }
+        if langs.latin {
+            push_quota("tm_multi_lat", vocab, freq_order, |i| matches!(kinds[i as usize], Kind::Script { latin: true, .. }), &mut keep, &mut tiers, per_script, eff_k);
+        }
+        push_quota("tm_multi_ascii", vocab, freq_order, is_ascii_neutral, &mut keep, &mut tiers, eff_k, eff_k);
+    }
+
+    // Spill remaining active scripts / domain / ASCII up to eff_k, then align to 64
+    if keep.len() < eff_k {
+        let spill_room = eff_k.saturating_sub(keep.len());
+        push_quota(
+            "tm_spill",
+            vocab,
+            freq_order,
+            |i| {
+                langs.keeps_script(kinds[i as usize])
+                    || domain.contains(&i)
+                    || is_ascii_neutral(i)
+            },
+            &mut keep,
+            &mut tiers,
+            spill_room,
+            eff_k,
+        );
+    }
+    let aligned = keep.len().next_multiple_of(ALIGN).min(vocab);
+    let before_pad = keep.len();
+    for i in (0..vocab as u32).filter(|&i| kinds[i as usize] == Kind::Ascii).chain(0..vocab as u32) {
+        if keep.len() >= aligned {
+            break;
+        }
+        keep.insert(i);
+    }
+    tiers.push(("pad", keep.len() - before_pad));
     (keep.into_iter().collect(), tiers)
 }
 
@@ -764,5 +1096,79 @@ mod tests {
         eprintln!("Qwen3.5 rows: en {en} · ko+en {ko} · ja+en {ja} · all {all} of 248320");
         assert!(en < ko && ko < all && ja < all && all <= 248_320);
         assert_eq!(ko % ALIGN, 0);
+    }
+
+    #[test]
+    fn langs_iso639_3_codes_do_not_bleed_into_other() {
+        let ko = Langs::from_codes(&["kor", "eng"]).unwrap();
+        assert!(ko.hangul && !ko.other && !ko.cjk);
+        let ja = Langs::from_codes(&["jpn", "eng"]).unwrap();
+        assert!(ja.kana && ja.cjk && !ja.other);
+        let zh = Langs::from_codes(&["zho", "cmn", "zh-tw"]).unwrap();
+        assert!(zh.cjk && !zh.other);
+        let ar = Langs::from_codes(&["ara"]).unwrap();
+        assert!(ar.arabic && !ar.other);
+        let lat = Langs::from_codes(&["deu", "fra", "spa", "ita", "por", "nld", "ces"]).unwrap();
+        assert!(lat.latin && !lat.other && !lat.hangul);
+    }
+
+    #[test]
+    fn compact_track_m_balanced_ja_fr_ko() {
+        let mut pieces: Vec<Vec<u8>> = vec![b"<s>".to_vec()];
+        for b in 0..=255u8 {
+            pieces.push(vec![b]);
+        }
+        // French + Polish latin tokens
+        for w in ["café", "résumé", "Łódź", "ąęćż"] {
+            pieces.push(w.as_bytes().to_vec());
+        }
+        // Kana, CJK, Hangul, and 400 ASCII words
+        for i in 0..300usize {
+            pieces.push(format!("カタ{i}").into_bytes());
+            pieces.push(format!("漢{i}").into_bytes());
+            pieces.push(format!("가{i}").into_bytes());
+            pieces.push(format!("word{i}").into_bytes());
+        }
+        let added: Vec<bool> = (0..pieces.len()).map(|i| i == 0).collect();
+        let k = kinds(&pieces, &added);
+
+        // French should filter out Polish-specific diacritics when doc_lang="fr"
+        let (fr_ids, _) = select_compact_track_m(
+            &k,
+            &pieces,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Langs::of_doc_lang("fr"),
+            Some("fr"),
+            512,
+            None,
+        );
+        let fr_set: BTreeSet<u32> = fr_ids.into_iter().collect();
+        let has_pl = (0..pieces.len() as u32).any(|i| pieces[i as usize] == "Łódź".as_bytes() && fr_set.contains(&i));
+        assert!(!has_pl, "doc_lang=fr must exclude Polish diacritics during specific quota pass");
+
+        // Japanese K=640 must retain Kana, CJK, AND ASCII without zero starvation
+        let (ja_ids, _) = select_compact_track_m(
+            &k,
+            &pieces,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Langs::of_doc_lang("ja"),
+            Some("ja"),
+            640,
+            None,
+        );
+        assert_eq!(ja_ids.len() % ALIGN, 0);
+        let kana_kept = ja_ids.iter().filter(|&&id| matches!(k[id as usize], Kind::Script { kana: true, .. })).count();
+        let cjk_kept = ja_ids.iter().filter(|&&id| matches!(k[id as usize], Kind::Script { cjk: true, kana: false, .. })).count();
+        let asc_kept = ja_ids.iter().filter(|&&id| k[id as usize] == Kind::Ascii).count();
+        assert!(kana_kept > 0 && cjk_kept > 0 && asc_kept > 0, "ja must keep kana={kana_kept} cjk={cjk_kept} asc={asc_kept}");
+
+        // select_compact_ranked backward compatibility + no starvation on narrow K=512
+        let dom: BTreeSet<u32> = (pieces.len() as u32 - 40..pieces.len() as u32).collect();
+        let (cr_ids, _) = select_compact_ranked(&k, &dom, &BTreeSet::new(), &BTreeSet::new(), Langs::of_doc_lang("ja"), 512, None);
+        assert_eq!(cr_ids.len() % ALIGN, 0);
     }
 }

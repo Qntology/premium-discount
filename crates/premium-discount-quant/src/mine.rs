@@ -292,6 +292,8 @@ pub fn default_ascii_struct_corpus() -> Vec<String> {
     let mut v: Vec<String> = [
         "<table>", "</table>", "<tr>", "</tr>", "<td>", "</td>", "<th>", "</th>",
         "<thead>", "<tbody>", "<br>", "{\"", "\":", "\": \"", "\", \"", "\"}", "[{", "}]",
+        "\"}\n", "\"},\n", "\"},", "{\n", "}\n", "\n\n", "```", "```json",
+        "Answer:", "Output:", "Result:", "Summary:",
         "null", "true", "false", "USD", "KRW", "JPY", "CNY", "EUR", "GBP", "AED", "SAR", "CZK",
         "FOB", "CIF", "CFR", "EXW", "DDP", "DAP", "FCA", "CPT", "CIP", "HS", "SKU", "B/L", "L/C",
         "PCS", "CTN", "KG", "MT", "CBM", "20FT", "40FT", "40HC", "LCL", "FCL", "ETA", "ETD",
@@ -301,6 +303,10 @@ pub fn default_ascii_struct_corpus() -> Vec<String> {
         "discount", "seller", "buyer", "address", "phone", "email", "tracking", "carrier",
         "transcription", "product", "item", "items", "category", "brand", "color", "size",
         "weight", "unit", "origin", "destination", "container", "seal", "vessel", "voyage",
+        "shipment", "freight", "customs", "consignment", "bill", "lading", "commercial",
+        "prepaid", "collect", "cartons", "boxes", "gross", "net", "packages", "material",
+        "electronics", "industrial", "components", "parts", "equipment", "machinery",
+        "model", "serial", "company", "supplier", "manufacturer",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -401,6 +407,7 @@ pub fn select_hybrid_plan(
         "goods", "condition", "status", "order", "invoice", "packing", "shipper", "consignee",
         "quantity", "amount", "price", "currency", "date", "number", "code", "total", "title",
         "name", "description", "transcription", "SKU", "HS", "FOB", "CIF",
+        "Answer", "Output", "Result", "Summary", "shipment", "industrial", "company",
     ];
     for id in collect_space_pair_tokens(tok, &default_keys, vocab_size) {
         if assigned[id as usize] {
@@ -552,6 +559,40 @@ pub fn select_hybrid_plan(
                     let n = try_insert_with_closure(&mut kept, id, target_k);
                     if n > 0 {
                         added_bucket += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Bare ASCII Twin pass: preserve unspaced `word` whenever ` word` is in top 16,384
+    if matches!(
+        flavor,
+        TokenizerFlavor::Gpt2ByteBpe | TokenizerFlavor::GraniteByteBpe
+    ) && kept.len() < target_k
+    {
+        let mut bare_lookup: HashMap<&[u8], u32> = HashMap::with_capacity(vocab_size);
+        for id in 0..vocab_size as u32 {
+            let idx = id as usize;
+            if assigned[idx] && !added[idx] && !is_source_orphan(idx) {
+                bare_lookup.entry(pieces[idx].as_slice()).or_insert(id);
+            }
+        }
+        let scan_limit = vocab_size.min(16_384) as u32;
+        let mut twins_added = 0usize;
+        for id in 0..scan_limit {
+            if twins_added >= 2_048 || kept.len() >= target_k {
+                break;
+            }
+            let p = &pieces[id as usize];
+            if p.len() >= 4 && p[0] == b' ' && p[1..].iter().all(|b| b.is_ascii_alphabetic()) {
+                let bare = &p[1..];
+                if let Some(&bare_id) = bare_lookup.get(bare) {
+                    if allowed_id(bare_id) && !kept.contains_key(&bare_id) {
+                        let n = try_insert_with_closure(&mut kept, bare_id, target_k);
+                        if n > 0 {
+                            twins_added += 1;
+                        }
                     }
                 }
             }
@@ -757,5 +798,97 @@ mod tests {
         assert!(bl.is_blocked("hello world"));
         assert!(bl.is_blocked("bl-2026-08814"));
         assert!(!bl.is_blocked("different document"));
+    }
+
+    #[test]
+    fn struct_corpus_and_bare_ascii_twin_pass() {
+        let sc = default_ascii_struct_corpus();
+        assert!(sc.iter().any(|s| s == "\"}\n"));
+        assert!(sc.iter().any(|s| s == "```"));
+        assert!(sc.iter().any(|s| s == "industrial"));
+
+        // Construct a minimal GPT-2 byte-BPE tokenizer where `Ġmicro` is at low ID 260
+        // and bare `micro` is at high ID 372 (> target_k 320), with disjoint merge chains.
+        let b2c: HashMap<u8, char> = crate::vocab::byte_decoder()
+            .into_iter()
+            .map(|(c, b)| (b, c))
+            .collect();
+        let encode_bytes = |bs: &[u8]| -> String { bs.iter().map(|b| b2c[b]).collect() };
+
+        let mut vocab = serde_json::Map::new();
+        for b in 0..=255u8 {
+            vocab.insert(b2c[&b].to_string(), serde_json::Value::from(b as u64));
+        }
+        let mut merges: Vec<String> = Vec::new();
+        let mut next_id = 256u64;
+        let mut push_merge = |a: String, b: String, vocab: &mut serde_json::Map<String, serde_json::Value>| -> u64 {
+            let ab = format!("{a}{b}");
+            let id = next_id;
+            next_id += 1;
+            merges.push(format!("{a} {b}"));
+            vocab.insert(ab, serde_json::Value::from(id));
+            id
+        };
+
+        let sp = b2c[&b' '].to_string();
+        let m = b2c[&b'm'].to_string();
+        let i = b2c[&b'i'].to_string();
+        let c = b2c[&b'c'].to_string();
+        let r = b2c[&b'r'].to_string();
+        let o = b2c[&b'o'].to_string();
+        push_merge(sp.clone(), m.clone(), &mut vocab); // 256: Ġm
+        push_merge(i.clone(), c.clone(), &mut vocab);  // 257: ic
+        push_merge(r.clone(), o.clone(), &mut vocab);  // 258: ro
+        push_merge(encode_bytes(b"ic"), encode_bytes(b"ro"), &mut vocab); // 259: icro
+        let g_micro_id = push_merge(encode_bytes(b" m"), encode_bytes(b"icro"), &mut vocab); // 260: Ġmicro
+        assert_eq!(g_micro_id, 260);
+
+        for pfx in [b'x', b'y', b'z'] {
+            for ch in (b'0'..=b'9').chain(b'A'..=b'Z') {
+                push_merge(b2c[&pfx].to_string(), b2c[&ch].to_string(), &mut vocab);
+            }
+        }
+        push_merge(m, i, &mut vocab); // mi
+        push_merge(encode_bytes(b"mi"), c, &mut vocab); // mic
+        push_merge(encode_bytes(b"mic"), r, &mut vocab); // micr
+        let bare_micro_id = push_merge(encode_bytes(b"micr"), o, &mut vocab) as u32; // micro (>= 370)
+        assert!(bare_micro_id > 320);
+
+        let tok_json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [],
+            "model": { "type": "BPE", "vocab": vocab, "merges": merges }
+        })
+        .to_string();
+        let tok = Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+        let vocab_size = next_id as usize;
+        let cache = FreqCache::new("sha".into(), vocab_size, "leak".into());
+        let cfg = HybridPlanConfig {
+            model_family: "qwen3".into(),
+            bundle: "core12".into(),
+            target_k: 320,
+            langs: Langs::all(),
+            lang_codes: vec!["en".into()],
+            domain_alpha: 10.0,
+            hanja_cap: 64,
+            corpus_manifest_sha256: "m".into(),
+            lexicon_sha256: "l".into(),
+        };
+        let plan = select_hybrid_plan(
+            &tok_json,
+            &tok,
+            vocab_size,
+            &cache,
+            &[],
+            &[],
+            &cfg,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(plan.orphan_bpe_tokens, 0);
+        assert!(
+            plan.kept_ids.contains(&bare_micro_id),
+            "bare twin 'micro' ({bare_micro_id}) must be preserved when spaced 'Ġmicro' is < 16k"
+        );
     }
 }
