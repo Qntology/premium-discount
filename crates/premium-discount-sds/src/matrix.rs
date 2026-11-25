@@ -107,37 +107,42 @@ fn cell(matrix: &[Vec<f32>], f: usize, l: usize) -> f32 {
     }
 }
 
-/// `own − best rival on the line`; only cells reaching `abs_threshold` count as rivals, and with none the rival
-/// is `abs_threshold` itself (logis RIVAL FIX: absent markers must not inflate margins).
-fn margin_over_rivals(matrix: &[Vec<f32>], f: usize, l: usize, own: f32, abs_threshold: f32) -> f32 {
-    let mut rival = f32::MIN;
-    for other in 0..matrix.len() {
-        if other == f {
-            continue;
-        }
-        let s = cell(matrix, other, l);
-        if s < abs_threshold {
-            continue;
-        }
-        if s > rival {
-            rival = s;
-        }
-    }
-    own - if rival == f32::MIN { abs_threshold } else { rival }
-}
-
 type Claim = (usize, usize, f32, f32);
 
 /// Claims `(field, line, own, margin)` passing both thresholds; `gate` may veto one (and record why).
+/// Precomputes per-line `(top1, top1_field, top2)` over cells reaching `abs_threshold` so rival lookup
+/// is O(1) instead of O(F), reducing total complexity from O(F² · L) to O(F · L) with identical
+/// floating-point arithmetic (`own - rival`, falling back to `abs_threshold` when no rival qualifies).
 fn claims(matrix: &[Vec<f32>], abs_threshold: f32, margin_threshold: f32, mut gate: impl FnMut(usize, usize, f32) -> bool) -> Vec<Claim> {
+    let lines = line_count(matrix);
+    let mut top1_val = vec![f32::MIN; lines];
+    let mut top1_f = vec![usize::MAX; lines];
+    let mut top2_val = vec![f32::MIN; lines];
+    for f in 0..matrix.len() {
+        for l in 0..lines {
+            let s = cell(matrix, f, l);
+            if s < abs_threshold {
+                continue;
+            }
+            if s > top1_val[l] {
+                top2_val[l] = top1_val[l];
+                top1_val[l] = s;
+                top1_f[l] = f;
+            } else if s > top2_val[l] {
+                top2_val[l] = s;
+            }
+        }
+    }
+
     let mut out = Vec::new();
     for f in 0..matrix.len() {
-        for l in 0..line_count(matrix) {
+        for l in 0..lines {
             let own = cell(matrix, f, l);
             if own < abs_threshold {
                 continue;
             }
-            let margin = margin_over_rivals(matrix, f, l, own, abs_threshold);
+            let rival = if f == top1_f[l] { top2_val[l] } else { top1_val[l] };
+            let margin = own - if rival == f32::MIN { abs_threshold } else { rival };
             if margin < margin_threshold {
                 continue;
             }
