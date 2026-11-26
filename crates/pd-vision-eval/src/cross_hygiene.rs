@@ -12,13 +12,29 @@ const FORBIDDEN_BENCH_IDENTS: &[&str] = &[
     "Mind2Web",
     "NYUv2",
     "ScanNet",
+    "docs_nn_scenarios",
+    "DOCS_NN_HOLDOUT_SEED",
+    "ZH-",
+    "ui_nn_scenarios",
+    "UI_NN_HOLDOUT_SEED",
+    "UI-ZH-",
 ];
 
-/// Audits `lv-core`, `lv-screen`, `lv-doc`, and `lv-spatial` source trees under `lv_root` for
-/// benchmark contamination literals.
+/// Audits all 10 Tier 1 crates under `lv_root` for benchmark and UI/docs holdout contamination literals.
 pub fn audit_louis_vision_crates(lv_root: &Path) -> anyhow::Result<Vec<HygieneFinding>> {
     let mut findings = Vec::new();
-    for krate in ["lv-core", "lv-screen", "lv-doc", "lv-spatial"] {
+    for krate in [
+        "lv-kernels",
+        "lv-sds",
+        "lv-core",
+        "lv-screen",
+        "lv-doc",
+        "lv-spatial",
+        "lv-planar",
+        "lv-domain",
+        "lv-router",
+        "lv-agent",
+    ] {
         let src = lv_root.join("crates").join(krate).join("src");
         if src.exists() {
             findings.extend(scan_engine_tree(&src, FORBIDDEN_BENCH_IDENTS, &["rs"])?);

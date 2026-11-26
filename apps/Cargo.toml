@@ -35,13 +35,17 @@ premium-discount-quant       = { path = "../crates/premium-discount-quant" }
 premium-discount-relay       = { path = "../crates/premium-discount-relay" }
 premium-discount-analytic    = { path = "../crates/premium-discount-analytic" }
 
-# Tier 1 (Qntology/louis-vision) pinned to sealed <LV_LIB_PIN_REV>
-lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
-lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
-lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
-lv-screen  = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
-lv-doc     = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6", default-features = false }
-lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+# Tier 1 (Qntology/louis-vision) pinned to merged <LV_FINAL_REV>
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-screen  = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-doc     = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56", default-features = false }
+lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-domain  = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-planar  = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56", default-features = false, features = ["domain", "screen"] }
+lv-router  = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-agent   = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
 
 # Shared runtime & ML dependencies
 anyhow      = "1"
@@ -64,6 +68,7 @@ tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", 
 [patch."https://github.com/Qntology/premium-discount"]
 premium-discount-cpu-kernels = { path = "../crates/premium-discount-cpu-kernels" }
 premium-discount-eval        = { path = "../crates/premium-discount-eval" }
+premium-discount-manifest    = { path = "../crates/premium-discount-manifest" }
 premium-discount-sds         = { path = "../crates/premium-discount-sds" }
 premium-discount-quant       = { path = "../crates/premium-discount-quant" }
 premium-discount-nlp         = { path = "../crates/premium-discount-nlp" }
@@ -90,6 +95,8 @@ opt-level = 3
 [profile.dev.package.lv-kernels]
 opt-level = 3
 [profile.dev.package.lv-spatial]
+opt-level = 3
+[profile.dev.package.lv-planar]
 opt-level = 3
 [profile.dev.package.lv-core]
 opt-level = 2

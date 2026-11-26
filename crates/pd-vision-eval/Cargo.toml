@@ -8,10 +8,10 @@ license = "Apache-2.0"
 
 [features]
 default = []
-cuda    = ["lv-core/cuda", "lv-screen/cuda", "lv-spatial/cuda"]
-rocm    = ["lv-core/rocm", "lv-screen/rocm", "lv-spatial/rocm"]
-vulkan  = ["lv-core/vulkan", "lv-screen/vulkan", "lv-spatial/vulkan"]
-metal   = ["lv-core/metal", "lv-screen/metal", "lv-spatial/metal"]
+cuda    = ["lv-core/cuda", "lv-screen/cuda", "lv-spatial/cuda", "lv-planar/cuda"]
+rocm    = ["lv-core/rocm", "lv-screen/rocm", "lv-spatial/rocm", "lv-planar/rocm"]
+vulkan  = ["lv-core/vulkan", "lv-screen/vulkan", "lv-spatial/vulkan", "lv-planar/vulkan"]
+metal   = ["lv-core/metal", "lv-screen/metal", "lv-spatial/metal", "lv-planar/metal"]
 
 [dependencies]
 anyhow.workspace = true
@@ -26,3 +26,5 @@ lv-core.workspace = true
 lv-screen.workspace = true
 lv-doc.workspace = true
 lv-spatial.workspace = true
+lv-domain.workspace = true
+lv-planar.workspace = true
