@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 image.workspace = true
 candle-core.workspace = true
+sha2.workspace = true
 premium-discount-eval = { workspace = true, features = ["hygiene"] }
 premium-discount-sds.workspace = true
 premium-discount-nav.workspace = true
