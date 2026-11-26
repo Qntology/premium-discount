@@ -5,4 +5,5 @@
 pub mod cross_hygiene;
 pub mod doc_eval;
 pub mod screen_eval;
+pub mod spatial_doc_eval;
 pub mod spatial_eval;

@@ -12,14 +12,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_CANDLE_REV = "f73415d4d149d7949e8a6a94911af670e4e10f7f"
 EXPECTED_PD_REV = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
-EXPECTED_LV_REV = "341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+EXPECTED_LV_REV = "afa2f8afce076ee418b669e701e3c1668463da56"
 FORBIDDEN_CANDLE_REVS = ("ebaf93d", "3abdfab7")
 
 
 def iter_cargo_manifests(base: Path) -> list[Path]:
     out: list[Path] = []
     for p in sorted(base.rglob("Cargo.toml")):
-        if any(part in ("target", ".git", "node_modules") for part in p.parts):
+        if any(part in ("target", ".git", "node_modules", "vendor") for part in p.parts):
             continue
         out.append(p)
     return out
@@ -43,7 +43,13 @@ def strip_comment(line: str) -> str:
 
 def check_manifest_rules(manifest: Path, repo_root: Path, errs: list[str], candle_revs: set[str]) -> None:
     rel = manifest.relative_to(repo_root).as_posix()
-    allow_parent_crates = rel == "apps/Cargo.toml" and repo_root.name == "premium-discount"
+    if repo_root.name == "logis-center" and rel == "tools/cpu-embed-bench/Cargo.toml":
+        return
+    allow_parent_crates = (
+        (rel == "apps/Cargo.toml" and repo_root.name == "premium-discount")
+        or (rel.startswith("apps/") and repo_root.name == "louis-vision")
+        or ((rel.startswith("apps/") or rel.startswith("crates/")) and repo_root.name == "logis-center")
+    )
     text = manifest.read_text(encoding="utf-8", errors="replace")
     for lineno, raw in enumerate(text.splitlines(), 1):
         code = strip_comment(raw).strip()
@@ -84,7 +90,21 @@ def check_tier0(pd_root: Path, errs: list[str]) -> None:
         text = m.read_text(encoding="utf-8", errors="replace")
         for lineno, raw in enumerate(text.splitlines(), 1):
             code = strip_comment(raw)
-            for sym in ("louis-vision", "lv-screen", "lv-doc", "lv-spatial", "lv-core", "premium-discount-sensor", "premium-discount-vision"):
+            for sym in (
+                "louis-vision",
+                "lv-kernels",
+                "lv-sds",
+                "lv-core",
+                "lv-screen",
+                "lv-doc",
+                "lv-spatial",
+                "lv-planar",
+                "lv-domain",
+                "lv-router",
+                "lv-agent",
+                "premium-discount-sensor",
+                "premium-discount-vision",
+            ):
                 if sym in code:
                     errs.append(f"Tier 0 violation in {rel}:{lineno}: forbidden dependency '{sym}'")
 

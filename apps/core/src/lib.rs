@@ -11,6 +11,7 @@ pub mod embeddinggemma;
 pub mod embeddinggemma_audio;
 pub mod embeddinggemma_text;
 pub mod embeddinggemma_tokens;
+pub use lv_core::gemma_embed;
 pub use lv_core::gemma_vision;
 pub mod error;
 pub mod filter;
