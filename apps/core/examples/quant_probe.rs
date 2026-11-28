@@ -102,7 +102,7 @@ fn main() {
         for (name, recipe) in expand(spec) {
             let t = Instant::now();
             let kernel = Kernel::parse(&std::env::var("PD_QUANT_KERNEL").unwrap_or_default()).expect("PD_QUANT_KERNEL: dequant | native");
-            let model = EmbeddingGemma::load_with(&dir, LoadOptions { modalities: Modalities::Text, quant: recipe, kernel, tower_bits: None }).expect("모델 로드");
+            let model = EmbeddingGemma::load_with(&dir, LoadOptions { modalities: Modalities::Text, quant: recipe, kernel, tower_bits: None, ..Default::default() }).expect("모델 로드");
             let load_ms = t.elapsed().as_millis() as u64;
             let t = Instant::now();
             let mut cos = Vec::new();

@@ -130,7 +130,10 @@ async fn build_core(settings: &Settings, filter: Arc<SwitchFilter>) -> Result<Co
     let options = LoadOptions {
         modalities: settings.modalities,
         quant: settings.quant.recipe(platform),
+        encoder: settings.quant.encoder(),
         tower_bits: settings.quant.tower_bits(platform),
+        vision_quant: Some(settings.quant.vision_plan(platform)),
+        audio_quant: Some(settings.quant.audio_plan(platform)),
         ..Default::default()
     };
     let embedder = tauri::async_runtime::spawn_blocking(move || EmbeddingGemma::load_with(&model_dir, options))
