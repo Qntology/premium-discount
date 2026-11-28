@@ -75,7 +75,7 @@ fn load_tower(dir: &Path) -> VisionTower {
         (None, Some(keep)) => keep,
         (None, None) => TowerQuant::default_keep(TOWER),
     };
-    let q = TowerQuant { bits, kernel: Default::default(), cache: None, keep_f32 };
+    let q = TowerQuant { bits, keep_f32, ..TowerQuant::off() };
     let tower = VisionTower::load_with(&vb, &Device::Cpu, q).expect("비전 타워 로드");
     println!("linear MB: {:.1}", tower.linear_bytes() as f64 / 1e6);
     tower

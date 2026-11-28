@@ -83,7 +83,7 @@ fn audio_path_matches_transformers_reference() {
         (None, Some(keep)) => keep,
         (None, None) => premium_discount_app::quant::TowerQuant::default_keep(TOWER),
     };
-    let q = premium_discount_app::quant::TowerQuant { bits, kernel: Default::default(), cache: None, keep_f32 };
+    let q = premium_discount_app::quant::TowerQuant { bits, keep_f32, ..premium_discount_app::quant::TowerQuant::off() };
     let tower = AudioTower::load_with(&vb, &Device::Cpu, q).expect("오디오 타워 로드");
     println!("linear MB: {:.1}", tower.linear_bytes() as f64 / 1e6);
     let threshold = if bits.is_some() { MIN_COSINE_QUANTIZED } else { MIN_COSINE };

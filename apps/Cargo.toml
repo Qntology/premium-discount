@@ -36,16 +36,16 @@ premium-discount-relay       = { path = "../crates/premium-discount-relay" }
 premium-discount-analytic    = { path = "../crates/premium-discount-analytic" }
 
 # Tier 1 (Qntology/louis-vision) pinned to merged <LV_FINAL_REV>
-lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-screen  = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-doc     = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132", default-features = false }
-lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-domain  = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-planar  = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132", default-features = false, features = ["domain", "screen"] }
-lv-router  = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-agent   = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-screen  = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-doc     = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611", default-features = false }
+lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-domain  = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-planar  = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611", default-features = false, features = ["domain", "screen"] }
+lv-router  = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-agent   = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
 
 # Shared runtime & ML dependencies
 anyhow      = "1"

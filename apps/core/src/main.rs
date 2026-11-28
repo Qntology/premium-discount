@@ -108,10 +108,14 @@ async fn build_core(config: &Config, filter: Arc<SwitchFilter>) -> Result<Core, 
         backend = backend.with_session(hash.clone(), token.clone());
     }
     let model_dir = std::path::PathBuf::from(&config.model_dir);
+    let plat = platform();
     let options = LoadOptions {
         modalities: config.modalities,
-        quant: config.quant.recipe(platform()),
-        tower_bits: config.quant.tower_bits(platform()),
+        quant: config.quant.recipe(plat),
+        encoder: config.quant.encoder(),
+        tower_bits: config.quant.tower_bits(plat),
+        vision_quant: Some(config.quant.vision_plan(plat)),
+        audio_quant: Some(config.quant.audio_plan(plat)),
         ..Default::default()
     };
     // 모델 로드는 CPU를 몇 초 쓰므로 비동기 작업 스레드(내려받기도 여기서 돈다)를 막지 않게 따로 돌린다
