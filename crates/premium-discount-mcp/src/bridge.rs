@@ -105,9 +105,9 @@ pub struct AppConfig {
     pub model_dir: PathBuf,
     pub data_dir: PathBuf,
     pub server_url: String,
-    /// `text` (default here: Raon Zena only sends text) | `auto`.
+    /// `text` (default here: Raon Zena only sends text) | `auto` | `vision,audio`.
     pub modalities: String,
-    /// `q8_0` (default here: ~300 MB resident instead of ~660 MB F32, cos 0.9999 to the reference) | `auto` | `off`.
+    /// `q8_0` (default here: ~300 MB resident instead of ~660 MB F32, cos 0.9999 to the reference) | `tiered` | `auto` | `off`.
     pub quant: String,
     /// Stop the app after this long without commands (`None`: keep it).
     pub idle: Option<Duration>,

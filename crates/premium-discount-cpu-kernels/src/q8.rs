@@ -164,13 +164,148 @@ pub unsafe fn score_q8_0_prejudice_avx2(raw_q8: &[u8], h: &[f32], t: &[f32]) -> 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub unsafe fn dot_q8_0_f32_neon(raw_q8: &[u8], h: &[f32]) -> f32 {
-    dot_q8_0_f32_scalar(raw_q8, h)
+    use std::arch::aarch64::*;
+    let n_blocks = (h.len() / 32).min(raw_q8.len() / 34);
+    let mut total = vdupq_n_f32(0.0);
+    let rp = raw_q8.as_ptr();
+    let hp = h.as_ptr();
+
+    for b in 0..n_blocks {
+        let blk = rp.add(b * 34);
+        let d = f16::from_le_bytes([*blk, *blk.add(1)]).to_f32();
+        let dv = vdupq_n_f32(d);
+        let qs_lo = vld1q_s8(blk.add(2) as *const i8);
+        let qs_hi = vld1q_s8(blk.add(18) as *const i8);
+        let s16_0 = vmovl_s8(vget_low_s8(qs_lo));
+        let s16_1 = vmovl_s8(vget_high_s8(qs_lo));
+        let s16_2 = vmovl_s8(vget_low_s8(qs_hi));
+        let s16_3 = vmovl_s8(vget_high_s8(qs_hi));
+
+        let q0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_0)));
+        let q1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_0)));
+        let q2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_1)));
+        let q3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_1)));
+        let q4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_2)));
+        let q5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_2)));
+        let q6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_3)));
+        let q7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_3)));
+
+        let xb = hp.add(b * 32);
+        let mut bacc = vmulq_f32(q0, vld1q_f32(xb));
+        bacc = vfmaq_f32(bacc, q1, vld1q_f32(xb.add(4)));
+        bacc = vfmaq_f32(bacc, q2, vld1q_f32(xb.add(8)));
+        bacc = vfmaq_f32(bacc, q3, vld1q_f32(xb.add(12)));
+        bacc = vfmaq_f32(bacc, q4, vld1q_f32(xb.add(16)));
+        bacc = vfmaq_f32(bacc, q5, vld1q_f32(xb.add(20)));
+        bacc = vfmaq_f32(bacc, q6, vld1q_f32(xb.add(24)));
+        bacc = vfmaq_f32(bacc, q7, vld1q_f32(xb.add(28)));
+        total = vfmaq_f32(total, dv, bacc);
+    }
+    vaddvq_f32(total)
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub unsafe fn score_q8_0_prejudice_neon(raw_q8: &[u8], h: &[f32], t: &[f32]) -> f32 {
-    score_q8_0_prejudice_scalar(raw_q8, h, t)
+    use std::arch::aarch64::*;
+    let n_blocks = (h.len() / 32).min(t.len() / 32).min(raw_q8.len() / 34);
+    let mut wh_v = vdupq_n_f32(0.0);
+    let mut wt_v = vdupq_n_f32(0.0);
+    let mut ww_v = vdupq_n_f32(0.0);
+    let rp = raw_q8.as_ptr();
+    let hp = h.as_ptr();
+    let tp = t.as_ptr();
+
+    for b in 0..n_blocks {
+        let blk = rp.add(b * 34);
+        let d = f16::from_le_bytes([*blk, *blk.add(1)]).to_f32();
+        let dv = vdupq_n_f32(d);
+        let d2v = vdupq_n_f32(d * d);
+        let qs_lo = vld1q_s8(blk.add(2) as *const i8);
+        let qs_hi = vld1q_s8(blk.add(18) as *const i8);
+        let s16_0 = vmovl_s8(vget_low_s8(qs_lo));
+        let s16_1 = vmovl_s8(vget_high_s8(qs_lo));
+        let s16_2 = vmovl_s8(vget_low_s8(qs_hi));
+        let s16_3 = vmovl_s8(vget_high_s8(qs_hi));
+        let qs = [
+            vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_0))),
+            vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_0))),
+            vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_1))),
+            vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_1))),
+            vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_2))),
+            vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_2))),
+            vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16_3))),
+            vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16_3))),
+        ];
+        let xb = hp.add(b * 32);
+        let tb = tp.add(b * 32);
+        let mut wh_b = vdupq_n_f32(0.0);
+        let mut wt_b = vdupq_n_f32(0.0);
+        let mut ww_b = vdupq_n_f32(0.0);
+        for (i, &qv) in qs.iter().enumerate() {
+            let off = i * 4;
+            wh_b = vfmaq_f32(wh_b, qv, vld1q_f32(xb.add(off)));
+            wt_b = vfmaq_f32(wt_b, qv, vld1q_f32(tb.add(off)));
+            ww_b = vfmaq_f32(ww_b, qv, qv);
+        }
+        wh_v = vfmaq_f32(wh_v, dv, wh_b);
+        wt_v = vfmaq_f32(wt_v, dv, wt_b);
+        ww_v = vfmaq_f32(ww_v, d2v, ww_b);
+    }
+    let dot_wh = vaddvq_f32(wh_v);
+    let dot_wt = vaddvq_f32(wt_v);
+    let norm_w_sq = vaddvq_f32(ww_v);
+    dot_wh - prejudice_from_stats(dot_wt, norm_w_sq)
+}
+
+/// Precompute `1.0 / ||w||_2` for a raw Q8_0 row (returns `0.0` for zero/non-finite rows).
+#[inline]
+pub fn q8_0_inv_norm(raw_q8: &[u8]) -> f32 {
+    let n_blocks = raw_q8.len() / 34;
+    let mut norm_sq = 0.0f64;
+    for b in 0..n_blocks {
+        let blk = &raw_q8[b * 34..b * 34 + 34];
+        let d = f16::from_le_bytes([blk[0], blk[1]]).to_f32() as f64;
+        let mut qq = 0i64;
+        for &q in &blk[2..34] {
+            let qi = (q as i8) as i64;
+            qq += qi * qi;
+        }
+        norm_sq += d * d * (qq as f64);
+    }
+    if norm_sq > 1e-24 && norm_sq.is_finite() {
+        (1.0 / norm_sq.sqrt()) as f32
+    } else {
+        0.0
+    }
+}
+
+/// Bufferless unit-normalized cosine similarity `cos(w_q8, q_unit) = dot(w_q8, q_unit) * inv_norm`.
+/// Assumes `q_unit` is L2-normalized (`||q_unit||_2 == 1`) and `inv_norm == q8_0_inv_norm(raw_q8)`.
+/// Intended for linear bias/prejudice banks (`DomainBank` / `BiasedTieredBank`) without exponential LLM penalties.
+#[inline]
+pub fn cosine_q8_0_f32_scalar(raw_q8: &[u8], q_unit: &[f32], inv_norm: f32) -> f32 {
+    if !(inv_norm > 0.0) || !inv_norm.is_finite() {
+        return 0.0;
+    }
+    let dot = dot_q8_0_f32_scalar(raw_q8, q_unit);
+    if !dot.is_finite() {
+        return 0.0;
+    }
+    (dot * inv_norm).clamp(-1.0, 1.0)
+}
+
+/// SIMD-dispatched bufferless cosine similarity `cos(w_q8, q_unit)` using precomputed `inv_norm`.
+#[inline]
+pub fn cosine_q8_0_f32_simd(raw_q8: &[u8], q_unit: &[f32], inv_norm: f32) -> f32 {
+    if !(inv_norm > 0.0) || !inv_norm.is_finite() {
+        return 0.0;
+    }
+    let dot = dot_q8_0_f32_simd(raw_q8, q_unit);
+    if !dot.is_finite() {
+        return 0.0;
+    }
+    (dot * inv_norm).clamp(-1.0, 1.0)
 }
 
 /// Dispatch bufferless Q8_0 dot product to AVX2+FMA+F16C / NEON / scalar.
@@ -336,5 +471,31 @@ mod tests {
         // Truncated slice must safely clamp instead of panicking
         let trunc = &zero_raw[..17];
         assert_eq!(dot_q8_0_f32_simd(trunc, &h), 0.0);
+    }
+
+    #[test]
+    fn q8_cosine_simd_matches_f64_reference_without_prejudice_distortion() {
+        let cols = 512usize;
+        let (raw, w_f32) = make_q8_row(cols, 99, false);
+        let q_raw: Vec<f32> = (0..cols).map(|i| ((i % 19) as f32 - 9.0) * 0.11).collect();
+        let q_norm: f32 = q_raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let q_unit: Vec<f32> = q_raw.iter().map(|v| v / q_norm).collect();
+
+        let inv_norm = q8_0_inv_norm(&raw);
+        let got_simd = cosine_q8_0_f32_simd(&raw, &q_unit, inv_norm);
+        let got_scalar = cosine_q8_0_f32_scalar(&raw, &q_unit, inv_norm);
+        let w_norm: f64 = w_f32.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+        let ref_cos: f64 = w_f32
+            .iter()
+            .zip(&q_unit)
+            .map(|(&a, &b)| (a as f64) * (b as f64))
+            .sum::<f64>()
+            / w_norm;
+        assert!(((got_simd as f64) - ref_cos).abs() < 1e-5, "simd={got_simd} ref={ref_cos}");
+        assert!(((got_scalar as f64) - ref_cos).abs() < 1e-5, "scalar={got_scalar} ref={ref_cos}");
+
+        let (zero_raw, _) = make_q8_row(64, 1, true);
+        assert_eq!(q8_0_inv_norm(&zero_raw), 0.0);
+        assert_eq!(cosine_q8_0_f32_simd(&zero_raw, &q_unit[..64], 0.0), 0.0);
     }
 }

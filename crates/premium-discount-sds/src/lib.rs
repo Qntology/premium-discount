@@ -22,6 +22,7 @@ pub mod geometry;
 pub mod ledger;
 pub mod matrix;
 pub mod moments;
+pub mod perforate;
 pub mod scope;
 pub mod stats;
 pub mod temporal;

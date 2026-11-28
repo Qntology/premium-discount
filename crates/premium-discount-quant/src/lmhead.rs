@@ -151,6 +151,7 @@ impl MeanCenteredCsGuard {
 
 impl ColdGuard {
     /// Save the precomputed cluster guard to a compact binary cache (`.cold_guard.bin`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
         use std::io::Write;
         if let Some(parent) = path.parent() {
@@ -179,6 +180,7 @@ impl ColdGuard {
     }
 
     /// Load a cached cluster guard from `.cold_guard.bin`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path)?;
         if bytes.len() < 20 || &bytes[0..4] != b"LCCG" {
@@ -363,6 +365,123 @@ pub fn exact_argmax(
     (best_id, best, st)
 }
 
+/// Spherical Cauchy-Schwarz guard over **L2-normalized decoded unit vectors** `w_hat_i = w_i / ||w_i||_2`.
+///
+/// Unlike [`ColdGuard`] (which bounds unnormalized inner products `w_i . h`), cosine matching must
+/// cluster strictly on the unit sphere so per-row norm differences cannot invalidate the upper bound:
+///
+///   `cos(w_i, q_unit) = w_hat_i . q_unit <= c_m . q_unit + rho_m + eps_f32`
+///
+/// where `rho_m = (1 + 1e-4) * max_{i in C_m} ||w_hat_i - c_m||_2 + 1e-6`.
+#[derive(Debug, Clone)]
+pub struct UnitColdGuard {
+    pub dim: usize,
+    /// `[C, D]` spherical cluster centers.
+    pub centers: Vec<f32>,
+    /// `[C]` strict inflated radii on the unit sphere.
+    pub radius: Vec<f32>,
+    /// Cold row ids grouped by cluster.
+    pub members: Vec<u32>,
+    /// `[C + 1]` offsets into `members`.
+    pub offsets: Vec<u32>,
+}
+
+fn normalize_unit_rows(rows: &[f32], n: usize, dim: usize) -> Vec<f32> {
+    let mut unit = vec![0.0f32; n * dim];
+    for i in 0..n {
+        let src = &rows[i * dim..(i + 1) * dim];
+        let norm = src.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+        if norm > 1e-12 && norm.is_finite() {
+            let dst = &mut unit[i * dim..(i + 1) * dim];
+            for (d, &s) in dst.iter_mut().zip(src) {
+                *d = (s as f64 / norm) as f32;
+            }
+        }
+    }
+    unit
+}
+
+/// Build a [`UnitColdGuard`] strictly on L2-normalized unit rows (`rows`: `[ids.len(), dim]`).
+pub fn build_unit_cold_guard(rows: &[f32], ids: &[u32], dim: usize, clusters: usize, iters: usize) -> UnitColdGuard {
+    let n = ids.len();
+    assert_eq!(rows.len(), n * dim);
+    let unit_rows = normalize_unit_rows(rows, n, dim);
+    let base = build_cold_guard(&unit_rows, ids, dim, clusters, iters);
+    UnitColdGuard {
+        dim: base.dim,
+        centers: base.centers,
+        radius: base.radius,
+        members: base.members,
+        offsets: base.offsets,
+    }
+}
+
+impl UnitColdGuard {
+    /// Upper bound `U_m(q_unit) = c_m . q_unit + rho_m + eps` for cluster `j` against a unit query `q_unit`.
+    #[inline]
+    pub fn cluster_upper_bound(&self, j: usize, q_unit: &[f32]) -> f32 {
+        let c = &self.centers[j * self.dim..(j + 1) * self.dim];
+        let ch = dot(c, q_unit);
+        let r = self.radius[j];
+        ch + r + 1e-3 * (ch.abs() + r) + 1e-4
+    }
+
+    /// Biased cosine argmax with sector prior `beta_sector` and cold noise margin `delta_q4`:
+    ///
+    /// - Sets gate `S_gate = best_active + beta_sector`.
+    /// - Skips any cold cluster `m` where `U_m(q_unit) - delta_q4 <= S_gate`.
+    /// - Evaluates crossing clusters via `cold_cosine(id)` and lets a cold candidate win iff
+    ///   `s_cold - delta_q4 > S_gate` (and exceeds previous best cold candidate).
+    pub fn biased_cosine_argmax(
+        &self,
+        active_cosines: &[f32],
+        active_ids: &[u32],
+        q_unit: &[f32],
+        beta_sector: f32,
+        delta_q4: f32,
+        cold_cosine: impl Fn(u32) -> f32,
+    ) -> (u32, f32, bool, ArgmaxStats) {
+        let (mut best_id, mut best_active) = (u32::MAX, f32::NEG_INFINITY);
+        for (&s, &id) in active_cosines.iter().zip(active_ids) {
+            if s > best_active || (s == best_active && id < best_id) {
+                best_active = s;
+                best_id = id;
+            }
+        }
+        let s_gate = best_active + beta_sector;
+        let c = self.radius.len();
+        let mut bounds: Vec<(f32, usize)> = (0..c)
+            .map(|j| (self.cluster_upper_bound(j, q_unit), j))
+            .collect();
+        bounds.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut st = ArgmaxStats {
+            clusters: c,
+            ..Default::default()
+        };
+        let mut best_score = best_active;
+        let mut rescued = false;
+        let mut threshold = s_gate;
+        for (ub, j) in bounds {
+            if ub - delta_q4 <= threshold {
+                break;
+            }
+            st.clusters_refined += 1;
+            for &id in &self.members[self.offsets[j] as usize..self.offsets[j + 1] as usize] {
+                st.rows_refined += 1;
+                let sc = cold_cosine(id);
+                let eff = sc - delta_q4;
+                if eff > threshold || (eff == threshold && rescued && id < best_id) {
+                    threshold = eff;
+                    best_score = sc;
+                    best_id = id;
+                    rescued = true;
+                }
+            }
+        }
+        (best_id, best_score, rescued, st)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +581,59 @@ mod tests {
         }
         assert!(rescues < 100, "guard should prune hot-winning trials (rescues={rescues})");
         assert!(rescues >= 25, "cold-winning trials must rescue (rescues={rescues})");
+    }
+
+    #[test]
+    fn unit_cold_guard_preserves_cosine_bound_under_varying_row_norms() {
+        let (v, d) = (600usize, 64usize);
+        let mut s = 777u64;
+        // Intentionally give rows wildly different L2 norms (0.05..20.0) so unnormalized ColdGuard would fail cosine!
+        let mut table = vec![0.0f32; v * d];
+        for i in 0..v {
+            let scale = if i % 2 == 0 { 0.05 } else { 20.0 };
+            for j in 0..d {
+                table[i * d + j] = rng(&mut s) * scale;
+            }
+        }
+        let unit = normalize_unit_rows(&table, v, d);
+        let active: Vec<u32> = (0..120u32).collect();
+        let cold: Vec<u32> = (120..v as u32).collect();
+        let cold_raw: Vec<f32> = cold
+            .iter()
+            .flat_map(|&i| table[i as usize * d..(i as usize + 1) * d].to_vec())
+            .collect();
+        let uguard = build_unit_cold_guard(&cold_raw, &cold, d, 32, 4);
+
+        let mut pruned_trials = 0usize;
+        for trial in 0..100 {
+            let mut q: Vec<f32> = (0..d).map(|_| rng(&mut s)).collect();
+            let target = if trial % 3 == 0 {
+                cold[trial % cold.len()] as usize
+            } else {
+                active[trial % active.len()] as usize
+            };
+            for j in 0..d {
+                q[j] = unit[target * d + j] * 3.0 + 0.05 * q[j];
+            }
+            let qn = q.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt() as f32;
+            for x in &mut q {
+                *x /= qn;
+            }
+            let cos_fn = |id: u32| dot(&unit[id as usize * d..(id as usize + 1) * d], &q);
+            let act_scores: Vec<f32> = active.iter().map(|&i| cos_fn(i)).collect();
+
+            // With beta = 0, delta_q4 = 0, unit guard must be 100% exact full cosine argmax
+            let (id, sc, _rescued, st) = uguard.biased_cosine_argmax(&act_scores, &active, &q, 0.0, 0.0, cos_fn);
+            let (full_id, full_sc) = (0..v as u32)
+                .map(|i| (i, cos_fn(i)))
+                .fold((u32::MAX, f32::NEG_INFINITY), |a, b| {
+                    if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) { b } else { a }
+                });
+            assert_eq!(id, full_id, "trial {trial} got=({id},{sc}) full=({full_id},{full_sc})");
+            if st.rows_refined < cold.len() {
+                pruned_trials += 1;
+            }
+        }
+        assert!(pruned_trials > 50, "expected spherical pruning (pruned_trials={pruned_trials})");
     }
 }

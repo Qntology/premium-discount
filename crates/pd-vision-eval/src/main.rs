@@ -605,6 +605,7 @@ fn main() -> Result<()> {
         total_bundles = rows.len();
 
         let mut lang_scores: BTreeMap<String, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+        let mut observed_violations = ZeroToleranceViolations::default();
         let mut core_post = 0usize;
         let mut core_proc = 0usize;
         let mut core_adv = 0usize;
@@ -614,6 +615,10 @@ fn main() -> Result<()> {
 
         for row in &rows {
             let mut bundle_ok = true;
+            let mut asset_pass_count = 0usize;
+            let mut cer_quality_sum = 0.0f64;
+            let mut audio_tiou_sum = 0.0f64;
+            let mut audio_tiou_cnt = 0usize;
             for asset in &row.e2e_assets {
                 let apath = plan_dir.join(&asset.rel_path);
                 ensure!(
@@ -628,19 +633,40 @@ fn main() -> Result<()> {
                     "asset byte/sha256 mismatch for {}",
                     asset.asset_id
                 );
+                if let Ok(text_utf8) = std::str::from_utf8(&bytes) {
+                    if contains_forbidden_raw_gov_id_digits(text_utf8) {
+                        observed_violations.privacy_pixel_kiosk_or_gov_id_leak += 1;
+                        bundle_ok = false;
+                    }
+                }
+                let mut asset_ok = true;
                 if asset.kind == "wav_16k" {
                     let (tiou, false_cnt) =
                         decode_wav_16k_and_eval_audio(&bytes, &asset.expected_audio_spans)?;
                     audio_tious.push(tiou);
+                    audio_tiou_sum += tiou;
+                    audio_tiou_cnt += 1;
                     ballad_false_triggers += false_cnt;
                     if tiou < 0.70 || false_cnt > 0 {
+                        observed_violations.interlock_out_of_order_or_stage_fire += false_cnt as u32;
+                        asset_ok = false;
                         bundle_ok = false;
                     }
                 }
-                if asset.expected_cer_max.unwrap_or(0.005) > 0.02 {
+                let cer_max = asset.expected_cer_max.unwrap_or(0.005) as f64;
+                if cer_max > 0.02 {
+                    observed_violations.outbound_term_fact_or_c2o_leak += 1;
+                    asset_ok = false;
                     bundle_ok = false;
                 }
+                cer_quality_sum += (1.0 - cer_max).clamp(0.0, 1.0);
+                if asset_ok {
+                    asset_pass_count += 1;
+                }
                 verified_assets += 1;
+            }
+            if !bundle_ok && row.expected_form_overridden {
+                observed_violations.false_auto_finalize_adverse_or_proc += 1;
             }
             ensure!(bundle_ok, "bundle {} failed audio/asset verification", row.bundle_id);
 
@@ -655,9 +681,17 @@ fn main() -> Result<()> {
                 odd_adversarial_passed += 1;
             }
 
+            // E-09: Derive real per-bundle quality scores from verified assets, CER margin, and audio tIoU
+            let n_assets = row.e2e_assets.len().max(1) as f64;
+            let pure_v = (asset_pass_count as f64 / n_assets).clamp(0.0, 1.0);
+            let mean_cer_q = cer_quality_sum / n_assets;
+            let mean_audio_q = if audio_tiou_cnt > 0 {
+                audio_tiou_sum / audio_tiou_cnt as f64
+            } else {
+                1.0
+            };
+            let e2e_v = (pure_v * mean_cer_q * (0.5 + 0.5 * mean_audio_q)).clamp(0.0, 1.0);
             let entry = lang_scores.entry(row.doc_lang.clone()).or_default();
-            let pure_v = if bundle_ok { 0.96 } else { 0.0 };
-            let e2e_v = if bundle_ok { 0.955 } else { 0.0 };
             entry.0.push(pure_v);
             entry.1.push(e2e_v);
 
@@ -772,7 +806,7 @@ fn main() -> Result<()> {
                 odd_adversarial_passed,
                 slice_r10_pure_vs_e2e: slice_r10,
                 mean_audio_tiou,
-                violations: ZeroToleranceViolations::default(),
+                violations: observed_violations.clone(),
             };
             let seal_exit = evaluate_final_release_seal(&seal_inp, boot_seed);
             if seal_exit != GateExit::Pass {
