@@ -546,6 +546,190 @@ pub fn stream_attention_f32(
     stream_attention_f32_masked(q, k, v, seq_q, seq_kv, cfg, None, out);
 }
 
+/// 64-Key panel streaming attention restricted to a per-query bidirectional sliding window
+/// `| (past_offset + qi) - ki | <= window_radius` (and `ki <= past_offset + qi` if `cfg.causal`).
+/// Eliminates `[B, H, seq_q, seq_kv]` score matrix allocation on long sliding-window layers
+/// (e.g. EmbeddingGemma bidirectional sliding layers with `window_radius = 257`).
+pub fn stream_attention_f32_windowed(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_q: usize,
+    seq_kv: usize,
+    cfg: &CpuStreamAttnCfg,
+    window_radius: usize,
+    key_mask: Option<&[f32]>,
+    out: &mut [f32],
+) {
+    // When the entire sequence fits inside the window, delegate directly to the fast full-panel path.
+    if !cfg.causal && seq_q.saturating_add(cfg.past_offset) <= window_radius.saturating_add(1) && seq_kv <= window_radius.saturating_add(1) {
+        stream_attention_f32_masked(q, k, v, seq_q, seq_kv, cfg, key_mask, out);
+        return;
+    }
+    let hq = cfg.num_heads;
+    let hkv = cfg.num_kv_heads;
+    let d = cfg.head_dim;
+    assert!(hkv > 0 && hq % hkv == 0 && d > 0);
+    assert_eq!(q.len(), seq_q * hq * d);
+    assert_eq!(k.len(), seq_kv * hkv * d);
+    assert_eq!(v.len(), seq_kv * hkv * d);
+    assert_eq!(out.len(), seq_q * hq * d);
+    if let Some(m) = key_mask {
+        assert_eq!(m.len(), seq_kv);
+    }
+    if seq_q == 0 || seq_kv == 0 {
+        out.fill(0.0);
+        return;
+    }
+
+    let group = hq / hkv;
+    let q_stride = hq * d;
+    let kv_stride = hkv * d;
+    let avx2 = use_avx2_fma();
+    let n_panels = seq_kv.div_ceil(KP);
+    let kt_head_elems = n_panels * d * KP;
+    let mut kt_all = vec![0.0f32; hkv * kt_head_elems];
+    let mut v_all = vec![0.0f32; hkv * seq_kv * d];
+
+    for kvh in 0..hkv {
+        let kt_h = &mut kt_all[kvh * kt_head_elems..(kvh + 1) * kt_head_elems];
+        let v_h = &mut v_all[kvh * seq_kv * d..(kvh + 1) * seq_kv * d];
+        for p in 0..n_panels {
+            let j0 = p * KP;
+            let valid = KP.min(seq_kv - j0);
+            let kt_p = &mut kt_h[p * d * KP..(p + 1) * d * KP];
+            for j in 0..valid {
+                let k_src = &k[(j0 + j) * kv_stride + kvh * d..(j0 + j) * kv_stride + (kvh + 1) * d];
+                let v_src = &v[(j0 + j) * kv_stride + kvh * d..(j0 + j) * kv_stride + (kvh + 1) * d];
+                v_h[(j0 + j) * d..(j0 + j + 1) * d].copy_from_slice(v_src);
+                for e in 0..d {
+                    kt_p[e * KP + j] = k_src[e];
+                }
+            }
+        }
+    }
+
+    let q_blocks = seq_q.div_ceil(QB);
+    let total_tasks = hq * q_blocks;
+    let out_ptr = SendPtr(out.as_mut_ptr());
+
+    let run_task = |task_idx: usize| {
+        let out_ptr = &out_ptr;
+        let head = task_idx / q_blocks;
+        let qb = task_idx % q_blocks;
+        let kvh = head / group;
+        let q0 = qb * QB;
+        let q1 = (q0 + QB).min(seq_q);
+
+        let kt_h = &kt_all[kvh * kt_head_elems..(kvh + 1) * kt_head_elems];
+        let v_h = &v_all[kvh * seq_kv * d..(kvh + 1) * seq_kv * d];
+
+        SCRATCH.with(|cell| {
+            let mut sc = cell.borrow_mut();
+            if sc.scores.len() < KP {
+                sc.scores.resize(KP, 0.0);
+            }
+            if sc.weights.len() < KP {
+                sc.weights.resize(KP, 0.0);
+            }
+            if sc.acc.len() < d {
+                sc.acc.resize(d, 0.0);
+            }
+            let TlsScratch { scores, weights, acc } = &mut *sc;
+
+            for qi in q0..q1 {
+                let q_pos = cfg.past_offset + qi;
+                let k_lo = q_pos.saturating_sub(window_radius);
+                let k_hi = if cfg.causal {
+                    (q_pos + 1).min(seq_kv)
+                } else {
+                    q_pos.saturating_add(window_radius).saturating_add(1).min(seq_kv)
+                };
+                if k_lo >= k_hi {
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(out_ptr.0.add(qi * q_stride + head * d), d)
+                    };
+                    dst.fill(0.0);
+                    continue;
+                }
+                let q_row = &q[qi * q_stride + head * d..qi * q_stride + (head + 1) * d];
+                acc[..d].fill(0.0);
+                let mut m_curr = f32::NEG_INFINITY;
+                let mut l_curr = 0.0f32;
+
+                let first_panel = k_lo / KP;
+                let last_panel = (k_hi - 1) / KP;
+                for p in first_panel..=last_panel {
+                    let j0 = p * KP;
+                    let valid = KP.min(seq_kv - j0);
+                    let kt_p = &kt_h[p * d * KP..(p + 1) * d * KP];
+
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            score_panel_avx2(q_row.as_ptr(), kt_p.as_ptr(), d, cfg.scale, scores.as_mut_ptr());
+                        }
+                    } else {
+                        score_panel_scalar(q_row, kt_p, d, valid, cfg.scale, scores);
+                    }
+
+                    let mut p_max = f32::NEG_INFINITY;
+                    for j in 0..valid {
+                        let ki = j0 + j;
+                        if ki < k_lo || ki >= k_hi {
+                            scores[j] = f32::NEG_INFINITY;
+                        } else {
+                            let s = scores[j] + key_mask.map_or(0.0, |m| m[ki]);
+                            scores[j] = s;
+                            if s > p_max {
+                                p_max = s;
+                            }
+                        }
+                    }
+                    if !p_max.is_finite() {
+                        continue;
+                    }
+
+                    let m_new = m_curr.max(p_max);
+                    let corr = if m_curr.is_finite() { (m_curr - m_new).exp() } else { 0.0 };
+                    let mut p_sum = 0.0f32;
+                    for j in 0..valid {
+                        let w = if scores[j].is_finite() { (scores[j] - m_new).exp() } else { 0.0 };
+                        weights[j] = w;
+                        p_sum += w;
+                    }
+
+                    let v_p = &v_h[j0 * d..];
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            accumulate_avx2(acc.as_mut_ptr(), corr, weights.as_ptr(), v_p.as_ptr(), d, valid, d);
+                        }
+                    } else {
+                        accumulate_scalar(acc, corr, weights, v_p, d, valid, d);
+                    }
+                    l_curr = l_curr * corr + p_sum;
+                    m_curr = m_new;
+                }
+
+                let inv_l = if l_curr > 0.0 { 1.0 / l_curr } else { 0.0 };
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(out_ptr.0.add(qi * q_stride + head * d), d)
+                };
+                for e in 0..d {
+                    dst[e] = acc[e] * inv_l;
+                }
+            }
+        });
+    };
+
+    if total_tasks <= 1 || seq_q * seq_kv * hq * d < 65_536 {
+        (0..total_tasks).for_each(run_task);
+    } else {
+        (0..total_tasks).into_par_iter().for_each(run_task);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +922,57 @@ mod tests {
         let want2 = reference_attn(&q2, &k2, &v2, 1, 141, &cfg_qwen, Some(&mask));
         let err2 = out2.iter().zip(want2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(err2 < 1e-5, "seq_q=1 GQA masked decode max_err {err2}");
+    }
+
+    #[test]
+    fn sliding_window_streaming_matches_exact_reference() {
+        let seq = 180;
+        let radius = 33;
+        let cfg = CpuStreamAttnCfg {
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 64,
+            scale: 1.0 / 8.0,
+            causal: false,
+            past_offset: 0,
+        };
+        let q = det(seq * 4 * 64, 71);
+        let k = det(seq * 2 * 64, 72);
+        let v = det(seq * 2 * 64, 73);
+        let mut got = vec![0.0f32; q.len()];
+        stream_attention_f32_windowed(&q, &k, &v, seq, seq, &cfg, radius, None, &mut got);
+
+        // Exact f64 sliding window reference
+        let group = 2;
+        let mut want = vec![0.0f32; q.len()];
+        for h in 0..4 {
+            let kvh = h / group;
+            for qi in 0..seq {
+                let lo = qi.saturating_sub(radius);
+                let hi = (qi + radius + 1).min(seq);
+                let mut scores = Vec::with_capacity(hi - lo);
+                let mut mx = f64::NEG_INFINITY;
+                for ki in lo..hi {
+                    let mut dot = 0.0f64;
+                    for e in 0..64 {
+                        dot += (q[(qi * 4 + h) * 64 + e] as f64) * (k[(ki * 2 + kvh) * 64 + e] as f64);
+                    }
+                    let s = dot * cfg.scale as f64;
+                    scores.push(s);
+                    mx = mx.max(s);
+                }
+                let exps: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
+                let denom: f64 = exps.iter().sum();
+                for e in 0..64 {
+                    let mut acc = 0.0f64;
+                    for (idx, ki) in (lo..hi).enumerate() {
+                        acc += exps[idx] * (v[(ki * 2 + kvh) * 64 + e] as f64);
+                    }
+                    want[(qi * 4 + h) * 64 + e] = (acc / denom) as f32;
+                }
+            }
+        }
+        let max_err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_err < 1e-5, "sliding window max_err={max_err}");
     }
 }

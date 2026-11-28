@@ -1543,9 +1543,29 @@ impl QuarantineLedger {
         }
     }
 
+    /// Convenience constructor overriding the total entry cap while keeping `per_cc_cap` proportional.
+    pub fn with_capacity(total_cap: usize) -> QuarantineLedger {
+        let cap = total_cap.max(1);
+        QuarantineLedger::with_caps(cap.min(QuarantineLedger::PER_CC_CAP.max(cap)), cap)
+    }
+
     /// 저장해 둔 항목들에서 (규칙에 안 맞는 항목은 버린다)
     pub fn from_entries(entries: Vec<QuarantineEntry>) -> QuarantineLedger {
-        let mut l = QuarantineLedger::default();
+        QuarantineLedger::from_entries_with_caps(
+            entries,
+            QuarantineLedger::PER_CC_CAP,
+            QuarantineLedger::TOTAL_CAP,
+        )
+    }
+
+    /// Reload saved entries using explicit `(per_cc_cap, total_cap)` bounds so callers storing
+    /// more than the default 1,024 entries do not suffer silent truncation.
+    pub fn from_entries_with_caps(
+        entries: Vec<QuarantineEntry>,
+        per_cc_cap: usize,
+        total_cap: usize,
+    ) -> QuarantineLedger {
+        let mut l = QuarantineLedger::with_caps(per_cc_cap, total_cap);
         for e in entries {
             l.record(e);
         }
@@ -1671,6 +1691,88 @@ impl QuarantineLedger {
             None => false,
         }
     }
+}
+
+/// Identifies paragraph indices that MUST be pinned open in Pass 1 during long-document
+/// perforated embedding so `condition_disjoint` and `PolarityFlip` clauses have 0% omission:
+/// 1. Paragraphs containing negations (`-nms::analyze::negation_counts` or `predicate_polarity`),
+/// 2. Paragraphs containing condition qualifiers (`condition_qualifiers`), numeric/unit values (`claim`), or identifiers,
+/// 3. Header / title / table-header paragraphs.
+pub fn pinned_paragraph_indices(paragraphs: &[&str], parsed_sentences: &[Vec<Sentence>]) -> Vec<usize> {
+    let mut pinned = BTreeSet::new();
+    for (idx, &para) in paragraphs.iter().enumerate() {
+        let trimmed = para.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // 1) Heading / title / table-header rule
+        let is_heading = trimmed.starts_with('#')
+            || trimmed.starts_with('|')
+            || trimmed.contains("단위:")
+            || trimmed.contains("Unit:")
+            || (idx == 0 && trimmed.chars().count() <= 120);
+        if is_heading {
+            pinned.insert(idx);
+            continue;
+        }
+        // 2) -nms negation detection on raw paragraph text
+        let mut norm = premium_discount_nms::normalize::normalize(trimmed);
+        premium_discount_nms::analyze::Analyzer::analyze(
+            &premium_discount_nms::analyze::RuleAnalyzer,
+            &mut norm,
+        );
+        let negs = premium_discount_nms::analyze::negation_counts(&norm.words);
+        if negs.iter().any(|&c| c > 0) {
+            pinned.insert(idx);
+            continue;
+        }
+        // 3) -relay condition qualifiers, polarity, numeric/unit claims, identifiers
+        let mut hit = false;
+        if let Some(sents) = parsed_sentences.get(idx) {
+            for s in sents {
+                let c = claim(s);
+                if c.negated || !c.qualifiers.is_empty() || !c.values.is_empty() {
+                    hit = true;
+                    break;
+                }
+                if s.tokens.iter().any(|t| is_identifier(t.text.trim())) {
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if !hit {
+            // Raw-token fallback for unparsed paragraphs (lightweight whitespace split -> Sentence)
+            let tokens: Vec<Token> = trimmed
+                .split_whitespace()
+                .map(|w| Token {
+                    text: w.to_string(),
+                    lemma: w.to_lowercase(),
+                    upos: if w.chars().any(|c| c.is_ascii_digit()) { "NUM" } else { "NOUN" }.to_string(),
+                    deprel: "dep".to_string(),
+                    head: 0,
+                })
+                .collect();
+            let synth = Sentence { text: trimmed.to_string(), tokens };
+            let c = claim(&synth);
+            if c.negated
+                || !c.qualifiers.is_empty()
+                || !c.values.is_empty()
+                || synth.tokens.iter().any(|t| is_identifier(t.text.trim()))
+            {
+                hit = true;
+            }
+        }
+        if hit {
+            pinned.insert(idx);
+        }
+    }
+    pinned.into_iter().collect()
+}
+
+/// Convenience wrapper when caller has only raw paragraph texts without pre-parsed UD sentences.
+pub fn pinned_paragraph_indices_text(paragraphs: &[&str]) -> Vec<usize> {
+    pinned_paragraph_indices(paragraphs, &[])
 }
 
 #[cfg(test)]
@@ -2272,5 +2374,48 @@ mod tests {
         let (s_unrelated, empty) = meta_transition_score(&cp_keys, &shop_keys, &emb.embed("말레니아"), &emb.embed("Steam"), &cl, 1.0);
         assert_eq!(s_unrelated, 0.0);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn quarantine_ledger_with_caps_round_trips_above_default_1024() {
+        let mut raw_entries = Vec::with_capacity(1_200);
+        for i in 0..1_200usize {
+            raw_entries.push(QuarantineEntry {
+                cc: format!("scope-{}", i % 10),
+                old_id: format!("old-{i}"),
+                new_id: format!("new-{i}"),
+                old_to: None,
+                new_to: None,
+                old_at_ms: 1_000,
+                new_at_ms: 2_000 + i as i64,
+                value_diff: None,
+                recorded_at_ms: 3_000 + i as i64,
+                sync_state: QuarantineSyncState::LocalOnlyCrossScope,
+            });
+        }
+        let default_l = QuarantineLedger::from_entries(raw_entries.clone());
+        assert_eq!(default_l.len(), QuarantineLedger::TOTAL_CAP);
+
+        let large_l = QuarantineLedger::from_entries_with_caps(raw_entries, 256, 2_048);
+        assert_eq!(large_l.len(), 1_200);
+        assert!(large_l.is_quarantined("scope-0", "old-0", |_| Standing::default()));
+        assert!(large_l.is_quarantined("scope-9", "old-1199", |_| Standing::default()));
+    }
+
+    #[test]
+    fn pinned_paragraph_indices_preserves_headers_negations_and_conditions() {
+        let paras = [
+            "# Section 1 Overview",
+            "일반적인 배경 서술 문단으로 특별한 조건이나 수치가 없습니다.",
+            "1페이즈 피해 감소율은 20%로 적용됩니다.",
+            "회피 불가 패턴으로 변경되었습니다.",
+            "또 다른 일반 서술 문단입니다.",
+        ];
+        let pins = pinned_paragraph_indices_text(&paras);
+        assert!(pins.contains(&0), "header must be pinned: {pins:?}");
+        assert!(pins.contains(&2), "condition + numeric paragraph must be pinned: {pins:?}");
+        assert!(pins.contains(&3), "polarity/negation paragraph must be pinned: {pins:?}");
+        assert!(!pins.contains(&1), "plain prose need not be pinned: {pins:?}");
+        assert!(!pins.contains(&4), "plain prose need not be pinned: {pins:?}");
     }
 }

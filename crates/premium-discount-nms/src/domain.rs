@@ -303,6 +303,332 @@ impl<M: Clone, E: TextEmbedder> DomainBank<M, E> {
     }
 }
 
+/// Configuration for [`BiasedTieredBank`] sector-biased cosine matching with unit-sphere cold pruning.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TieredBankConfig {
+    /// Prior bonus added to active-sector top-1 score (`S_gate = s_q8_best + beta_sector`).
+    pub beta_sector: f32,
+    /// Conservative noise margin subtracted from cold-tier (`Q4_K`) scores (`s_q4 - delta_q4 > S_gate`).
+    pub delta_q4: f32,
+    /// Minimum absolute score floor required for an accepted verdict.
+    pub abs_floor: f32,
+    /// Minimum top-1 minus top-2 separation margin for high-confidence acceptance.
+    pub margin_high: f32,
+    /// Number of unit-sphere clusters for cold-tier pruning (default `64`).
+    pub cold_clusters: usize,
+    /// Prejudice penalty weight `w_prej` in `max(bias - w_prej * prej, 0)`.
+    pub prejudice_weight: f32,
+}
+
+impl Default for TieredBankConfig {
+    fn default() -> Self {
+        Self {
+            beta_sector: 0.035,
+            delta_q4: 0.012,
+            abs_floor: 0.50,
+            margin_high: 0.08,
+            cold_clusters: 64,
+            prejudice_weight: 0.50,
+        }
+    }
+}
+
+/// One entry in a sector-tiered cosine bank (generic, domain-literal-free, `wasm32`-clean).
+#[derive(Debug, Clone)]
+pub struct TieredEntry<M> {
+    pub key: String,
+    pub sector: u32,
+    /// Priority-pinned entries (e.g. safety / privacy) are always scored in the active high-precision tier
+    /// and are exempt from any sector penalty.
+    pub priority_pinned: bool,
+    pub payload: M,
+    /// L2-normalized bias prototype vectors with weights.
+    pub bias_unit: Vec<(Vec<f32>, f32)>,
+    /// L2-normalized prejudice prototype vectors.
+    pub prej_unit: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Clone)]
+struct ColdCluster {
+    center: Vec<f32>,
+    radius: f32,
+    /// Indices into `BiasedTieredBank::entries` belonging to this cluster.
+    entry_indices: Vec<usize>,
+    /// Maximum phrase weight across bias vectors in this cluster.
+    max_weight: f32,
+}
+
+/// Output of [`BiasedTieredBank::match_unit`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TieredMatchOutcome {
+    pub best_index: Option<usize>,
+    pub best_score: f32,
+    pub second_score: f32,
+    pub accepted: bool,
+    pub rescued_from_cold: bool,
+    pub clusters_checked: usize,
+    pub clusters_opened: usize,
+    pub cold_entries_scored: usize,
+    /// Variance-isolated z-scores (`(entry_index, z_score)`), normalized strictly on active-tier statistics.
+    pub neutral_z: Vec<(usize, f32)>,
+}
+
+fn l2_normalize(v: &[f32]) -> Vec<f32> {
+    let n = v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+    if n > 1e-12 && n.is_finite() {
+        v.iter().map(|&x| (x as f64 / n) as f32).collect()
+    } else {
+        vec![0.0; v.len()]
+    }
+}
+
+#[inline]
+fn dot_unit(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(&x, &y)| x * y).sum()
+}
+
+/// Sector-biased 2-tier cosine matching bank (`wasm32`-clean):
+/// 1. Scores active-sector entries + `priority_pinned` entries first at full precision.
+/// 2. Prunes inactive-sector clusters via spherical Cauchy-Schwarz bound `c_m . q + rho_m - delta_q4 <= S_gate`.
+/// 3. Selectively rescues crossing cold clusters and projects rescued scores onto active-tier `(mu, sd)`.
+pub struct BiasedTieredBank<M> {
+    dim: usize,
+    entries: Vec<TieredEntry<M>>,
+    cfg: TieredBankConfig,
+}
+
+impl<M: Clone> BiasedTieredBank<M> {
+    pub fn new(dim: usize, entries: Vec<TieredEntry<M>>, cfg: TieredBankConfig) -> Self {
+        let normalized = entries
+            .into_iter()
+            .map(|mut e| {
+                e.bias_unit = e
+                    .bias_unit
+                    .into_iter()
+                    .map(|(v, w)| (l2_normalize(&v), w))
+                    .collect();
+                e.prej_unit = e.prej_unit.into_iter().map(|v| l2_normalize(&v)).collect();
+                e
+            })
+            .collect();
+        Self { dim, entries: normalized, cfg }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn entry(&self, idx: usize) -> &TieredEntry<M> {
+        &self.entries[idx]
+    }
+
+    fn score_entry(&self, idx: usize, q_unit: &[f32]) -> f32 {
+        let e = &self.entries[idx];
+        let bias = e
+            .bias_unit
+            .iter()
+            .map(|(b, w)| dot_unit(q_unit, b) * w)
+            .fold(0.0f32, f32::max);
+        let prej = e
+            .prej_unit
+            .iter()
+            .map(|p| dot_unit(q_unit, p))
+            .fold(0.0f32, f32::max);
+        (bias - self.cfg.prejudice_weight * prej).max(0.0)
+    }
+
+    /// Build deterministic unit-sphere clusters over all inactive-sector entries (excluding `priority_pinned`).
+    fn build_cold_clusters(&self, active_sector: u32) -> Vec<ColdCluster> {
+        // Collect (entry_idx, unit_vec, weight) for every bias vector of every cold entry.
+        let mut pts: Vec<(usize, &[f32], f32)> = Vec::new();
+        for (idx, e) in self.entries.iter().enumerate() {
+            if e.priority_pinned || e.sector == active_sector {
+                continue;
+            }
+            for (v, w) in &e.bias_unit {
+                if v.len() == self.dim {
+                    pts.push((idx, v.as_slice(), *w));
+                }
+            }
+        }
+        if pts.is_empty() {
+            return Vec::new();
+        }
+        let k = self.cfg.cold_clusters.clamp(1, pts.len());
+        let mut centers: Vec<Vec<f32>> = (0..k)
+            .map(|c| pts[c * pts.len() / k].1.to_vec())
+            .collect();
+        let mut assign = vec![0usize; pts.len()];
+        for it in 0..=4 {
+            for (pi, &(_, v, _)) in pts.iter().enumerate() {
+                let mut best = (f32::NEG_INFINITY, 0usize);
+                for (ci, cv) in centers.iter().enumerate() {
+                    let sim = dot_unit(v, cv);
+                    if sim > best.0 {
+                        best = (sim, ci);
+                    }
+                }
+                assign[pi] = best.1;
+            }
+            if it == 4 {
+                break;
+            }
+            let mut sums = vec![vec![0.0f64; self.dim]; k];
+            let mut cnts = vec![0usize; k];
+            for (pi, &ci) in assign.iter().enumerate() {
+                cnts[ci] += 1;
+                for (s, &v) in sums[ci].iter_mut().zip(pts[pi].1) {
+                    *s += v as f64;
+                }
+            }
+            for ci in 0..k {
+                if cnts[ci] > 0 {
+                    let mean: Vec<f32> = sums[ci].iter().map(|&s| (s / cnts[ci] as f64) as f32).collect();
+                    centers[ci] = mean;
+                }
+            }
+        }
+        let mut radii = vec![0.0f32; k];
+        let mut max_w = vec![0.0f32; k];
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); k];
+        for (pi, &ci) in assign.iter().enumerate() {
+            let (entry_idx, v, w) = pts[pi];
+            let dist = v
+                .iter()
+                .zip(&centers[ci])
+                .map(|(&a, &b)| ((a as f64) - (b as f64)).powi(2))
+                .sum::<f64>()
+                .sqrt() as f32;
+            radii[ci] = radii[ci].max(dist);
+            max_w[ci] = max_w[ci].max(w);
+            if !buckets[ci].contains(&entry_idx) {
+                buckets[ci].push(entry_idx);
+            }
+        }
+        buckets
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ci, entry_indices)| {
+                if entry_indices.is_empty() {
+                    None
+                } else {
+                    Some(ColdCluster {
+                        center: centers[ci].clone(),
+                        radius: radii[ci] * (1.0 + 1e-4) + 1e-6,
+                        entry_indices,
+                        max_weight: max_w[ci],
+                    })
+                }
+            })
+            .collect()
+    }
+
+    /// Match a query vector against the active sector (+ priority-pinned entries) first,
+    /// then prune or rescue inactive-sector clusters with `(beta_sector, delta_q4)`.
+    pub fn match_query(&self, query: &[f32], active_sector: u32) -> TieredMatchOutcome {
+        let q_unit = l2_normalize(query);
+        // Step 1: Active sector + priority-pinned high-precision scoring
+        let mut active_scores: Vec<(usize, f32)> = Vec::new();
+        for (idx, e) in self.entries.iter().enumerate() {
+            if e.priority_pinned || e.sector == active_sector {
+                active_scores.push((idx, self.score_entry(idx, &q_unit)));
+            }
+        }
+        let mut best_idx: Option<usize> = None;
+        let mut best_score = 0.0f32;
+        let mut second_score = 0.0f32;
+        for &(idx, s) in &active_scores {
+            if best_idx.is_none() || s > best_score {
+                if best_idx.is_some() {
+                    second_score = best_score;
+                }
+                best_score = s;
+                best_idx = Some(idx);
+            } else if s > second_score {
+                second_score = s;
+            }
+        }
+
+        // Variance-isolated active statistics (mu_act, sd_act) computed strictly on active tier.
+        let (mu_act, sd_act) = if active_scores.len() >= 2 {
+            let nf = active_scores.len() as f64;
+            let mean = active_scores.iter().map(|(_, s)| *s as f64).sum::<f64>() / nf;
+            let var = active_scores
+                .iter()
+                .map(|(_, s)| (*s as f64 - mean).powi(2))
+                .sum::<f64>()
+                / nf;
+            (mean, var.sqrt().max(1e-6))
+        } else {
+            (0.0, 1.0)
+        };
+
+        let s_gate = best_score + self.cfg.beta_sector;
+
+        // Step 2: Spherical Cauchy-Schwarz cluster guard over cold entries
+        let clusters = self.build_cold_clusters(active_sector);
+        let clusters_checked = clusters.len();
+        let mut clusters_opened = 0usize;
+        let mut cold_entries_scored = 0usize;
+        let mut rescued_from_cold = false;
+        let mut rescued_scores: Vec<(usize, f32)> = Vec::new();
+        let mut scored_cold_set: HashSet<usize> = HashSet::new();
+
+        for cl in &clusters {
+            let ub = (dot_unit(&cl.center, &q_unit) + cl.radius + 1e-4) * cl.max_weight;
+            if ub - self.cfg.delta_q4 <= s_gate {
+                continue;
+            }
+            clusters_opened += 1;
+            for &entry_idx in &cl.entry_indices {
+                if !scored_cold_set.insert(entry_idx) {
+                    continue;
+                }
+                cold_entries_scored += 1;
+                let s_cold = self.score_entry(entry_idx, &q_unit);
+                rescued_scores.push((entry_idx, s_cold));
+                let eff_cold = s_cold - self.cfg.delta_q4;
+                if eff_cold > s_gate && eff_cold > best_score {
+                    second_score = best_score;
+                    best_score = s_cold;
+                    best_idx = Some(entry_idx);
+                    rescued_from_cold = true;
+                } else if s_cold > second_score && Some(entry_idx) != best_idx {
+                    second_score = s_cold;
+                }
+            }
+        }
+
+        // Step 3: Variance-isolated projection of active + rescued entries onto (mu_act, sd_act)
+        let mut neutral_z: Vec<(usize, f32)> = active_scores
+            .iter()
+            .chain(rescued_scores.iter())
+            .map(|&(idx, s)| (idx, (((s as f64) - mu_act) / sd_act) as f32))
+            .collect();
+        neutral_z.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let accepted = best_idx.is_some()
+            && best_score >= self.cfg.abs_floor
+            && (best_score - second_score) >= self.cfg.margin_high;
+
+        TieredMatchOutcome {
+            best_index: best_idx,
+            best_score,
+            second_score,
+            accepted,
+            rescued_from_cold,
+            clusters_checked,
+            clusters_opened,
+            cold_entries_scored,
+            neutral_z,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +709,63 @@ mod tests {
         ];
         let z = DomainBank::<Act, HashedNgramEmbedder>::bank_neutral_scores(&scores);
         assert!(z[0] > z[1] && z[0].is_finite() && z[1].is_finite());
+    }
+
+    #[test]
+    fn biased_tiered_bank_prunes_cold_clusters_and_rescues_true_out_of_sector_hit() {
+        let entries = vec![
+            TieredEntry {
+                key: "act_0".into(),
+                sector: 1,
+                priority_pinned: false,
+                payload: 10u32,
+                bias_unit: vec![(vec![1.0, 0.0, 0.0, 0.0], 1.0)],
+                prej_unit: vec![],
+            },
+            TieredEntry {
+                key: "act_1".into(),
+                sector: 1,
+                priority_pinned: false,
+                payload: 11u32,
+                bias_unit: vec![(vec![0.0, 1.0, 0.0, 0.0], 1.0)],
+                prej_unit: vec![],
+            },
+            TieredEntry {
+                key: "priority_guard".into(),
+                sector: 99,
+                priority_pinned: true,
+                payload: 99u32,
+                bias_unit: vec![(vec![0.0, 0.0, 1.0, 0.0], 1.0)],
+                prej_unit: vec![],
+            },
+            TieredEntry {
+                key: "cold_0".into(),
+                sector: 2,
+                priority_pinned: false,
+                payload: 20u32,
+                bias_unit: vec![(vec![0.0, 0.0, 0.0, 1.0], 1.0)],
+                prej_unit: vec![],
+            },
+        ];
+        let bank = BiasedTieredBank::new(4, entries, TieredBankConfig::default());
+
+        // 1) Active-sector hit prunes cold cluster completely (0 cold entries scored)
+        let r_act = bank.match_query(&[0.98, 0.1, 0.0, 0.0], 1);
+        assert_eq!(r_act.best_index, Some(0));
+        assert!(r_act.accepted);
+        assert!(!r_act.rescued_from_cold);
+        assert_eq!(r_act.cold_entries_scored, 0);
+
+        // 2) Priority-pinned entry wins immediately regardless of active sector
+        let r_pri = bank.match_query(&[0.0, 0.0, 1.0, 0.0], 1);
+        assert_eq!(r_pri.best_index, Some(2));
+        assert!(!r_pri.rescued_from_cold);
+        assert_eq!(r_pri.cold_entries_scored, 0);
+
+        // 3) Out-of-sector query punches through gate and rescues cold_0
+        let r_cold = bank.match_query(&[0.05, 0.0, 0.0, 0.99], 1);
+        assert_eq!(r_cold.best_index, Some(3));
+        assert!(r_cold.rescued_from_cold);
+        assert_eq!(r_cold.cold_entries_scored, 1);
     }
 }

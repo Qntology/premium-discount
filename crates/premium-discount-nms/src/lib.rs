@@ -25,6 +25,7 @@ pub mod normalize;
 pub mod semantic;
 pub mod span;
 pub mod spatial;
+pub mod temporal;
 
 pub use domain::{DomainBank, DomainEntry, DomainSpec, Hit};
 

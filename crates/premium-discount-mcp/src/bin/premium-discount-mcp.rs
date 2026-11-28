@@ -18,7 +18,7 @@ use premium_discount_mcp::{default_home, find_pd_app_with, AppConfig, PdSyncServ
 use premium_discount_mcp_protocol::serve;
 
 const USAGE: &str = "usage: premium-discount-mcp [--pd-app PATH] [--home DIR] [--model-dir DIR] [--data-dir DIR] \
-                     [--server-url URL] [--modalities text|auto] [--quant q8_0|auto|off] [--idle-secs N]";
+                     [--server-url URL] [--modalities text|auto|vision,audio] [--quant q8_0|tiered|auto|off] [--idle-secs N]";
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
@@ -63,8 +63,10 @@ fn main() {
             other => eprintln!("premium-discount-mcp: ignoring unknown argument {other}"),
         }
     }
-    if !matches!(modalities.as_str(), "text" | "auto") || !matches!(quant.as_str(), "q8_0" | "auto" | "off") {
-        eprintln!("premium-discount-mcp: --modalities is text|auto and --quant is q8_0|auto|off\n{USAGE}");
+    if !matches!(modalities.as_str(), "text" | "auto" | "vision,audio")
+        || !matches!(quant.as_str(), "q8_0" | "tiered" | "auto" | "off")
+    {
+        eprintln!("premium-discount-mcp: --modalities is text|auto|vision,audio and --quant is q8_0|tiered|auto|off\n{USAGE}");
         std::process::exit(2);
     }
     let home = home.unwrap_or_else(default_home);
